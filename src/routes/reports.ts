@@ -627,4 +627,272 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
       }
     }
   );
+
+  // ==========================================================================
+  // TAXAS POR VENDA
+  // ==========================================================================
+
+  /**
+   * Get fees breakdown by order
+   * Mostra as taxas detalhadas de cada venda
+   */
+  fastify.get(
+    '/reports/order-fees',
+    async (
+      request: FastifyRequest<{ Querystring: DateRangeQuery & { limit?: string } }>,
+      reply: FastifyReply
+    ) => {
+      try {
+        const { startDate, endDate, limit = '50' } = request.query;
+
+        if (!startDate || !endDate) {
+          return reply.code(400).send({
+            success: false,
+            message: 'startDate and endDate are required',
+          });
+        }
+
+        const range = parseDateRange(startDate, endDate);
+        const limitNum = parseInt(limit, 10) || 50;
+
+        // Buscar pedidos com pagamentos
+        const orders = await fastify.prisma.mLOrder.findMany({
+          where: {
+            dateCreated: {
+              gte: range.startDate,
+              lte: range.endDate,
+            },
+          },
+          include: {
+            payments: true,
+            items: true,
+          },
+          orderBy: { dateCreated: 'desc' },
+          take: limitNum,
+        });
+
+        // Processar cada pedido para extrair taxas
+        const ordersWithFees = orders.map((order) => {
+          // Extrair taxas do rawData dos pagamentos
+          let totalFees = 0;
+          let marketplaceFee = 0;
+          let shippingFee = 0;
+          let financingFee = 0;
+
+          order.payments.forEach((payment) => {
+            const rawData = payment.rawData as Record<string, unknown> | null;
+            
+            if (rawData) {
+              // fee_details contém as taxas do ML
+              const feeDetails = rawData.fee_details as Array<{ type: string; amount: number }> | undefined;
+              if (feeDetails && Array.isArray(feeDetails)) {
+                feeDetails.forEach((fee) => {
+                  totalFees += fee.amount || 0;
+                  if (fee.type === 'mercadopago_fee' || fee.type === 'ml_fee') {
+                    marketplaceFee += fee.amount || 0;
+                  } else if (fee.type === 'shipping_fee') {
+                    shippingFee += fee.amount || 0;
+                  } else if (fee.type === 'financing_fee') {
+                    financingFee += fee.amount || 0;
+                  }
+                });
+              }
+
+              // marketplace_fee separado
+              if (typeof rawData.marketplace_fee === 'number') {
+                marketplaceFee += rawData.marketplace_fee;
+                totalFees += rawData.marketplace_fee;
+              }
+            }
+
+            // Custo de frete do pagamento
+            if (payment.shippingCost) {
+              shippingFee += Number(payment.shippingCost);
+            }
+          });
+
+          const grossAmount = Number(order.totalAmount);
+          const netAmount = grossAmount - totalFees;
+
+          return {
+            orderId: order.externalId,
+            date: order.dateCreated,
+            status: order.status,
+            items: order.items.map(item => ({
+              title: item.title,
+              quantity: item.quantity,
+              unitPrice: Number(item.unitPrice),
+            })),
+            grossAmount,
+            fees: {
+              marketplace: marketplaceFee,
+              shipping: shippingFee,
+              financing: financingFee,
+              total: totalFees,
+            },
+            netAmount,
+            feePercentage: grossAmount > 0 ? ((totalFees / grossAmount) * 100).toFixed(2) : '0',
+          };
+        });
+
+        // Calcular totais
+        const totals = ordersWithFees.reduce(
+          (acc, order) => ({
+            grossAmount: acc.grossAmount + order.grossAmount,
+            totalFees: acc.totalFees + order.fees.total,
+            marketplaceFees: acc.marketplaceFees + order.fees.marketplace,
+            shippingFees: acc.shippingFees + order.fees.shipping,
+            financingFees: acc.financingFees + order.fees.financing,
+            netAmount: acc.netAmount + order.netAmount,
+          }),
+          { grossAmount: 0, totalFees: 0, marketplaceFees: 0, shippingFees: 0, financingFees: 0, netAmount: 0 }
+        );
+
+        return reply.send({
+          success: true,
+          data: {
+            period: {
+              start: startDate,
+              end: endDate,
+            },
+            ordersCount: ordersWithFees.length,
+            totals: {
+              ...totals,
+              averageFeePercentage: totals.grossAmount > 0 
+                ? ((totals.totalFees / totals.grossAmount) * 100).toFixed(2) 
+                : '0',
+            },
+            orders: ordersWithFees,
+          },
+        });
+      } catch (error) {
+        logger.error({ error }, 'Failed to get order fees');
+        return reply.code(500).send({
+          success: false,
+          message: error instanceof Error ? error.message : 'Unknown error',
+        });
+      }
+    }
+  );
+
+  /**
+   * Get fees for a specific order by ID
+   */
+  fastify.get(
+    '/reports/order-fees/:orderId',
+    async (
+      request: FastifyRequest<{ Params: { orderId: string } }>,
+      reply: FastifyReply
+    ) => {
+      try {
+        const { orderId } = request.params;
+
+        // Buscar pedido específico
+        const order = await fastify.prisma.mLOrder.findFirst({
+          where: {
+            OR: [
+              { externalId: orderId },
+              { id: orderId },
+            ],
+          },
+          include: {
+            payments: true,
+            items: true,
+            shipments: true,
+          },
+        });
+
+        if (!order) {
+          return reply.code(404).send({
+            success: false,
+            message: 'Order not found',
+          });
+        }
+
+        // Extrair taxas detalhadas
+        let totalFees = 0;
+        const feeBreakdown: Array<{ type: string; amount: number; description: string }> = [];
+
+        order.payments.forEach((payment) => {
+          const rawData = payment.rawData as Record<string, unknown> | null;
+          
+          if (rawData) {
+            const feeDetails = rawData.fee_details as Array<{ type: string; amount: number; fee_payer?: string }> | undefined;
+            if (feeDetails && Array.isArray(feeDetails)) {
+              feeDetails.forEach((fee) => {
+                totalFees += fee.amount || 0;
+                feeBreakdown.push({
+                  type: fee.type,
+                  amount: fee.amount,
+                  description: fee.fee_payer || fee.type,
+                });
+              });
+            }
+
+            if (typeof rawData.marketplace_fee === 'number' && rawData.marketplace_fee > 0) {
+              totalFees += rawData.marketplace_fee;
+              feeBreakdown.push({
+                type: 'marketplace_fee',
+                amount: rawData.marketplace_fee,
+                description: 'Taxa do Marketplace',
+              });
+            }
+          }
+
+          if (payment.shippingCost && Number(payment.shippingCost) > 0) {
+            feeBreakdown.push({
+              type: 'shipping_cost',
+              amount: Number(payment.shippingCost),
+              description: 'Custo de Envio',
+            });
+          }
+        });
+
+        const grossAmount = Number(order.totalAmount);
+        const netAmount = grossAmount - totalFees;
+
+        return reply.send({
+          success: true,
+          data: {
+            orderId: order.externalId,
+            date: order.dateCreated,
+            status: order.status,
+            buyer: order.buyerId,
+            items: order.items.map(item => ({
+              id: item.externalId,
+              title: item.title,
+              quantity: item.quantity,
+              unitPrice: Number(item.unitPrice),
+              subtotal: Number(item.unitPrice) * item.quantity,
+            })),
+            payments: order.payments.map(p => ({
+              id: p.externalId,
+              status: p.status,
+              method: p.paymentMethodId,
+              amount: Number(p.transactionAmount),
+            })),
+            shipment: order.shipments[0] ? {
+              id: order.shipments[0].externalId,
+              status: order.shipments[0].status,
+              trackingNumber: order.shipments[0].trackingNumber,
+              cost: order.shipments[0].cost ? Number(order.shipments[0].cost) : 0,
+            } : null,
+            financial: {
+              grossAmount,
+              feeBreakdown,
+              totalFees,
+              netAmount,
+              feePercentage: grossAmount > 0 ? ((totalFees / grossAmount) * 100).toFixed(2) : '0',
+            },
+          },
+        });
+      } catch (error) {
+        logger.error({ error }, 'Failed to get order fees by ID');
+        return reply.code(500).send({
+          success: false,
+          message: error instanceof Error ? error.message : 'Unknown error',
+        });
+      }
+    }
+  );
 }
