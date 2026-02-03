@@ -8,6 +8,7 @@ import { createLogger } from '../config/logger.js';
 import { csvExportService } from '../modules/reports/services/csv-export.service.js';
 import { excelExportService } from '../modules/reports/services/excel-export.service.js';
 import { reportService } from '../modules/reports/services/report.service.js';
+import { prisma } from '../shared/database/client.js';
 
 const logger = createLogger('reports-routes');
 
@@ -656,7 +657,7 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
         const limitNum = parseInt(limit, 10) || 50;
 
         // Buscar pedidos com pagamentos
-        const orders = await fastify.prisma.mLOrder.findMany({
+        const orders = await prisma.mLOrder.findMany({
           where: {
             dateCreated: {
               gte: range.startDate,
@@ -788,7 +789,7 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
         const { orderId } = request.params;
 
         // Buscar pedido específico
-        const order = await fastify.prisma.mLOrder.findFirst({
+        const order = await prisma.mLOrder.findFirst({
           where: {
             OR: [
               { externalId: orderId },
