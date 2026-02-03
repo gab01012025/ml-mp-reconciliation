@@ -52,12 +52,9 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://n8n-conciliacao-api.zgbjol.easypanel.host/reconciliation",
+        "url": "=https://n8n-conciliacao-api.zgbjol.easypanel.host/reconciliation/run?periodStart={{ $now.minus({days: 7}).toISO() }}&periodEnd={{ $now.toISO() }}",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "{\"days\": 7}",
         "options": {}
       },
       "id": "run-reconciliation",
