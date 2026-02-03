@@ -1,0 +1,69 @@
+{
+  "name": "ml-mp-reconciliation",
+  "version": "1.0.0",
+  "description": "Automação de conciliação financeira entre Mercado Livre e Mercado Pago",
+  "main": "dist/server.js",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "prisma generate && tsc",
+    "start": "node dist/server.js",
+    "lint": "eslint src --ext .ts",
+    "lint:fix": "eslint src --ext .ts --fix",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\"",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:logs": "docker-compose logs -f",
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push",
+    "db:migrate": "prisma migrate dev",
+    "db:migrate:deploy": "prisma migrate deploy",
+    "db:studio": "prisma studio",
+    "db:seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^9.0.1",
+    "@fastify/helmet": "^11.1.1",
+    "@fastify/sensible": "^5.6.0",
+    "@prisma/client": "^5.22.0",
+    "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
+    "fastify": "^4.28.1",
+    "fastify-plugin": "^4.5.1",
+    "pino": "^9.3.2",
+    "pino-pretty": "^11.2.2",
+    "prisma": "^7.3.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.3.0",
+    "@typescript-eslint/eslint-plugin": "^8.1.0",
+    "@typescript-eslint/parser": "^8.1.0",
+    "@vitest/coverage-v8": "^4.0.18",
+    "eslint": "^8.57.1",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-import-resolver-typescript": "^4.4.4",
+    "eslint-plugin-import": "^2.29.1",
+    "prettier": "^3.3.3",
+    "prisma": "^5.18.0",
+    "tsx": "^4.17.0",
+    "typescript": "^5.5.4",
+    "vitest": "^4.0.18"
+  },
+  "keywords": [
+    "mercado-livre",
+    "mercado-pago",
+    "reconciliation",
+    "financial"
+  ],
+  "author": "",
+  "license": "ISC"
+}

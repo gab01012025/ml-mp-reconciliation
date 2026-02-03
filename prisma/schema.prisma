@@ -1,0 +1,360 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+enum TokenStatus {
+  ACTIVE
+  EXPIRED
+  REVOKED
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  SHIPPED
+  DELIVERED
+  CANCELLED
+  REFUNDED
+}
+
+enum PaymentStatus {
+  PENDING
+  APPROVED
+  AUTHORIZED
+  IN_PROCESS
+  IN_MEDIATION
+  REJECTED
+  CANCELLED
+  REFUNDED
+  CHARGED_BACK
+}
+
+enum MovementType {
+  SALE
+  REFUND
+  FEE
+  SHIPPING
+  TAX
+  WITHDRAWAL
+  TRANSFER
+  CHARGEBACK
+  ADJUSTMENT
+  OTHER
+}
+
+enum ReconciliationStatus {
+  PENDING
+  MATCHED
+  PARTIAL_MATCH
+  UNMATCHED
+  DIVERGENT
+  MANUAL_REVIEW
+  RESOLVED
+}
+
+enum SyncStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+// ============================================================================
+// AUTH & TOKENS
+// ============================================================================
+
+model MercadoLivreToken {
+  id           String      @id @default(cuid())
+  userId       String      @unique @map("user_id")
+  accessToken  String      @map("access_token")
+  refreshToken String      @map("refresh_token")
+  expiresAt    DateTime    @map("expires_at")
+  status       TokenStatus @default(ACTIVE)
+  scopes       String[]    @default([])
+  createdAt    DateTime    @default(now()) @map("created_at")
+  updatedAt    DateTime    @updatedAt @map("updated_at")
+
+  @@map("mercado_livre_tokens")
+}
+
+model MercadoPagoToken {
+  id           String      @id @default(cuid())
+  userId       String      @unique @map("user_id")
+  accessToken  String      @map("access_token")
+  refreshToken String      @map("refresh_token")
+  expiresAt    DateTime    @map("expires_at")
+  status       TokenStatus @default(ACTIVE)
+  scopes       String[]    @default([])
+  createdAt    DateTime    @default(now()) @map("created_at")
+  updatedAt    DateTime    @updatedAt @map("updated_at")
+
+  @@map("mercado_pago_tokens")
+}
+
+// ============================================================================
+// MERCADO LIVRE DATA
+// ============================================================================
+
+model MLOrder {
+  id               String      @id @default(cuid())
+  externalId       String      @unique @map("external_id") // ML order ID
+  sellerId         String      @map("seller_id")
+  buyerId          String?     @map("buyer_id")
+  status           OrderStatus
+  totalAmount      Decimal     @map("total_amount") @db.Decimal(15, 2)
+  currency         String      @default("BRL")
+  shippingCost     Decimal?    @map("shipping_cost") @db.Decimal(15, 2)
+  dateCreated      DateTime    @map("date_created")
+  dateClosed       DateTime?   @map("date_closed")
+  dateLastUpdated  DateTime    @map("date_last_updated")
+  packId           String?     @map("pack_id")
+  rawData          Json?       @map("raw_data")
+  createdAt        DateTime    @default(now()) @map("created_at")
+  updatedAt        DateTime    @updatedAt @map("updated_at")
+
+  items         MLOrderItem[]
+  payments      MLPayment[]
+  shipments     MLShipment[]
+  reconciliations ReconciliationItem[]
+
+  @@index([sellerId])
+  @@index([dateCreated])
+  @@index([status])
+  @@map("ml_orders")
+}
+
+model MLOrderItem {
+  id            String  @id @default(cuid())
+  orderId       String  @map("order_id")
+  externalId    String  @map("external_id") // ML item ID
+  title         String
+  quantity      Int
+  unitPrice     Decimal @map("unit_price") @db.Decimal(15, 2)
+  categoryId    String? @map("category_id")
+  sku           String?
+  variationId   String? @map("variation_id")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  order MLOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("ml_order_items")
+}
+
+model MLPayment {
+  id                 String        @id @default(cuid())
+  orderId            String        @map("order_id")
+  externalId         String        @unique @map("external_id") // ML payment ID
+  status             PaymentStatus
+  statusDetail       String?       @map("status_detail")
+  paymentType        String?       @map("payment_type")
+  paymentMethodId    String?       @map("payment_method_id")
+  transactionAmount  Decimal       @map("transaction_amount") @db.Decimal(15, 2)
+  totalPaidAmount    Decimal?      @map("total_paid_amount") @db.Decimal(15, 2)
+  shippingCost       Decimal?      @map("shipping_cost") @db.Decimal(15, 2)
+  currency           String        @default("BRL")
+  dateCreated        DateTime      @map("date_created")
+  dateApproved       DateTime?     @map("date_approved")
+  dateLastModified   DateTime?     @map("date_last_modified")
+  rawData            Json?         @map("raw_data")
+  createdAt          DateTime      @default(now()) @map("created_at")
+  updatedAt          DateTime      @updatedAt @map("updated_at")
+
+  order MLOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([status])
+  @@index([dateCreated])
+  @@map("ml_payments")
+}
+
+model MLShipment {
+  id                String   @id @default(cuid())
+  orderId           String   @map("order_id")
+  externalId        String   @unique @map("external_id") // ML shipment ID
+  status            String
+  substatus         String?
+  shippingMode      String?  @map("shipping_mode")
+  trackingNumber    String?  @map("tracking_number")
+  trackingMethod    String?  @map("tracking_method")
+  receiverId        String?  @map("receiver_id")
+  cost              Decimal? @db.Decimal(15, 2)
+  dateCreated       DateTime @map("date_created")
+  dateFirstPrinted  DateTime? @map("date_first_printed")
+  dateDelivered     DateTime? @map("date_delivered")
+  rawData           Json?    @map("raw_data")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  order MLOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("ml_shipments")
+}
+
+// ============================================================================
+// MERCADO PAGO DATA
+// ============================================================================
+
+model MPMovement {
+  id                String       @id @default(cuid())
+  externalId        String       @unique @map("external_id") // MP movement ID
+  userId            String       @map("user_id")
+  type              MovementType
+  action            String?
+  amount            Decimal      @db.Decimal(15, 2)
+  fee               Decimal?     @db.Decimal(15, 2)
+  netAmount         Decimal?     @map("net_amount") @db.Decimal(15, 2)
+  currency          String       @default("BRL")
+  referenceId       String?      @map("reference_id")
+  externalReference String?      @map("external_reference")
+  dateCreated       DateTime     @map("date_created")
+  releaseDate       DateTime?    @map("release_date")
+  description       String?
+  status            String?
+  detail            String?
+  balanceAvailable  Decimal?     @map("balance_available") @db.Decimal(15, 2)
+  rawData           Json?        @map("raw_data")
+  createdAt         DateTime     @default(now()) @map("created_at")
+  updatedAt         DateTime     @updatedAt @map("updated_at")
+
+  reconciliations ReconciliationItem[]
+
+  @@index([userId])
+  @@index([type])
+  @@index([dateCreated])
+  @@index([referenceId])
+  @@map("mp_movements")
+}
+
+model MPBalance {
+  id               String   @id @default(cuid())
+  userId           String   @map("user_id")
+  availableBalance Decimal  @map("available_balance") @db.Decimal(15, 2)
+  pendingBalance   Decimal  @map("pending_balance") @db.Decimal(15, 2)
+  totalBalance     Decimal  @map("total_balance") @db.Decimal(15, 2)
+  currency         String   @default("BRL")
+  snapshotDate     DateTime @map("snapshot_date")
+  rawData          Json?    @map("raw_data")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  @@index([userId, snapshotDate])
+  @@map("mp_balances")
+}
+
+// ============================================================================
+// RECONCILIATION
+// ============================================================================
+
+model Reconciliation {
+  id            String               @id @default(cuid())
+  periodStart   DateTime             @map("period_start")
+  periodEnd     DateTime             @map("period_end")
+  status        ReconciliationStatus @default(PENDING)
+  
+  // Summary
+  totalOrders       Int      @default(0) @map("total_orders")
+  totalMovements    Int      @default(0) @map("total_movements")
+  matchedCount      Int      @default(0) @map("matched_count")
+  unmatchedCount    Int      @default(0) @map("unmatched_count")
+  divergentCount    Int      @default(0) @map("divergent_count")
+  
+  // Financial Summary
+  expectedRevenue   Decimal  @default(0) @map("expected_revenue") @db.Decimal(15, 2)
+  actualRevenue     Decimal  @default(0) @map("actual_revenue") @db.Decimal(15, 2)
+  totalFees         Decimal  @default(0) @map("total_fees") @db.Decimal(15, 2)
+  totalRefunds      Decimal  @default(0) @map("total_refunds") @db.Decimal(15, 2)
+  netRevenue        Decimal  @default(0) @map("net_revenue") @db.Decimal(15, 2)
+  discrepancy       Decimal  @default(0) @db.Decimal(15, 2)
+  
+  notes             String?
+  completedAt       DateTime? @map("completed_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  items ReconciliationItem[]
+
+  @@index([periodStart, periodEnd])
+  @@index([status])
+  @@map("reconciliations")
+}
+
+model ReconciliationItem {
+  id                String               @id @default(cuid())
+  reconciliationId  String               @map("reconciliation_id")
+  orderId           String?              @map("order_id")
+  movementId        String?              @map("movement_id")
+  status            ReconciliationStatus
+  
+  // Matching data
+  orderAmount       Decimal?  @map("order_amount") @db.Decimal(15, 2)
+  movementAmount    Decimal?  @map("movement_amount") @db.Decimal(15, 2)
+  difference        Decimal?  @db.Decimal(15, 2)
+  
+  // Match details
+  matchType         String?   @map("match_type")
+  matchConfidence   Float?    @map("match_confidence")
+  matchedBy         String?   @map("matched_by") // auto, manual
+  matchedAt         DateTime? @map("matched_at")
+  
+  notes             String?
+  resolvedAt        DateTime? @map("resolved_at")
+  resolvedBy        String?   @map("resolved_by")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  reconciliation Reconciliation @relation(fields: [reconciliationId], references: [id], onDelete: Cascade)
+  order          MLOrder?       @relation(fields: [orderId], references: [id])
+  movement       MPMovement?    @relation(fields: [movementId], references: [id])
+
+  @@index([reconciliationId])
+  @@index([status])
+  @@map("reconciliation_items")
+}
+
+// ============================================================================
+// SYNC LOGS
+// ============================================================================
+
+model SyncLog {
+  id          String     @id @default(cuid())
+  entityType  String     @map("entity_type") // orders, payments, movements, etc.
+  source      String     // ml, mp
+  status      SyncStatus
+  startedAt   DateTime   @map("started_at")
+  completedAt DateTime?  @map("completed_at")
+  
+  // Stats
+  totalRecords    Int    @default(0) @map("total_records")
+  createdRecords  Int    @default(0) @map("created_records")
+  updatedRecords  Int    @default(0) @map("updated_records")
+  failedRecords   Int    @default(0) @map("failed_records")
+  
+  // Sync params
+  dateFrom    DateTime?  @map("date_from")
+  dateTo      DateTime?  @map("date_to")
+  cursor      String?
+  
+  errorMessage String?   @map("error_message")
+  errorStack   String?   @map("error_stack")
+  metadata     Json?
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  @@index([entityType, source])
+  @@index([startedAt])
+  @@index([status])
+  @@map("sync_logs")
+}

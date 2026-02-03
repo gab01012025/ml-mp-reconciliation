@@ -1,0 +1,239 @@
+{
+  "name": "ML-MP Conciliação Financeira",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "trigger-schedule",
+      "name": "Executar a cada 6 horas",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.API_URL}}/sync/ml/orders",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "startDate",
+              "value": "={{ $now.minus(1, 'day').toISO() }}"
+            },
+            {
+              "name": "endDate",
+              "value": "={{ $now.toISO() }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "sync-ml-orders",
+      "name": "1. Sincronizar Pedidos ML",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [500, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "API_KEY_CREDENTIAL_ID",
+          "name": "ML-MP API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.API_URL}}/reconciliation/run",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "periodStart",
+              "value": "={{ $now.minus(7, 'day').toISO() }}"
+            },
+            {
+              "name": "periodEnd",
+              "value": "={{ $now.toISO() }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "run-reconciliation",
+      "name": "2. Executar Conciliação",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [750, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "API_KEY_CREDENTIAL_ID",
+          "name": "ML-MP API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.data.divergent }}",
+              "operation": "larger",
+              "value2": 0
+            }
+          ]
+        }
+      },
+      "id": "check-divergences",
+      "name": "3. Tem Divergências?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1000, 300]
+    },
+    {
+      "parameters": {
+        "fromEmail": "sistema@seudominio.com",
+        "toEmail": "joaopaulorocha@live.com",
+        "subject": "⚠️ Divergências Encontradas - Conciliação ML/MP",
+        "emailType": "html",
+        "html": "<h2>Divergências Encontradas!</h2>\n<p>A conciliação automática encontrou <strong>{{ $json.data.divergent }}</strong> divergência(s).</p>\n\n<h3>Resumo:</h3>\n<ul>\n  <li>Conciliados: {{ $json.data.matched }}</li>\n  <li>Não encontrados: {{ $json.data.unmatched }}</li>\n  <li>Divergentes: {{ $json.data.divergent }}</li>\n  <li>Discrepância total: R$ {{ $json.data.discrepancy }}</li>\n</ul>\n\n<p><a href=\"{{$env.DASHBOARD_URL}}\">Acessar Dashboard</a></p>"
+      },
+      "id": "send-email-alert",
+      "name": "4. Enviar Email de Alerta",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [1250, 200],
+      "credentials": {
+        "smtp": {
+          "id": "SMTP_CREDENTIAL_ID",
+          "name": "SMTP"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "no-action",
+      "name": "Tudo OK - Sem divergências",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1250, 400]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{$env.API_URL}}/reports/excel/full",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "startDate",
+              "value": "={{ $now.minus(7, 'day').format('yyyy-MM-dd') }}"
+            },
+            {
+              "name": "endDate",
+              "value": "={{ $now.format('yyyy-MM-dd') }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "id": "generate-report",
+      "name": "Gerar Relatório Excel",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [500, 500],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "API_KEY_CREDENTIAL_ID",
+          "name": "ML-MP API Key"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Executar a cada 6 horas": {
+      "main": [
+        [
+          {
+            "node": "1. Sincronizar Pedidos ML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1. Sincronizar Pedidos ML": {
+      "main": [
+        [
+          {
+            "node": "2. Executar Conciliação",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2. Executar Conciliação": {
+      "main": [
+        [
+          {
+            "node": "3. Tem Divergências?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3. Tem Divergências?": {
+      "main": [
+        [
+          {
+            "node": "4. Enviar Email de Alerta",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Tudo OK - Sem divergências",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "Conciliação",
+      "createdAt": "2026-02-01T00:00:00.000Z",
+      "updatedAt": "2026-02-01T00:00:00.000Z"
+    }
+  ],
+  "triggerCount": 1,
+  "pinData": {}
+}

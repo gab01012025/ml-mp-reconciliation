@@ -1,0 +1,88 @@
+version: '3.8'
+
+services:
+  # ================================
+  # PostgreSQL Database
+  # ================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: ml-mp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-mlmp}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-mlmp_secret_2024}
+      POSTGRES_DB: ${DB_NAME:-mlmp_reconciliation}
+    ports:
+      - '${DB_PORT:-5433}:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${DB_USER:-mlmp} -d ${DB_NAME:-mlmp_reconciliation}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mlmp-network
+
+  # ================================
+  # API Backend
+  # ================================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ml-mp-api
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3002
+      DATABASE_URL: postgresql://${DB_USER:-mlmp}:${DB_PASSWORD:-mlmp_secret_2024}@postgres:5432/${DB_NAME:-mlmp_reconciliation}?schema=public
+      API_KEY: ${API_KEY:-ml-mp-api-key-2024}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Mercado Livre
+      ML_APP_ID: ${ML_APP_ID:-7482396727089965}
+      ML_SECRET_KEY: ${ML_SECRET_KEY}
+      ML_REDIRECT_URI: ${ML_REDIRECT_URI:-https://your-domain.com/auth/ml/callback}
+      # Mercado Pago
+      MP_ACCESS_TOKEN: ${MP_ACCESS_TOKEN}
+      MP_PUBLIC_KEY: ${MP_PUBLIC_KEY:-}
+    ports:
+      - '${API_PORT:-3002}:3002'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - mlmp-network
+    healthcheck:
+      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://localhost:3002/health']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ================================
+  # Database Migration (run once)
+  # ================================
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ml-mp-migrate
+    command: sh -c "npx prisma migrate deploy && echo 'Migrations completed!'"
+    environment:
+      DATABASE_URL: postgresql://${DB_USER:-mlmp}:${DB_PASSWORD:-mlmp_secret_2024}@postgres:5432/${DB_NAME:-mlmp_reconciliation}?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - mlmp-network
+    restart: "no"
+    profiles:
+      - migrate
+
+networks:
+  mlmp-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
