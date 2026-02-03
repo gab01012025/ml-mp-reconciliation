@@ -674,35 +674,37 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
 
         // Processar cada pedido para extrair taxas
         const ordersWithFees = orders.map((order) => {
-          // Extrair taxas do rawData dos pagamentos
-          let totalFees = 0;
+          // Taxa de venda do ML (sale_fee dos itens)
           let marketplaceFee = 0;
+          order.items.forEach((item) => {
+            if (item.saleFee) {
+              marketplaceFee += Number(item.saleFee);
+            }
+          });
+
+          // Extrair outras taxas do rawData dos pagamentos
+          let totalFees = marketplaceFee;
           let shippingFee = 0;
           let financingFee = 0;
+          let mercadoPagoFee = 0;
 
           order.payments.forEach((payment) => {
             const rawData = payment.rawData as Record<string, unknown> | null;
             
             if (rawData) {
-              // fee_details contém as taxas do ML
+              // fee_details contém as taxas do MP
               const feeDetails = rawData.fee_details as Array<{ type: string; amount: number }> | undefined;
               if (feeDetails && Array.isArray(feeDetails)) {
                 feeDetails.forEach((fee) => {
                   totalFees += fee.amount || 0;
-                  if (fee.type === 'mercadopago_fee' || fee.type === 'ml_fee') {
-                    marketplaceFee += fee.amount || 0;
+                  if (fee.type === 'mercadopago_fee') {
+                    mercadoPagoFee += fee.amount || 0;
                   } else if (fee.type === 'shipping_fee') {
                     shippingFee += fee.amount || 0;
                   } else if (fee.type === 'financing_fee') {
                     financingFee += fee.amount || 0;
                   }
                 });
-              }
-
-              // marketplace_fee separado
-              if (typeof rawData.marketplace_fee === 'number') {
-                marketplaceFee += rawData.marketplace_fee;
-                totalFees += rawData.marketplace_fee;
               }
             }
 
@@ -723,10 +725,13 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
               title: item.title,
               quantity: item.quantity,
               unitPrice: Number(item.unitPrice),
+              saleFee: item.saleFee ? Number(item.saleFee) : 0,
+              listingType: item.listingTypeId,
             })),
             grossAmount,
             fees: {
-              marketplace: marketplaceFee,
+              mlSaleFee: marketplaceFee,
+              mercadoPago: mercadoPagoFee,
               shipping: shippingFee,
               financing: financingFee,
               total: totalFees,
@@ -741,12 +746,13 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
           (acc, order) => ({
             grossAmount: acc.grossAmount + order.grossAmount,
             totalFees: acc.totalFees + order.fees.total,
-            marketplaceFees: acc.marketplaceFees + order.fees.marketplace,
+            mlSaleFees: acc.mlSaleFees + order.fees.mlSaleFee,
+            mercadoPagoFees: acc.mercadoPagoFees + order.fees.mercadoPago,
             shippingFees: acc.shippingFees + order.fees.shipping,
             financingFees: acc.financingFees + order.fees.financing,
             netAmount: acc.netAmount + order.netAmount,
           }),
-          { grossAmount: 0, totalFees: 0, marketplaceFees: 0, shippingFees: 0, financingFees: 0, netAmount: 0 }
+          { grossAmount: 0, totalFees: 0, mlSaleFees: 0, mercadoPagoFees: 0, shippingFees: 0, financingFees: 0, netAmount: 0 }
         );
 
         return reply.send({
@@ -814,6 +820,19 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
         let totalFees = 0;
         const feeBreakdown: Array<{ type: string; amount: number; description: string }> = [];
 
+        // Taxa de venda do ML (sale_fee) dos itens
+        order.items.forEach((item) => {
+          if (item.saleFee && Number(item.saleFee) > 0) {
+            const fee = Number(item.saleFee);
+            totalFees += fee;
+            feeBreakdown.push({
+              type: 'ml_sale_fee',
+              amount: fee,
+              description: `Taxa de Venda ML - ${item.title}`,
+            });
+          }
+        });
+
         order.payments.forEach((payment) => {
           const rawData = payment.rawData as Record<string, unknown> | null;
           
@@ -827,15 +846,6 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
                   amount: fee.amount,
                   description: fee.fee_payer || fee.type,
                 });
-              });
-            }
-
-            if (typeof rawData.marketplace_fee === 'number' && rawData.marketplace_fee > 0) {
-              totalFees += rawData.marketplace_fee;
-              feeBreakdown.push({
-                type: 'marketplace_fee',
-                amount: rawData.marketplace_fee,
-                description: 'Taxa do Marketplace',
               });
             }
           }
@@ -865,6 +875,8 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
               quantity: item.quantity,
               unitPrice: Number(item.unitPrice),
               subtotal: Number(item.unitPrice) * item.quantity,
+              saleFee: item.saleFee ? Number(item.saleFee) : 0,
+              listingType: item.listingTypeId,
             })),
             payments: order.payments.map(p => ({
               id: p.externalId,

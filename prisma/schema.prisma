@@ -142,9 +142,11 @@ model MLOrderItem {
   title         String
   quantity      Int
   unitPrice     Decimal @map("unit_price") @db.Decimal(15, 2)
+  saleFee       Decimal? @map("sale_fee") @db.Decimal(15, 2) // Taxa de venda do ML
   categoryId    String? @map("category_id")
   sku           String?
   variationId   String? @map("variation_id")
+  listingTypeId String? @map("listing_type_id") // Tipo de anúncio (gold_special, etc)
   createdAt     DateTime @default(now()) @map("created_at")
   updatedAt     DateTime @updatedAt @map("updated_at")
 

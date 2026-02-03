@@ -209,14 +209,18 @@ export class MLSyncService {
             title: item.item.title,
             quantity: item.quantity,
             unitPrice: item.unit_price,
+            saleFee: item.sale_fee || 0,
             categoryId: item.item.category_id,
             sku: item.item.seller_sku,
             variationId: item.item.variation_id ? String(item.item.variation_id) : null,
+            listingTypeId: item.listing_type_id,
           },
           update: {
             title: item.item.title,
             quantity: item.quantity,
             unitPrice: item.unit_price,
+            saleFee: item.sale_fee || 0,
+            listingTypeId: item.listing_type_id,
           },
         });
       }
@@ -269,13 +273,30 @@ export class MLSyncService {
   }
 
   /**
-   * Upsert a payment record
+   * Upsert a payment record with fee details
    */
   private async upsertPayment(
     tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0],
     orderId: string,
     payment: MLApiPayment
   ): Promise<void> {
+    // Try to get detailed payment info with fee_details
+    let enrichedPayment: Record<string, unknown> = { ...payment };
+    
+    try {
+      const paymentDetails = await this.client.getPaymentDetails(payment.id);
+      // Merge fee_details into the payment data
+      enrichedPayment = {
+        ...payment,
+        fee_details: paymentDetails.fee_details || [],
+        charges_details: paymentDetails.charges_details || [],
+        marketplace_fee: paymentDetails.marketplace_fee || 0,
+      };
+      logger.debug({ paymentId: payment.id, feeDetails: paymentDetails.fee_details }, 'Got payment fee details');
+    } catch (error) {
+      logger.debug({ paymentId: payment.id, error }, 'Could not get payment details, using basic info');
+    }
+
     await tx.mLPayment.upsert({
       where: { externalId: String(payment.id) },
       create: {
@@ -294,7 +315,7 @@ export class MLSyncService {
         dateLastModified: payment.date_last_modified
           ? new Date(payment.date_last_modified)
           : null,
-        rawData: JSON.parse(JSON.stringify(payment)) as Prisma.InputJsonValue,
+        rawData: JSON.parse(JSON.stringify(enrichedPayment)) as Prisma.InputJsonValue,
       },
       update: {
         status: mapPaymentStatus(payment.status),
@@ -304,7 +325,7 @@ export class MLSyncService {
         dateLastModified: payment.date_last_modified
           ? new Date(payment.date_last_modified)
           : null,
-        rawData: JSON.parse(JSON.stringify(payment)) as Prisma.InputJsonValue,
+        rawData: JSON.parse(JSON.stringify(enrichedPayment)) as Prisma.InputJsonValue,
       },
     });
   }

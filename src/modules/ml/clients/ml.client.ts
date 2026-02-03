@@ -316,6 +316,62 @@ export class MLClient {
   }
 
   /**
+   * Get payment details with fee_details
+   * The /payments/{id} endpoint returns more details than the order's payment info
+   */
+  async getPaymentDetails(paymentId: number): Promise<{
+    id: number;
+    status: string;
+    status_detail: string;
+    transaction_amount: number;
+    total_paid_amount: number;
+    shipping_cost: number;
+    fee_details: Array<{
+      type: string;
+      amount: number;
+      fee_payer: string;
+    }>;
+    charges_details: Array<{
+      type: string;
+      amounts: {
+        original: number;
+        refunded: number;
+      };
+    }>;
+    marketplace_fee: number;
+    date_created: string;
+    date_approved: string | null;
+  }> {
+    return this.request('GET', `/v1/payments/${paymentId}`);
+  }
+
+  /**
+   * Get billing info for an order (contains fee breakdown)
+   */
+  async getOrderBilling(orderId: number): Promise<{
+    billing_info: {
+      type: string;
+      tax_amount: number;
+      fee: {
+        percentage: number;
+        amount: number;
+        original_amount: number;
+      };
+      shipping_cost: {
+        buyer: number;
+        seller: number;
+      };
+    };
+  } | null> {
+    try {
+      return await this.request('GET', `/orders/${orderId}/billing_info`);
+    } catch (error) {
+      logger.debug({ orderId, error }, 'Billing info not available');
+      return null;
+    }
+  }
+
+  /**
    * Get seller ID
    */
   async getSellerId(): Promise<string> {
