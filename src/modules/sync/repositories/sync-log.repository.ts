@@ -142,6 +142,20 @@ export class SyncLogRepository {
       },
     });
   }
+
+  async resetStuckSyncs() {
+    const result = await prisma.syncLog.updateMany({
+      where: {
+        status: 'RUNNING',
+      },
+      data: {
+        status: 'FAILED',
+        completedAt: new Date(),
+        errorMessage: 'Reset by admin - stuck sync',
+      },
+    });
+    return { resetCount: result.count };
+  }
 }
 
 export const syncLogRepository = new SyncLogRepository();

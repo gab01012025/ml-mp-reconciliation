@@ -366,4 +366,31 @@ export async function syncRoutes(fastify: FastifyInstance): Promise<void> {
       }
     }
   );
+
+  /**
+   * Reset stuck syncs - marks all RUNNING syncs as FAILED
+   */
+  fastify.post(
+    '/sync/reset',
+    async (_request: FastifyRequest, reply: FastifyReply) => {
+      logger.info('Resetting stuck syncs');
+
+      try {
+        const result = await syncLogRepository.resetStuckSyncs();
+        
+        return reply.code(200).send({
+          success: true,
+          message: 'Stuck syncs reset successfully',
+          data: result,
+        });
+      } catch (error) {
+        logger.error({ error }, 'Failed to reset stuck syncs');
+        return reply.code(500).send({
+          success: false,
+          message: 'Failed to reset stuck syncs',
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+      }
+    }
+  );
 }
