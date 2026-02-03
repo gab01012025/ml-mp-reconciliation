@@ -43,3 +43,4 @@ frontend/node_modules/
 .env.local
 .env.production
 .env.test
+CREDENCIAIS-CLIENTE.txt
