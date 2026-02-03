@@ -46,18 +46,18 @@ No EasyPanel, adicione estas variáveis ao serviço da API:
 NODE_ENV=production
 PORT=3002
 LOG_LEVEL=info
-API_KEY=sua-chave-api-segura-aqui
+API_KEY=[CONFIGURAR_API_KEY]
 
 # Database (o EasyPanel cria automaticamente)
 DATABASE_URL=postgresql://mlmp:senha@postgres:5432/mlmp_reconciliation
 
 # Mercado Livre
-ML_APP_ID=7482396727089965
-ML_SECRET_KEY=hlDcv6hWZDeysAm293dL5rJGgN6PrJ
+ML_APP_ID=[CONFIGURAR_ML_APP_ID]
+ML_SECRET_KEY=[CONFIGURAR_ML_SECRET]
 ML_REDIRECT_URI=https://seu-dominio.easypanel.host/auth/ml/callback
 
 # Mercado Pago
-MP_ACCESS_TOKEN=TOKEN_DO_CLIENTE_AQUI
+MP_ACCESS_TOKEN=[CONFIGURAR_MP_TOKEN]
 ```
 
 ---

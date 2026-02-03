@@ -103,7 +103,7 @@ GET /reports/export/excel
   "method": "GET",
   "url": "https://n8n-conciliacao-api.zgbjol.easypanel.host/reconciliation/dashboard",
   "headers": {
-    "x-api-key": "conciliacao-api-key-2026"
+    "x-api-key": "[SUA_API_KEY]"
   }
 }
 ```
@@ -130,8 +130,5 @@ GET /reports/export/excel
 
 ## 🔑 Credenciais do Cliente
 
-- **ML App ID**: 7482396727089965
-- **ML Secret**: hlDcv6hWZDeysAm293dL5rJGgN6PrJ
-- **MP Client ID**: APP_USR-f8cf5c60-6d57-4f93-aa71-dc7ac6054ced
-- **MP Access Token**: APP_USR-752302537209102-020210-42d8042fb95279e865d18917ea6477e5-3166345954
-- **Email**: joaopaulorocha@live.com
+> ⚠️ **As credenciais foram enviadas por canal seguro separado.**
+> Nunca armazene credenciais em arquivos versionados!
