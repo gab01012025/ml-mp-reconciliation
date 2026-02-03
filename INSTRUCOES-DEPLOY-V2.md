@@ -60,10 +60,10 @@ docker push ghcr.io/SEU_USUARIO/ml-mp-reconciliation:latest
 
 ```bash
 # Copiar ZIP para servidor
-scp conciliacao-api-v2.zip root@31.97.87.68:/tmp/
+scp conciliacao-api-v2.zip root@[IP_DO_SERVIDOR]:/tmp/
 
 # No servidor
-ssh root@31.97.87.68
+ssh root@[IP_DO_SERVIDOR]
 cd /easypanel/data/projects/conciliacao/services/conciliacao-api
 unzip -o /tmp/conciliacao-api-v2.zip
 npm install

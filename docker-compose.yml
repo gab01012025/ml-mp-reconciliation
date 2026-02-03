@@ -40,7 +40,7 @@ services:
       API_KEY: ${API_KEY:-ml-mp-api-key-2024}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       # Mercado Livre
-      ML_APP_ID: ${ML_APP_ID:-7482396727089965}
+      ML_APP_ID: ${ML_APP_ID}
       ML_SECRET_KEY: ${ML_SECRET_KEY}
       ML_REDIRECT_URI: ${ML_REDIRECT_URI:-https://your-domain.com/auth/ml/callback}
       # Mercado Pago

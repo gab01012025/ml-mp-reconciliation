@@ -4,7 +4,7 @@
 
 ### 1. Acesse o EasyPanel
 ```
-URL: http://31.97.87.68:3000
+URL: [Ver arquivo CREDENCIAIS-CLIENTE.txt]
 ```
 
 ### 2. Vá até o serviço da API

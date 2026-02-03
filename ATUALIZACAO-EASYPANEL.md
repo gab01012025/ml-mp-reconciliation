@@ -2,7 +2,7 @@
 
 ## Passo 1: Atualizar Serviço no EasyPanel
 
-1. Acesse: **http://31.97.87.68:3000**
+1. Acesse: **[URL do EasyPanel - ver credenciais]**
 2. Login no EasyPanel
 3. Vá no projeto **conciliacao** > serviço **conciliacao-api**
 4. Clique em **"Settings"** > **"Source"**

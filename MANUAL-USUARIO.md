@@ -20,7 +20,7 @@ Este sistema automatiza a conciliação financeira entre suas vendas no **Mercad
 |---------|-----|
 | **API de Conciliação** | https://n8n-conciliacao-api.zgbjol.easypanel.host |
 | **n8n (Automação)** | https://n8n-n8n.zgbjol.easypanel.host |
-| **EasyPanel** | http://31.97.87.68:3000 |
+| **EasyPanel** | [Ver credenciais] |
 
 ---
 
@@ -100,7 +100,7 @@ O sistema está configurado para executar automaticamente a cada 6 horas:
 1. Sincroniza pedidos do ML
 2. Sincroniza movimentos do MP
 3. Executa conciliação
-4. Se houver divergências, envia email para: `joaopaulorocha@live.com`
+4. Se houver divergências, envia email para o destinatário configurado
 
 ### Importar Workflow no n8n
 

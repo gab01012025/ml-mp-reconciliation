@@ -80,7 +80,7 @@
     {
       "parameters": {
         "fromEmail": "sistema@conciliacao.app",
-        "toEmail": "joaopaulorocha@live.com",
+        "toEmail": "CONFIGURAR_EMAIL_DESTINO",
         "subject": "⚠️ Divergências Encontradas - Conciliação ML/MP",
         "emailType": "html",
         "html": "<h2>Divergências Encontradas!</h2><p>A conciliação encontrou <strong>{{ $json.divergent }}</strong> divergência(s).</p><h3>Resumo:</h3><ul><li>Conciliados: {{ $json.matched }}</li><li>Não encontrados: {{ $json.unmatched }}</li><li>Divergentes: {{ $json.divergent }}</li></ul>"

@@ -44,3 +44,4 @@ frontend/node_modules/
 .env.production
 .env.test
 CREDENCIAIS-CLIENTE.txt
+*.zip
