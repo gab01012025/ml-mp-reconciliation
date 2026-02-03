@@ -26,18 +26,20 @@ Este sistema automatiza a conciliação financeira entre suas vendas no **Mercad
 
 ## 🔐 Credenciais
 
+> ⚠️ **IMPORTANTE**: As credenciais são confidenciais e foram enviadas separadamente por canal seguro.
+> Nunca compartilhe credenciais em repositórios públicos!
+
 ### API Key
 ```
-x-api-key: conciliacao-api-key-2026
+x-api-key: [CONFIGURAR NO EASYPANEL]
 ```
 
-### Mercado Livre (já autorizado)
-- **User ID**: 697553753
+### Mercado Livre
 - **Status**: ✅ Conectado
 
 ### Mercado Pago
 - **Access Token**: Configurado nas variáveis de ambiente
-- **Status**: ✅ Configurado (conta de teste)
+- **Status**: ✅ Configurado
 
 ---
 
@@ -48,7 +50,7 @@ x-api-key: conciliacao-api-key-2026
 #### Sincronizar Pedidos do Mercado Livre:
 ```bash
 curl -X POST "https://n8n-conciliacao-api.zgbjol.easypanel.host/sync/ml/orders" \
-  -H "x-api-key: conciliacao-api-key-2026" \
+  -H "x-api-key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"days": 30}'
 ```
@@ -56,7 +58,7 @@ curl -X POST "https://n8n-conciliacao-api.zgbjol.easypanel.host/sync/ml/orders" 
 #### Sincronizar Movimentos do Mercado Pago:
 ```bash
 curl -X POST "https://n8n-conciliacao-api.zgbjol.easypanel.host/sync/mp/movements" \
-  -H "x-api-key: conciliacao-api-key-2026" \
+  -H "x-api-key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"days": 30}'
 ```
@@ -65,7 +67,7 @@ curl -X POST "https://n8n-conciliacao-api.zgbjol.easypanel.host/sync/mp/movement
 
 ```bash
 curl -X POST "https://n8n-conciliacao-api.zgbjol.easypanel.host/reconciliation" \
-  -H "x-api-key: conciliacao-api-key-2026" \
+  -H "x-api-key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"days": 30}'
 ```
@@ -85,7 +87,7 @@ curl -X POST "https://n8n-conciliacao-api.zgbjol.easypanel.host/reconciliation" 
 
 ```bash
 curl -X GET "https://n8n-conciliacao-api.zgbjol.easypanel.host/reports/excel?days=30" \
-  -H "x-api-key: conciliacao-api-key-2026" \
+  -H "x-api-key: $API_KEY" \
   -o relatorio.xlsx
 ```
 
@@ -107,7 +109,7 @@ O sistema está configurado para executar automaticamente a cada 6 horas:
 3. Crie credencial "Header Auth":
    - **Name**: `ML-MP API Key`
    - **Header Name**: `x-api-key`
-   - **Header Value**: `conciliacao-api-key-2026`
+   - **Header Value**: `[SUA_API_KEY]`
 4. Vá em **Workflows** > **Import from File**
 5. Importe o arquivo: `n8n-workflow-conciliacao.json`
 6. Ative o workflow

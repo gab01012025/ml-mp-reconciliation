@@ -2,8 +2,15 @@
 # Script de teste do Sistema de Conciliação ML-MP
 # Execute: bash teste-sistema.sh
 
+# IMPORTANTE: Configure sua API Key antes de executar
 API_URL="https://n8n-conciliacao-api.zgbjol.easypanel.host"
-API_KEY="conciliacao-api-key-2026"
+API_KEY="${API_KEY:-CONFIGURE_SUA_API_KEY_AQUI}"
+
+if [ "$API_KEY" == "CONFIGURE_SUA_API_KEY_AQUI" ]; then
+    echo "⚠️  ERRO: Configure a variável API_KEY antes de executar"
+    echo "   Exemplo: API_KEY=sua-chave-aqui bash teste-sistema.sh"
+    exit 1
+fi
 
 echo "==========================================="
 echo "   TESTE DO SISTEMA DE CONCILIAÇÃO ML-MP"

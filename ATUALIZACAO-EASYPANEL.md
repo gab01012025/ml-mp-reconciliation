@@ -24,7 +24,7 @@ curl -s "https://n8n-conciliacao-api.zgbjol.easypanel.host/health"
 
 ```bash
 curl -s -X POST "https://n8n-conciliacao-api.zgbjol.easypanel.host/sync/mp/movements" \
-  -H "x-api-key: conciliacao-api-key-2026" \
+  -H "x-api-key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"days": 30}'
 ```

@@ -5,7 +5,7 @@
 | Item | Valor |
 |------|-------|
 | **URL da API** | `https://n8n-conciliacao-api.zgbjol.easypanel.host` |
-| **API Key** | `conciliacao-api-key-2026` |
+| **API Key** | `[CONFIGURAR - enviada por canal seguro]` |
 | **Header** | `x-api-key` |
 
 ---
@@ -18,7 +18,7 @@
 4. Configure:
    - **Name**: `ML-MP API Key`
    - **Header Name**: `x-api-key`
-   - **Header Value**: `conciliacao-api-key-2026`
+   - **Header Value**: `[SUA_API_KEY]`
 5. Salve
 
 ---
@@ -76,7 +76,7 @@ GET /reports/export/excel
   "method": "POST",
   "url": "https://n8n-conciliacao-api.zgbjol.easypanel.host/sync/ml/orders",
   "headers": {
-    "x-api-key": "conciliacao-api-key-2026",
+    "x-api-key": "[SUA_API_KEY]",
     "Content-Type": "application/json"
   },
   "body": {
@@ -92,7 +92,7 @@ GET /reports/export/excel
   "method": "POST",
   "url": "https://n8n-conciliacao-api.zgbjol.easypanel.host/reconciliation",
   "headers": {
-    "x-api-key": "conciliacao-api-key-2026"
+    "x-api-key": "[SUA_API_KEY]"
   }
 }
 ```

@@ -79,13 +79,13 @@ curl -s "https://n8n-conciliacao-api.zgbjol.easypanel.host/health"
 
 # 2. Testar sync de MP (deve funcionar sem erros)
 curl -s -X POST "https://n8n-conciliacao-api.zgbjol.easypanel.host/sync/mp/movements" \
-  -H "x-api-key: conciliacao-api-key-2026" \
+  -H "x-api-key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"days": 30}'
 
 # 3. Rodar conciliação
 curl -s -X POST "https://n8n-conciliacao-api.zgbjol.easypanel.host/reconciliation" \
-  -H "x-api-key: conciliacao-api-key-2026" \
+  -H "x-api-key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"days": 30}'
 ```

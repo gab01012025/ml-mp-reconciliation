@@ -28,7 +28,7 @@ Isso vai baixar a nova imagem e reiniciar o serviço.
 
 ```bash
 curl -s "https://n8n-conciliacao-api.zgbjol.easypanel.host/health" \
-  -H "x-api-key: conciliacao-api-key-2026"
+  -H "x-api-key: $API_KEY"
 ```
 
 ---
