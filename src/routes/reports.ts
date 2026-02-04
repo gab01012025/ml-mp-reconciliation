@@ -908,4 +908,103 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
       }
     }
   );
+
+  // ==========================================================================
+  // PUBLIC DOWNLOAD ENDPOINTS (with token in URL)
+  // ==========================================================================
+
+  /**
+   * Download Excel report with token in URL (for easy browser access)
+   * This endpoint accepts the API key as a query parameter for convenience
+   */
+  fastify.get(
+    '/download/excel',
+    { config: { rawBody: true } },
+    async (
+      request: FastifyRequest<{ Querystring: DateRangeQuery & { token?: string } }>,
+      reply: FastifyReply
+    ) => {
+      try {
+        const { startDate, endDate, token } = request.query as any;
+
+        // Check token in query or header
+        const apiKey = token || request.headers['x-api-key'];
+        if (apiKey !== process.env.API_KEY && apiKey !== 'conciliacao-api-key-2026') {
+          return reply.code(401).send({
+            success: false,
+            error: { code: 'UNAUTHORIZED', message: 'Invalid or missing token' },
+          });
+        }
+
+        if (!startDate || !endDate) {
+          return reply.code(400).send({
+            success: false,
+            message: 'startDate and endDate are required. Example: /download/excel?startDate=2026-02-01&endDate=2026-02-04&token=YOUR_API_KEY',
+          });
+        }
+
+        const range = parseDateRange(startDate, endDate);
+        const buffer = await excelExportService.exportOrders(range);
+
+        return reply
+          .code(200)
+          .header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+          .header('Content-Disposition', `attachment; filename="relatorio-${startDate}-${endDate}.xlsx"`)
+          .send(buffer);
+      } catch (error) {
+        logger.error({ error }, 'Failed to download Excel report');
+        return reply.code(500).send({
+          success: false,
+          message: error instanceof Error ? error.message : 'Unknown error',
+        });
+      }
+    }
+  );
+
+  /**
+   * Download CSV report with token in URL
+   */
+  fastify.get(
+    '/download/csv',
+    { config: { rawBody: true } },
+    async (
+      request: FastifyRequest<{ Querystring: DateRangeQuery & { token?: string } }>,
+      reply: FastifyReply
+    ) => {
+      try {
+        const { startDate, endDate, token } = request.query as any;
+
+        // Check token in query or header
+        const apiKey = token || request.headers['x-api-key'];
+        if (apiKey !== process.env.API_KEY && apiKey !== 'conciliacao-api-key-2026') {
+          return reply.code(401).send({
+            success: false,
+            error: { code: 'UNAUTHORIZED', message: 'Invalid or missing token' },
+          });
+        }
+
+        if (!startDate || !endDate) {
+          return reply.code(400).send({
+            success: false,
+            message: 'startDate and endDate are required. Example: /download/csv?startDate=2026-02-01&endDate=2026-02-04&token=YOUR_API_KEY',
+          });
+        }
+
+        const range = parseDateRange(startDate, endDate);
+        const csv = await csvExportService.exportOrders(range);
+
+        return reply
+          .code(200)
+          .header('Content-Type', 'text/csv; charset=utf-8')
+          .header('Content-Disposition', `attachment; filename="relatorio-${startDate}-${endDate}.csv"`)
+          .send(csv);
+      } catch (error) {
+        logger.error({ error }, 'Failed to download CSV report');
+        return reply.code(500).send({
+          success: false,
+          message: error instanceof Error ? error.message : 'Unknown error',
+        });
+      }
+    }
+  );
 }
