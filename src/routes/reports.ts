@@ -944,12 +944,12 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
         }
 
         const range = parseDateRange(startDate, endDate);
-        const buffer = await excelExportService.exportOrders(range);
+        const buffer = await excelExportService.exportOrdersWithFees(range);
 
         return reply
           .code(200)
           .header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-          .header('Content-Disposition', `attachment; filename="relatorio-${startDate}-${endDate}.xlsx"`)
+          .header('Content-Disposition', `attachment; filename="relatorio-taxas-${startDate}-${endDate}.xlsx"`)
           .send(buffer);
       } catch (error) {
         logger.error({ error }, 'Failed to download Excel report');

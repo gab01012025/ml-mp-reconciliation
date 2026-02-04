@@ -491,6 +491,145 @@ class ExcelExportService {
 
     return Buffer.from(buffer);
   }
+
+  /**
+   * Export orders with fees breakdown to Excel
+   */
+  async exportOrdersWithFees(options: ExportOptions): Promise<Buffer> {
+    logger.info({ startDate: options.startDate, endDate: options.endDate }, 'Exporting orders with fees to Excel');
+
+    const orders = await prisma.mLOrder.findMany({
+      where: {
+        dateCreated: {
+          gte: options.startDate,
+          lte: options.endDate,
+        },
+      },
+      include: {
+        items: true,
+        payments: true,
+      },
+      orderBy: { dateCreated: 'desc' },
+    });
+
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'ML-MP Reconciliation';
+    workbook.created = new Date();
+
+    const sheet = workbook.addWorksheet('Pedidos com Taxas', {
+      properties: { tabColor: { argb: 'FF00A0DC' } },
+    });
+
+    // Define columns with fees
+    sheet.columns = [
+      { header: 'ID Pedido', key: 'externalId', width: 18 },
+      { header: 'Data', key: 'dateCreated', width: 18 },
+      { header: 'Status', key: 'status', width: 12 },
+      { header: 'Produto', key: 'products', width: 35 },
+      { header: 'Qtd', key: 'quantity', width: 6 },
+      { header: 'Valor Bruto', key: 'grossAmount', width: 14 },
+      { header: 'Taxa ML', key: 'mlFee', width: 12 },
+      { header: 'Taxa MP', key: 'mpFee', width: 12 },
+      { header: 'Frete', key: 'shippingCost', width: 12 },
+      { header: 'Valor Líquido', key: 'netAmount', width: 14 },
+      { header: '% Taxas', key: 'feePercentage', width: 10 },
+    ];
+
+    // Style header row
+    const headerRow = sheet.getRow(1);
+    headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    headerRow.fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FF00A0DC' },
+    };
+    headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
+
+    let totalGross = 0;
+    let totalMlFee = 0;
+    let totalMpFee = 0;
+    let totalShipping = 0;
+    let totalNet = 0;
+
+    // Add data with fees calculation
+    for (const order of orders) {
+      const productTitles = order.items.map(i => i.title).join(', ');
+      const quantity = order.items.reduce((sum, i) => sum + i.quantity, 0);
+      
+      // Calculate fees from items
+      let mlFee = 0;
+      let mpFee = 0;
+      
+      for (const item of order.items) {
+        if (item.saleFee) mlFee += Number(item.saleFee);
+      }
+      
+      // Check payments for MP fee
+      for (const payment of order.payments) {
+        if (payment.feeAmount) mpFee += Number(payment.feeAmount);
+      }
+      
+      const grossAmount = Number(order.totalAmount);
+      const shippingCost = order.shippingCost ? Number(order.shippingCost) : 0;
+      const netAmount = grossAmount - mlFee - mpFee;
+      const feePercentage = grossAmount > 0 ? ((mlFee + mpFee) / grossAmount * 100) : 0;
+      
+      totalGross += grossAmount;
+      totalMlFee += mlFee;
+      totalMpFee += mpFee;
+      totalShipping += shippingCost;
+      totalNet += netAmount;
+
+      sheet.addRow({
+        externalId: order.externalId,
+        dateCreated: order.dateCreated,
+        status: order.status,
+        products: productTitles.substring(0, 80),
+        quantity,
+        grossAmount,
+        mlFee,
+        mpFee,
+        shippingCost,
+        netAmount,
+        feePercentage,
+      });
+    }
+
+    // Format currency columns
+    ['F', 'G', 'H', 'I', 'J'].forEach(col => {
+      sheet.getColumn(col).numFmt = 'R$ #,##0.00';
+    });
+    
+    // Format percentage column
+    sheet.getColumn('K').numFmt = '0.00%';
+
+    // Format date column
+    sheet.getColumn('B').numFmt = 'dd/mm/yyyy hh:mm';
+
+    // Add summary row
+    sheet.addRow({});
+    const summaryRow = sheet.addRow({
+      externalId: 'TOTAIS',
+      quantity: orders.length,
+      grossAmount: totalGross,
+      mlFee: totalMlFee,
+      mpFee: totalMpFee,
+      shippingCost: totalShipping,
+      netAmount: totalNet,
+      feePercentage: totalGross > 0 ? (totalMlFee + totalMpFee) / totalGross : 0,
+    });
+    summaryRow.font = { bold: true };
+    summaryRow.fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFFFE599' },
+    };
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    logger.info({ orderCount: orders.length }, 'Orders with fees exported to Excel');
+
+    return Buffer.from(buffer);
+  }
 }
 
 export const excelExportService = new ExcelExportService();
