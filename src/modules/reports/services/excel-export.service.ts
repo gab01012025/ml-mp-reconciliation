@@ -512,6 +512,29 @@ class ExcelExportService {
       orderBy: { dateCreated: 'desc' },
     });
 
+    // Get MP movements to find fees by reference (order ID)
+    const movements = await prisma.mPMovement.findMany({
+      where: {
+        dateCreated: {
+          gte: options.startDate,
+          lte: options.endDate,
+        },
+      },
+    });
+
+    // Create a map of order ID -> MP fee
+    const mpFeeByReference = new Map<string, number>();
+    for (const mov of movements) {
+      if (mov.fee && mov.referenceId) {
+        const currentFee = mpFeeByReference.get(mov.referenceId) || 0;
+        mpFeeByReference.set(mov.referenceId, currentFee + Number(mov.fee));
+      }
+      if (mov.fee && mov.externalReference) {
+        const currentFee = mpFeeByReference.get(mov.externalReference) || 0;
+        mpFeeByReference.set(mov.externalReference, currentFee + Number(mov.fee));
+      }
+    }
+
     const workbook = new ExcelJS.Workbook();
     workbook.creator = 'ML-MP Reconciliation';
     workbook.created = new Date();
@@ -556,18 +579,14 @@ class ExcelExportService {
       const productTitles = order.items.map(i => i.title).join(', ');
       const quantity = order.items.reduce((sum, i) => sum + i.quantity, 0);
       
-      // Calculate fees from items
+      // Calculate ML fees from items (sale_fee)
       let mlFee = 0;
-      let mpFee = 0;
-      
       for (const item of order.items) {
         if (item.saleFee) mlFee += Number(item.saleFee);
       }
       
-      // Check payments for MP fee
-      for (const payment of order.payments) {
-        if (payment.feeAmount) mpFee += Number(payment.feeAmount);
-      }
+      // Get MP fee from movements map (by order externalId)
+      const mpFee = mpFeeByReference.get(order.externalId) || 0;
       
       const grossAmount = Number(order.totalAmount);
       const shippingCost = order.shippingCost ? Number(order.shippingCost) : 0;
