@@ -25,7 +25,8 @@ async function authPlugin(fastify: FastifyInstance, opts: AuthPluginOptions) {
       return;
     }
 
-    const apiKey = request.headers[headerName];
+    // Check for API key in header OR query parameter (for /download routes)
+    const apiKey = request.headers[headerName] || (request.query as any)?.token;
 
     if (!apiKey) {
       return reply.status(401).send({
