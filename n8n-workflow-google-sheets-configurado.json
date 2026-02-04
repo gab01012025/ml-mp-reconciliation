@@ -1,0 +1,138 @@
+{
+  "name": "Relatório Diário → Google Sheets",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24,
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Todo dia às 8h",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [400, 400]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://n8n-conciliacao-api.zgbjol.easypanel.host/reports/order-fees",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "conciliacao-api-key-2026"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "startDate",
+              "value": "={{ $now.minus({days: 1}).toFormat('yyyy-MM-dd') }}"
+            },
+            {
+              "name": "endDate",
+              "value": "={{ $now.toFormat('yyyy-MM-dd') }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "http-request",
+      "name": "Buscar Relatório",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [600, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Formata os dados para o Google Sheets\nconst items = $input.all();\nconst result = [];\n\nfor (const item of items) {\n  const data = item.json.data || item.json;\n  \n  if (Array.isArray(data)) {\n    for (const order of data) {\n      result.push({\n        json: {\n          'ID Pedido': order.externalId || '',\n          'Data': order.dateCreated ? new Date(order.dateCreated).toLocaleDateString('pt-BR') : '',\n          'Status': order.status || '',\n          'Produto': order.products || '',\n          'Qtd': order.quantity || 0,\n          'Valor Bruto': order.grossAmount || 0,\n          'Taxa ML': order.mlFee || 0,\n          'Taxa MP': order.mpFee || 0,\n          'Frete': order.shippingCost || 0,\n          'Valor Líquido': order.netAmount || 0,\n          '% Taxas': order.feePercentage ? order.feePercentage.toFixed(2) + '%' : '0%'\n        }\n      });\n    }\n  }\n}\n\nreturn result.length > 0 ? result : [{ json: { message: 'Nenhum dado encontrado' } }];"
+      },
+      "id": "code-format",
+      "name": "Formatar Dados",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [800, 400]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1aiJ6QDljeSpmA7dM_ctVHu556BkMsPTrZ_rY8mvTy1c",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Relatorios",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {}
+        },
+        "options": {}
+      },
+      "id": "google-sheets",
+      "name": "Salvar no Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1000, 400],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "",
+          "name": ""
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Todo dia às 8h": {
+      "main": [
+        [
+          {
+            "node": "Buscar Relatório",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar Relatório": {
+      "main": [
+        [
+          {
+            "node": "Formatar Dados",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Formatar Dados": {
+      "main": [
+        [
+          {
+            "node": "Salvar no Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": []
+}
