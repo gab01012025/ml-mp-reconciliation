@@ -56,6 +56,174 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
   };
 
   // ==========================================================================
+  // JSON ENDPOINTS FOR GOOGLE SHEETS / N8N
+  // ==========================================================================
+
+  /**
+   * Get orders with full details for Google Sheets export
+   * Returns: ID, Produto, Valor Produto, Taxa Venda, Frete, Total Líquido
+   */
+  fastify.get(
+    '/reports/orders/details',
+    async (
+      request: FastifyRequest<{ Querystring: DateRangeQuery & { limit?: string } }>,
+      reply: FastifyReply
+    ) => {
+      try {
+        const { startDate, endDate, limit } = request.query;
+
+        if (!startDate || !endDate) {
+          return reply.code(400).send({
+            success: false,
+            message: 'startDate and endDate are required',
+          });
+        }
+
+        const start = new Date(startDate);
+        const end = new Date(endDate);
+        const maxResults = limit ? parseInt(limit, 10) : 500;
+
+        const orders = await prisma.mLOrder.findMany({
+          where: {
+            dateCreated: {
+              gte: start,
+              lte: end,
+            },
+          },
+          include: {
+            items: true,
+            payments: true,
+          },
+          orderBy: { dateCreated: 'desc' },
+          take: maxResults,
+        });
+
+        // Format data for Google Sheets
+        const formattedOrders = orders.flatMap((order) => {
+          // Calculate totals per order
+          const totalItems = order.items.reduce(
+            (sum, item) => sum + item.unitPrice.toNumber() * item.quantity,
+            0
+          );
+          const totalFees = order.items.reduce(
+            (sum, item) => sum + (item.saleFee?.toNumber() || 0),
+            0
+          );
+          const shippingCost = order.shippingCost?.toNumber() || 0;
+          const totalLiquido = totalItems - totalFees - shippingCost;
+
+          // Return one row per item for detailed view
+          return order.items.map((item) => ({
+            pedidoId: order.externalId,
+            data: order.dateCreated.toISOString().split('T')[0],
+            status: order.status,
+            produto: item.title,
+            quantidade: item.quantity,
+            valorProduto: item.unitPrice.toNumber() * item.quantity,
+            taxaVenda: item.saleFee?.toNumber() || 0,
+            frete: shippingCost / order.items.length, // Divide frete pelos itens
+            totalLiquido: (item.unitPrice.toNumber() * item.quantity) - (item.saleFee?.toNumber() || 0) - (shippingCost / order.items.length),
+            sku: item.sku || '',
+          }));
+        });
+
+        return reply.code(200).send({
+          success: true,
+          count: formattedOrders.length,
+          data: formattedOrders,
+        });
+      } catch (error) {
+        logger.error({ error }, 'Failed to get order details');
+        return reply.code(500).send({
+          success: false,
+          message: error instanceof Error ? error.message : 'Unknown error',
+        });
+      }
+    }
+  );
+
+  /**
+   * Get orders summary (one row per order) for Google Sheets
+   */
+  fastify.get(
+    '/reports/orders/summary',
+    async (
+      request: FastifyRequest<{ Querystring: DateRangeQuery & { limit?: string } }>,
+      reply: FastifyReply
+    ) => {
+      try {
+        const { startDate, endDate, limit } = request.query;
+
+        if (!startDate || !endDate) {
+          return reply.code(400).send({
+            success: false,
+            message: 'startDate and endDate are required',
+          });
+        }
+
+        const start = new Date(startDate);
+        const end = new Date(endDate);
+        const maxResults = limit ? parseInt(limit, 10) : 500;
+
+        const orders = await prisma.mLOrder.findMany({
+          where: {
+            dateCreated: {
+              gte: start,
+              lte: end,
+            },
+          },
+          include: {
+            items: true,
+            payments: true,
+          },
+          orderBy: { dateCreated: 'desc' },
+          take: maxResults,
+        });
+
+        // Format data - one row per order
+        const formattedOrders = orders.map((order) => {
+          const produtos = order.items.map(i => i.title).join(' | ');
+          const totalItems = order.items.reduce(
+            (sum, item) => sum + item.unitPrice.toNumber() * item.quantity,
+            0
+          );
+          const totalFees = order.items.reduce(
+            (sum, item) => sum + (item.saleFee?.toNumber() || 0),
+            0
+          );
+          const shippingCost = order.shippingCost?.toNumber() || 0;
+          const totalLiquido = totalItems - totalFees - shippingCost;
+
+          return {
+            pedidoId: order.externalId,
+            data: order.dateCreated.toISOString().split('T')[0],
+            hora: order.dateCreated.toISOString().split('T')[1].substring(0, 5),
+            status: order.status,
+            produtos: produtos.substring(0, 200),
+            qtdItens: order.items.length,
+            valorProdutos: Number(totalItems.toFixed(2)),
+            taxaVenda: Number(totalFees.toFixed(2)),
+            frete: Number(shippingCost.toFixed(2)),
+            totalLiquido: Number(totalLiquido.toFixed(2)),
+          };
+        });
+
+        return reply.code(200).send({
+          success: true,
+          count: formattedOrders.length,
+          data: formattedOrders,
+        });
+      } catch (error) {
+        logger.error({ error }, 'Failed to get orders summary');
+        return reply.code(500).send({
+          success: false,
+          message: error instanceof Error ? error.message : 'Unknown error',
+        });
+      }
+    }
+  );
+
+  // ==========================================================================
   // SUMMARY & ANALYTICS
   // ==========================================================================
 
