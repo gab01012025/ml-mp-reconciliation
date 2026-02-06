@@ -1,37 +1,31 @@
 {
-  "name": "Relatório Diário → Google Sheets",
+  "name": "ML-MP Exportar para Google Sheets",
   "nodes": [
     {
       "parameters": {
         "rule": {
-          "interval": [
-            {
-              "field": "hours",
-              "hoursInterval": 24,
-              "triggerAtHour": 8
-            }
-          ]
+          "interval": [{ "field": "hours", "hoursInterval": 6 }]
         }
       },
       "id": "schedule-trigger",
-      "name": "Todo dia às 8h",
+      "name": "Executar a cada 6 horas",
       "type": "n8n-nodes-base.scheduleTrigger",
-      "typeVersion": 1.2,
+      "typeVersion": 1,
       "position": [250, 300]
     },
     {
       "parameters": {
         "method": "GET",
-        "url": "=https://n8n-conciliacao-api.zgbjol.easypanel.host/reports/order-fees?startDate={{ $now.minus({days: 1}).toFormat('yyyy-MM-dd') }}&endDate={{ $now.toFormat('yyyy-MM-dd') }}",
+        "url": "=https://n8n-conciliacao-api.zgbjol.easypanel.host/reports/orders/details?startDate={{ $now.minus({days: 7}).toFormat('yyyy-MM-dd') }}&endDate={{ $now.toFormat('yyyy-MM-dd') }}&limit=500",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "options": {}
       },
-      "id": "http-get-report",
-      "name": "Buscar Relatório",
+      "id": "get-orders",
+      "name": "1. Buscar Pedidos",
       "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [500, 300],
+      "typeVersion": 4,
+      "position": [450, 300],
       "credentials": {
         "httpHeaderAuth": {
           "id": "CREDENTIAL_ID",
@@ -41,38 +35,51 @@
     },
     {
       "parameters": {
-        "jsCode": "// Extrai os dados do relatório\nconst response = $input.first().json;\n\nif (!response.success || !response.data) {\n  return [{ json: { error: 'Sem dados' } }];\n}\n\n// Formata cada pedido para o Google Sheets\nconst rows = response.data.map(order => ({\n  data: new Date().toISOString().split('T')[0],\n  pedido_id: order.orderId,\n  valor_bruto: order.totalAmount || 0,\n  taxa_ml: order.mlFee || 0,\n  taxa_mp: order.mpFee || 0,\n  frete: order.shippingCost || 0,\n  valor_liquido: order.netAmount || 0,\n  percentual_taxas: order.feePercentage || 0\n}));\n\nreturn rows.map(row => ({ json: row }));"
+        "jsCode": "// Extrair array de data\nconst response = $input.first().json;\nconst orders = response.data || [];\n\n// Retornar cada pedido como item separado\nreturn orders.map(order => ({\n  json: {\n    pedidoId: order.pedidoId,\n    data: order.data,\n    status: order.status,\n    produto: order.produto,\n    quantidade: order.quantidade,\n    valorProduto: order.valorProduto,\n    taxaVenda: order.taxaVenda,\n    frete: order.frete || 0,\n    totalLiquido: order.totalLiquido,\n    sku: order.sku || ''\n  }\n}));"
       },
-      "id": "code-format",
-      "name": "Formatar Dados",
+      "id": "transform-data",
+      "name": "2. Transformar Dados",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [750, 300]
+      "position": [650, 300]
     },
     {
       "parameters": {
-        "operation": "append",
+        "operation": "appendOrUpdate",
         "documentId": {
           "__rl": true,
-          "mode": "list",
-          "value": ""
+          "mode": "id",
+          "value": "SEU_SPREADSHEET_ID_AQUI"
         },
         "sheetName": {
           "__rl": true,
           "mode": "list",
-          "value": ""
+          "value": "Pedidos"
         },
         "columns": {
-          "mappingMode": "autoMapInputData",
-          "value": {}
+          "mappingMode": "defineBelow",
+          "value": {
+            "ID Pedido": "={{ $json.pedidoId }}",
+            "Data": "={{ $json.data }}",
+            "Status": "={{ $json.status }}",
+            "Produto": "={{ $json.produto }}",
+            "Quantidade": "={{ $json.quantidade }}",
+            "Valor Produto": "={{ $json.valorProduto }}",
+            "Taxa Venda": "={{ $json.taxaVenda }}",
+            "Frete": "={{ $json.frete }}",
+            "Total Líquido": "={{ $json.totalLiquido }}",
+            "SKU": "={{ $json.sku }}"
+          }
         },
-        "options": {}
+        "options": {
+          "cellFormat": "USER_ENTERED"
+        }
       },
       "id": "google-sheets",
-      "name": "Salvar no Google Sheets",
+      "name": "3. Salvar no Google Sheets",
       "type": "n8n-nodes-base.googleSheets",
-      "typeVersion": 4.5,
-      "position": [1000, 300],
+      "typeVersion": 4,
+      "position": [850, 300],
       "credentials": {
         "googleSheetsOAuth2Api": {
           "id": "GOOGLE_CREDENTIAL_ID",
@@ -82,45 +89,17 @@
     }
   ],
   "connections": {
-    "Todo dia às 8h": {
-      "main": [
-        [
-          {
-            "node": "Buscar Relatório",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+    "Executar a cada 6 horas": {
+      "main": [[{ "node": "1. Buscar Pedidos", "type": "main", "index": 0 }]]
     },
-    "Buscar Relatório": {
-      "main": [
-        [
-          {
-            "node": "Formatar Dados",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+    "1. Buscar Pedidos": {
+      "main": [[{ "node": "2. Transformar Dados", "type": "main", "index": 0 }]]
     },
-    "Formatar Dados": {
-      "main": [
-        [
-          {
-            "node": "Salvar no Google Sheets",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+    "2. Transformar Dados": {
+      "main": [[{ "node": "3. Salvar no Google Sheets", "type": "main", "index": 0 }]]
     }
   },
   "settings": {
     "executionOrder": "v1"
-  },
-  "staticData": null,
-  "tags": [],
-  "triggerCount": 1,
-  "pinData": {}
+  }
 }
