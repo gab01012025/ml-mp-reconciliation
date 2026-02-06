@@ -109,7 +109,14 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
             (sum, item) => sum + (item.saleFee?.toNumber() || 0),
             0
           );
-          const shippingCost = order.shippingCost?.toNumber() || 0;
+          // Get shipping cost from order or sum from payments
+          let shippingCost = order.shippingCost?.toNumber() || 0;
+          if (shippingCost === 0 && order.payments.length > 0) {
+            shippingCost = order.payments.reduce(
+              (sum, p) => sum + (p.shippingCost?.toNumber() || 0),
+              0
+            );
+          }
           const totalLiquido = totalItems - totalFees - shippingCost;
 
           // Return one row per item for detailed view
@@ -191,7 +198,14 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
             (sum, item) => sum + (item.saleFee?.toNumber() || 0),
             0
           );
-          const shippingCost = order.shippingCost?.toNumber() || 0;
+          // Get shipping cost from order or sum from payments
+          let shippingCost = order.shippingCost?.toNumber() || 0;
+          if (shippingCost === 0 && order.payments.length > 0) {
+            shippingCost = order.payments.reduce(
+              (sum, p) => sum + (p.shippingCost?.toNumber() || 0),
+              0
+            );
+          }
           const totalLiquido = totalItems - totalFees - shippingCost;
 
           return {

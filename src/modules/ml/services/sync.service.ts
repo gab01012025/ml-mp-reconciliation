@@ -180,7 +180,9 @@ export class MLSyncService {
           status: mapOrderStatus(order.status),
           totalAmount: order.total_amount,
           currency: order.currency_id,
-          shippingCost: order.shipping ? null : null, // Will be updated from shipment
+          shippingCost: order.payments
+            ? order.payments.reduce((sum: number, p: { shipping_cost?: number }) => sum + (p.shipping_cost || 0), 0)
+            : 0,
           dateCreated: new Date(order.date_created),
           dateClosed: order.date_closed ? new Date(order.date_closed) : null,
           dateLastUpdated: new Date(order.last_updated),
@@ -190,6 +192,9 @@ export class MLSyncService {
         update: {
           status: mapOrderStatus(order.status),
           totalAmount: order.total_amount,
+          shippingCost: order.payments
+            ? order.payments.reduce((sum: number, p: { shipping_cost?: number }) => sum + (p.shipping_cost || 0), 0)
+            : 0,
           dateClosed: order.date_closed ? new Date(order.date_closed) : null,
           dateLastUpdated: new Date(order.last_updated),
           rawData: JSON.parse(JSON.stringify(order)) as Prisma.InputJsonValue,
