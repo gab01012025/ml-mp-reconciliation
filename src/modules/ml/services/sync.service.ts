@@ -235,10 +235,21 @@ export class MLSyncService {
         await this.upsertPayment(tx, dbOrder.id, payment);
       }
 
-      // Upsert shipment if exists
+      // Upsert shipment if exists AND update order shippingCost from shipment
       if (order.shipping?.id) {
         try {
           const shipmentDetails = await this.client.getShipment(order.shipping.id);
+          
+          // Update order shippingCost from the actual shipment cost
+          const shipmentCost = shipmentDetails.base_cost || 0;
+          if (shipmentCost > 0) {
+            await tx.mLOrder.update({
+              where: { id: dbOrder.id },
+              data: { shippingCost: shipmentCost },
+            });
+            logger.debug({ orderId: order.id, shipmentCost }, 'Updated order shippingCost from shipment');
+          }
+
           await tx.mLShipment.upsert({
             where: { externalId: String(shipmentDetails.id) },
             create: {

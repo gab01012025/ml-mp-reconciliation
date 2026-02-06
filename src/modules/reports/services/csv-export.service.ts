@@ -62,24 +62,45 @@ export class CsvExportService {
       include: {
         items: true,
         payments: true,
+        shipments: true,
       },
       orderBy: { dateCreated: 'desc' },
     });
 
-    const rows: CsvRow[] = orders.map((order) => ({
-      id: order.id,
-      externalId: order.externalId,
-      sellerId: order.sellerId,
-      buyerId: order.buyerId,
-      status: order.status,
-      totalAmount: order.totalAmount.toNumber(),
-      currency: order.currency,
-      shippingCost: order.shippingCost?.toNumber() || 0,
-      dateCreated: order.dateCreated.toISOString(),
-      dateClosed: order.dateClosed?.toISOString() || '',
-      itemsCount: order.items.length,
-      paymentsCount: order.payments.length,
-    }));
+    const rows: CsvRow[] = orders.map((order) => {
+      // Get shipping cost: 1) from shipment table, 2) from order field, 3) from payments
+      let shippingCost = 0;
+      if (order.shipments && order.shipments.length > 0) {
+        shippingCost = order.shipments.reduce(
+          (sum, s) => sum + (s.cost?.toNumber() || 0),
+          0
+        );
+      }
+      if (shippingCost === 0) {
+        shippingCost = order.shippingCost?.toNumber() || 0;
+      }
+      if (shippingCost === 0 && order.payments.length > 0) {
+        shippingCost = order.payments.reduce(
+          (sum, p) => sum + (p.shippingCost?.toNumber() || 0),
+          0
+        );
+      }
+
+      return {
+        id: order.id,
+        externalId: order.externalId,
+        sellerId: order.sellerId,
+        buyerId: order.buyerId,
+        status: order.status,
+        totalAmount: order.totalAmount.toNumber(),
+        currency: order.currency,
+        shippingCost,
+        dateCreated: order.dateCreated.toISOString(),
+        dateClosed: order.dateClosed?.toISOString() || '',
+        itemsCount: order.items.length,
+        paymentsCount: order.payments.length,
+      };
+    });
 
     return this.toCsv(rows, [
       'id',

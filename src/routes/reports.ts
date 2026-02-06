@@ -93,10 +93,35 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
           include: {
             items: true,
             payments: true,
+            shipments: true,
           },
           orderBy: { dateCreated: 'desc' },
           take: maxResults,
         });
+
+        // Helper: extract marketplace fee from payment rawData
+        const getMarketplaceFee = (payments: typeof orders[0]['payments']): number => {
+          let totalFee = 0;
+          for (const p of payments) {
+            const raw = p.rawData as Record<string, unknown> | null;
+            if (raw) {
+              // marketplace_fee field
+              if (typeof raw.marketplace_fee === 'number' && raw.marketplace_fee > 0) {
+                totalFee += raw.marketplace_fee;
+              }
+              // fee_details array (mercadopago_fee, etc.)
+              if (Array.isArray(raw.fee_details)) {
+                for (const fee of raw.fee_details) {
+                  const f = fee as { type?: string; amount?: number };
+                  if (f.amount && f.amount > 0) {
+                    totalFee += f.amount;
+                  }
+                }
+              }
+            }
+          }
+          return totalFee;
+        };
 
         // Format data for Google Sheets
         const formattedOrders = orders.flatMap((order) => {
@@ -105,19 +130,30 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
             (sum, item) => sum + item.unitPrice.toNumber() * item.quantity,
             0
           );
-          const totalFees = order.items.reduce(
+          const totalSaleFees = order.items.reduce(
             (sum, item) => sum + (item.saleFee?.toNumber() || 0),
             0
           );
-          // Get shipping cost from order or sum from payments
-          let shippingCost = order.shippingCost?.toNumber() || 0;
+          // Get shipping cost: 1) from shipment table, 2) from order field, 3) from payments
+          let shippingCost = 0;
+          if (order.shipments && order.shipments.length > 0) {
+            shippingCost = order.shipments.reduce(
+              (sum, s) => sum + (s.cost?.toNumber() || 0),
+              0
+            );
+          }
+          if (shippingCost === 0) {
+            shippingCost = order.shippingCost?.toNumber() || 0;
+          }
           if (shippingCost === 0 && order.payments.length > 0) {
             shippingCost = order.payments.reduce(
               (sum, p) => sum + (p.shippingCost?.toNumber() || 0),
               0
             );
           }
-          const totalLiquido = totalItems - totalFees - shippingCost;
+          // Get marketplace fee from payment rawData
+          const taxaMP = getMarketplaceFee(order.payments);
+          const totalLiquido = totalItems - totalSaleFees - shippingCost - taxaMP;
 
           // Return one row per item for detailed view
           return order.items.map((item) => ({
@@ -128,8 +164,9 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
             quantidade: item.quantity,
             valorProduto: item.unitPrice.toNumber() * item.quantity,
             taxaVenda: item.saleFee?.toNumber() || 0,
-            frete: shippingCost / order.items.length, // Divide frete pelos itens
-            totalLiquido: (item.unitPrice.toNumber() * item.quantity) - (item.saleFee?.toNumber() || 0) - (shippingCost / order.items.length),
+            taxaMP: Number((taxaMP / order.items.length).toFixed(2)),
+            frete: Number((shippingCost / order.items.length).toFixed(2)),
+            totalLiquido: Number(((item.unitPrice.toNumber() * item.quantity) - (item.saleFee?.toNumber() || 0) - (shippingCost / order.items.length) - (taxaMP / order.items.length)).toFixed(2)),
             sku: item.sku || '',
           }));
         });
@@ -182,10 +219,33 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
           include: {
             items: true,
             payments: true,
+            shipments: true,
           },
           orderBy: { dateCreated: 'desc' },
           take: maxResults,
         });
+
+        // Helper: extract marketplace fee from payment rawData
+        const getMarketplaceFee = (payments: typeof orders[0]['payments']): number => {
+          let totalFee = 0;
+          for (const p of payments) {
+            const raw = p.rawData as Record<string, unknown> | null;
+            if (raw) {
+              if (typeof raw.marketplace_fee === 'number' && raw.marketplace_fee > 0) {
+                totalFee += raw.marketplace_fee;
+              }
+              if (Array.isArray(raw.fee_details)) {
+                for (const fee of raw.fee_details) {
+                  const f = fee as { type?: string; amount?: number };
+                  if (f.amount && f.amount > 0) {
+                    totalFee += f.amount;
+                  }
+                }
+              }
+            }
+          }
+          return totalFee;
+        };
 
         // Format data - one row per order
         const formattedOrders = orders.map((order) => {
@@ -198,15 +258,26 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
             (sum, item) => sum + (item.saleFee?.toNumber() || 0),
             0
           );
-          // Get shipping cost from order or sum from payments
-          let shippingCost = order.shippingCost?.toNumber() || 0;
+          // Get shipping cost: 1) from shipment table, 2) from order field, 3) from payments
+          let shippingCost = 0;
+          if (order.shipments && order.shipments.length > 0) {
+            shippingCost = order.shipments.reduce(
+              (sum, s) => sum + (s.cost?.toNumber() || 0),
+              0
+            );
+          }
+          if (shippingCost === 0) {
+            shippingCost = order.shippingCost?.toNumber() || 0;
+          }
           if (shippingCost === 0 && order.payments.length > 0) {
             shippingCost = order.payments.reduce(
               (sum, p) => sum + (p.shippingCost?.toNumber() || 0),
               0
             );
           }
-          const totalLiquido = totalItems - totalFees - shippingCost;
+          // Get marketplace fee from payment rawData
+          const taxaMP = getMarketplaceFee(order.payments);
+          const totalLiquido = totalItems - totalFees - shippingCost - taxaMP;
 
           return {
             pedidoId: order.externalId,
@@ -217,6 +288,7 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
             qtdItens: order.items.length,
             valorProdutos: Number(totalItems.toFixed(2)),
             taxaVenda: Number(totalFees.toFixed(2)),
+            taxaMP: Number(taxaMP.toFixed(2)),
             frete: Number(shippingCost.toFixed(2)),
             totalLiquido: Number(totalLiquido.toFixed(2)),
           };
