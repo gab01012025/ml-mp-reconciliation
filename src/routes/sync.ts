@@ -393,4 +393,106 @@ export async function syncRoutes(fastify: FastifyInstance): Promise<void> {
       }
     }
   );
+
+  /**
+   * Diagnostic endpoint: test ML payment details and billing info APIs
+   * This checks if the ML token can access fee information
+   */
+  fastify.get(
+    '/sync/ml/diagnose-fees',
+    async (_request: FastifyRequest, reply: FastifyReply) => {
+      logger.info('Running ML fee diagnostics');
+      
+      try {
+        const { prisma } = await import('../shared/database/client.js');
+        
+        // Get a recent order with payments
+        const order = await prisma.mLOrder.findFirst({
+          where: { status: 'PAID' },
+          include: { payments: true },
+          orderBy: { dateCreated: 'desc' },
+        });
+
+        if (!order || order.payments.length === 0) {
+          return reply.code(200).send({
+            success: false,
+            message: 'No paid orders with payments found',
+          });
+        }
+
+        const payment = order.payments[0];
+        const results: Record<string, unknown> = {
+          orderId: order.externalId,
+          paymentId: payment.externalId,
+          tests: {},
+        };
+
+        // Test 1: Payment Details API (/v1/payments/{id})
+        try {
+          const paymentDetails = await mlClient.getPaymentDetails(Number(payment.externalId));
+          results.tests = {
+            ...(results.tests as Record<string, unknown>),
+            paymentDetails: {
+              success: true,
+              fee_details: paymentDetails.fee_details,
+              marketplace_fee: paymentDetails.marketplace_fee,
+              shipping_cost: paymentDetails.shipping_cost,
+            },
+          };
+        } catch (error) {
+          results.tests = {
+            ...(results.tests as Record<string, unknown>),
+            paymentDetails: {
+              success: false,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          };
+        }
+
+        // Test 2: Order Billing API (/orders/{id}/billing_info)
+        try {
+          const billing = await mlClient.getOrderBilling(Number(order.externalId));
+          results.tests = {
+            ...(results.tests as Record<string, unknown>),
+            billingInfo: {
+              success: true,
+              data: billing,
+            },
+          };
+        } catch (error) {
+          results.tests = {
+            ...(results.tests as Record<string, unknown>),
+            billingInfo: {
+              success: false,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          };
+        }
+
+        // Test 3: Check rawData of payment for existing fee info
+        const rawData = payment.rawData as Record<string, unknown> | null;
+        results.tests = {
+          ...(results.tests as Record<string, unknown>),
+          existingRawData: {
+            has_fee_details: rawData ? Array.isArray(rawData.fee_details) && (rawData.fee_details as unknown[]).length > 0 : false,
+            fee_details: rawData?.fee_details || null,
+            marketplace_fee: rawData?.marketplace_fee || null,
+            has_charges_details: rawData ? Array.isArray(rawData.charges_details) && (rawData.charges_details as unknown[]).length > 0 : false,
+            charges_details: rawData?.charges_details || null,
+          },
+        };
+
+        return reply.code(200).send({
+          success: true,
+          data: results,
+        });
+      } catch (error) {
+        logger.error({ error }, 'Fee diagnostics failed');
+        return reply.code(500).send({
+          success: false,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+      }
+    }
+  );
 }
