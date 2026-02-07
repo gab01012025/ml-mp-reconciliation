@@ -8,7 +8,7 @@ import sensible from '@fastify/sensible';
 import Fastify, { FastifyInstance } from 'fastify';
 import { env } from './config/env.js';
 import { authPlugin } from './plugins/index.js';
-import { docsRoutes, healthRoutes, metricsRoutes, oauthRoutes, reconciliationRoutes, reportsRoutes, schedulerRoutes, syncRoutes } from './routes/index.js';
+import { dashboardRoutes, docsRoutes, healthRoutes, metricsRoutes, oauthRoutes, reconciliationRoutes, reportsRoutes, schedulerRoutes, syncRoutes } from './routes/index.js';
 import { connectDatabase, disconnectDatabase } from './shared/database/client.js';
 
 export async function buildApp(): Promise<FastifyInstance> {
@@ -35,10 +35,11 @@ export async function buildApp(): Promise<FastifyInstance> {
   // Auth plugin
   await app.register(authPlugin, {
     headerName: 'x-api-key',
-    excludePaths: ['/health', '/health/ready', '/health/live', '/', '/auth/ml/callback', '/auth/mp/callback', '/auth/ml/authorize', '/auth/mp/authorize', '/docs', '/docs/openapi.json', '/docs/redoc'],
+    excludePaths: ['/health', '/health/ready', '/health/live', '/', '/dashboard', '/auth/ml/callback', '/auth/mp/callback', '/auth/ml/authorize', '/auth/mp/authorize', '/docs', '/docs/openapi.json', '/docs/redoc'],
   });
 
   // Routes
+  await app.register(dashboardRoutes);
   await app.register(docsRoutes);
   await app.register(healthRoutes);
   await app.register(metricsRoutes);

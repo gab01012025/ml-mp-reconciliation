@@ -2,6 +2,7 @@
  * Routes exports
  */
 
+export { dashboardRoutes } from './dashboard.js';
 export { docsRoutes } from './docs.js';
 export { healthRoutes } from './health.js';
 export { metricsRoutes } from './metrics.js';
