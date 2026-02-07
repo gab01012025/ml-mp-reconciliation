@@ -512,7 +512,35 @@ export async function syncRoutes(fastify: FastifyInstance): Promise<void> {
           };
         }
 
-        // Test 5: Check rawData of payment for existing fee info
+        // Test 5: Billing API - Order details (/billing/integration/group/ML/order/details)
+        try {
+          const billingOrder = await mlClient.getBillingOrderDetails(order.externalId);
+          results.tests = {
+            ...(results.tests as Record<string, unknown>),
+            billingOrderDetails: {
+              success: true,
+              total: billingOrder.total,
+              sale_fee: billingOrder.results?.[0]?.sale_fee || null,
+              charges: billingOrder.results?.[0]?.details?.map((d: { charge_info: { transaction_detail: string; detail_amount: number; detail_sub_type: string; debited_from_operation: string }; marketplace_info: { marketplace: string } }) => ({
+                type: d.charge_info?.detail_sub_type,
+                description: d.charge_info?.transaction_detail,
+                amount: d.charge_info?.detail_amount,
+                debited: d.charge_info?.debited_from_operation,
+                marketplace: d.marketplace_info?.marketplace,
+              })) || [],
+            },
+          };
+        } catch (error) {
+          results.tests = {
+            ...(results.tests as Record<string, unknown>),
+            billingOrderDetails: {
+              success: false,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          };
+        }
+
+        // Test 6: Check rawData of payment for existing fee info
         const rawData = payment.rawData as Record<string, unknown> | null;
         results.tests = {
           ...(results.tests as Record<string, unknown>),

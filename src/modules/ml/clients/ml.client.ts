@@ -378,6 +378,93 @@ export class MLClient {
   }
 
   /**
+   * Get billing details by order ID (requires Invoices/Faturamento scope)
+   * Returns sale_fee breakdown (gross, net, rebate, discount) and charge details
+   * Uses /billing/integration/group/ML/order/details?order_ids={orderId}
+   */
+  async getBillingOrderDetails(orderIds: string): Promise<{
+    offset: number;
+    limit: number;
+    total: number;
+    results: Array<{
+      order_id: number;
+      payment_info: Array<{
+        payment_id: number;
+        date_approved: string;
+        date_created: string;
+        money_release_date: string;
+        money_release_days: number;
+        money_release_status: string;
+        payer_id: number;
+        payment_method_id: string;
+        payment_type_id: string;
+        status: string;
+        status_details: string | null;
+        tax_details: Array<{
+          from: string;
+          to: string;
+          original_amount: number;
+          refunded_amount: number;
+          mov_detail: string;
+          mov_financial_entity: string;
+          tax_id: number;
+          tax_status: string;
+        }>;
+      }>;
+      sale_fee: {
+        gross: number;
+        net: number;
+        rebate: number;
+        discount: number;
+        discount_reason: string | null;
+      };
+      details: Array<{
+        charge_info: {
+          detail_id: number;
+          transaction_detail: string;
+          detail_amount: number;
+          detail_type: string;
+          detail_sub_type: string;
+          debited_from_operation: string;
+        };
+        discount_info: {
+          charge_amount_without_discount: number;
+          discount_amount: number;
+          discount_reason: string | null;
+          rebate: number | null;
+        };
+        sales_info: Array<{
+          order_id: number;
+          operation_id: number;
+          sale_date_time: string;
+          transaction_amount: number;
+          financing_fee?: number;
+          financing_transfer_total?: number;
+          sale_fee?: {
+            gross: number;
+            net: number;
+            rebate: number;
+            discount: number;
+            discount_reason: string | null;
+          };
+        }>;
+        shipping_info: {
+          shipping_id: string;
+          pack_id: string | null;
+          receiver_shipping_cost: number | null;
+        } | null;
+        marketplace_info: {
+          marketplace: string;
+        };
+      }>;
+    }>;
+  }> {
+    return this.request('GET', `/billing/integration/group/ML/order/details`, {
+      params: { order_ids: orderIds },
+    });
+  }
+
+  /**
    * Get billing info for an order (contains fee breakdown)
    */
   async getOrderBilling(orderId: number): Promise<{
