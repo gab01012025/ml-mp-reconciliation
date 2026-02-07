@@ -99,28 +99,29 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
           take: maxResults,
         });
 
-        // Helper: extract marketplace fee from payment rawData
-        const getMarketplaceFee = (payments: typeof orders[0]['payments']): number => {
-          let totalFee = 0;
-          for (const p of payments) {
-            const raw = p.rawData as Record<string, unknown> | null;
-            if (raw) {
-              // marketplace_fee field
-              if (typeof raw.marketplace_fee === 'number' && raw.marketplace_fee > 0) {
-                totalFee += raw.marketplace_fee;
-              }
-              // fee_details array (mercadopago_fee, etc.)
-              if (Array.isArray(raw.fee_details)) {
-                for (const fee of raw.fee_details) {
-                  const f = fee as { type?: string; amount?: number };
-                  if (f.amount && f.amount > 0) {
-                    totalFee += f.amount;
-                  }
-                }
+        // Helper: extract fee breakdown from order rawData (billing API) or fallback to payment rawData
+        const getFeesBreakdown = (order: typeof orders[0]): { taxaML: number; taxaMP: number } => {
+          const orderRaw = order.rawData as Record<string, unknown> | null;
+          
+          // Try billing_charges from order rawData (populated by sync from billing API)
+          if (orderRaw && Array.isArray(orderRaw.billing_charges)) {
+            let taxaML = 0;
+            let taxaMP = 0;
+            for (const charge of orderRaw.billing_charges) {
+              const c = charge as { type?: string; amount?: number; marketplace?: string };
+              if (c.type === 'CVVML' || c.type === 'CV') {
+                taxaML += c.amount || 0;
+              } else if (c.type === 'CVVPRC' || c.type === 'CCMP') {
+                taxaMP += c.amount || 0;
               }
             }
+            if (taxaML > 0 || taxaMP > 0) {
+              return { taxaML, taxaMP };
+            }
           }
-          return totalFee;
+          
+          // Fallback: sale_fee from items is taxaVenda (combined ML+MP), taxaMP stays 0
+          return { taxaML: 0, taxaMP: 0 };
         };
 
         // Format data for Google Sheets
@@ -151,9 +152,12 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
               0
             );
           }
-          // Get marketplace fee from payment rawData
-          const taxaMP = getMarketplaceFee(order.payments);
-          const totalLiquido = totalItems - totalSaleFees - shippingCost - taxaMP;
+          // Get fee breakdown from billing data
+          const fees = getFeesBreakdown(order);
+          // If billing data available, use it; otherwise fallback to sale_fee as taxaVenda
+          const taxaML = fees.taxaML > 0 ? fees.taxaML : totalSaleFees;
+          const taxaMP = fees.taxaMP;
+          const totalLiquido = totalItems - taxaML - taxaMP - shippingCost;
 
           // Return one row per item for detailed view
           return order.items.map((item) => ({
@@ -164,9 +168,10 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
             quantidade: item.quantity,
             valorProduto: item.unitPrice.toNumber() * item.quantity,
             taxaVenda: item.saleFee?.toNumber() || 0,
+            taxaML: Number((taxaML / order.items.length).toFixed(2)),
             taxaMP: Number((taxaMP / order.items.length).toFixed(2)),
             frete: Number((shippingCost / order.items.length).toFixed(2)),
-            totalLiquido: Number(((item.unitPrice.toNumber() * item.quantity) - (item.saleFee?.toNumber() || 0) - (shippingCost / order.items.length) - (taxaMP / order.items.length)).toFixed(2)),
+            totalLiquido: Number(((item.unitPrice.toNumber() * item.quantity) - (taxaML / order.items.length) - (taxaMP / order.items.length) - (shippingCost / order.items.length)).toFixed(2)),
             sku: item.sku || '',
           }));
         });
@@ -225,26 +230,27 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
           take: maxResults,
         });
 
-        // Helper: extract marketplace fee from payment rawData
-        const getMarketplaceFee = (payments: typeof orders[0]['payments']): number => {
-          let totalFee = 0;
-          for (const p of payments) {
-            const raw = p.rawData as Record<string, unknown> | null;
-            if (raw) {
-              if (typeof raw.marketplace_fee === 'number' && raw.marketplace_fee > 0) {
-                totalFee += raw.marketplace_fee;
-              }
-              if (Array.isArray(raw.fee_details)) {
-                for (const fee of raw.fee_details) {
-                  const f = fee as { type?: string; amount?: number };
-                  if (f.amount && f.amount > 0) {
-                    totalFee += f.amount;
-                  }
-                }
+        // Helper: extract fee breakdown from order rawData (billing API) or fallback
+        const getFeesBreakdown = (order: typeof orders[0]): { taxaML: number; taxaMP: number } => {
+          const orderRaw = order.rawData as Record<string, unknown> | null;
+          
+          if (orderRaw && Array.isArray(orderRaw.billing_charges)) {
+            let taxaML = 0;
+            let taxaMP = 0;
+            for (const charge of orderRaw.billing_charges) {
+              const c = charge as { type?: string; amount?: number; marketplace?: string };
+              if (c.type === 'CVVML' || c.type === 'CV') {
+                taxaML += c.amount || 0;
+              } else if (c.type === 'CVVPRC' || c.type === 'CCMP') {
+                taxaMP += c.amount || 0;
               }
             }
+            if (taxaML > 0 || taxaMP > 0) {
+              return { taxaML, taxaMP };
+            }
           }
-          return totalFee;
+          
+          return { taxaML: 0, taxaMP: 0 };
         };
 
         // Format data - one row per order
@@ -275,9 +281,11 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
               0
             );
           }
-          // Get marketplace fee from payment rawData
-          const taxaMP = getMarketplaceFee(order.payments);
-          const totalLiquido = totalItems - totalFees - shippingCost - taxaMP;
+          // Get fee breakdown from billing data
+          const fees = getFeesBreakdown(order);
+          const taxaML = fees.taxaML > 0 ? fees.taxaML : totalFees;
+          const taxaMP = fees.taxaMP;
+          const totalLiquido = totalItems - taxaML - taxaMP - shippingCost;
 
           return {
             pedidoId: order.externalId,
@@ -288,6 +296,7 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
             qtdItens: order.items.length,
             valorProdutos: Number(totalItems.toFixed(2)),
             taxaVenda: Number(totalFees.toFixed(2)),
+            taxaML: Number(taxaML.toFixed(2)),
             taxaMP: Number(taxaMP.toFixed(2)),
             frete: Number(shippingCost.toFixed(2)),
             totalLiquido: Number(totalLiquido.toFixed(2)),

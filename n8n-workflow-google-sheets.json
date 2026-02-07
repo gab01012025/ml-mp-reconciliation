@@ -35,7 +35,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Extrair array de data\nconst response = $input.first().json;\nconst orders = response.data || [];\n\n// Retornar cada pedido como item separado\nreturn orders.map(order => ({\n  json: {\n    pedidoId: order.pedidoId,\n    data: order.data,\n    status: order.status,\n    produto: order.produto,\n    quantidade: order.quantidade,\n    valorProduto: order.valorProduto,\n    taxaVenda: order.taxaVenda,\n    taxaMP: order.taxaMP || 0,\n    frete: order.frete || 0,\n    totalLiquido: order.totalLiquido,\n    sku: order.sku || ''\n  }\n}));"
+        "jsCode": "// Extrair array de data\nconst response = $input.first().json;\nconst orders = response.data || [];\n\n// Retornar cada pedido como item separado\nreturn orders.map(order => ({\n  json: {\n    pedidoId: order.pedidoId,\n    data: order.data,\n    status: order.status,\n    produto: order.produto,\n    quantidade: order.quantidade,\n    valorProduto: order.valorProduto,\n    taxaVenda: order.taxaVenda,\n    taxaML: order.taxaML || 0,\n    taxaMP: order.taxaMP || 0,\n    frete: order.frete || 0,\n    totalLiquido: order.totalLiquido,\n    sku: order.sku || ''\n  }\n}));"
       },
       "id": "transform-data",
       "name": "2. Transformar Dados",
@@ -66,6 +66,7 @@
             "Quantidade": "={{ $json.quantidade }}",
             "Valor Produto": "={{ $json.valorProduto }}",
             "Taxa Venda": "={{ $json.taxaVenda }}",
+            "Taxa ML": "={{ $json.taxaML }}",
             "Taxa MP": "={{ $json.taxaMP }}",
             "Frete": "={{ $json.frete }}",
             "Total Líquido": "={{ $json.totalLiquido }}",

@@ -235,6 +235,35 @@ export class MLSyncService {
         await this.upsertPayment(tx, dbOrder.id, payment);
       }
 
+      // Fetch billing details for fee breakdown (taxaML vs taxaMP)
+      try {
+        const billingDetails = await this.client.getBillingOrderDetails(String(order.id));
+        if (billingDetails.total > 0 && billingDetails.results?.[0]) {
+          const billingResult = billingDetails.results[0];
+          // Store billing data in the order's rawData
+          const currentRawData = (await tx.mLOrder.findUnique({ where: { id: dbOrder.id }, select: { rawData: true } }))?.rawData as Record<string, unknown> || {};
+          await tx.mLOrder.update({
+            where: { id: dbOrder.id },
+            data: {
+              rawData: {
+                ...currentRawData,
+                billing_sale_fee: billingResult.sale_fee,
+                billing_charges: billingResult.details?.map((d) => ({
+                  type: d.charge_info?.detail_sub_type,
+                  description: d.charge_info?.transaction_detail,
+                  amount: d.charge_info?.detail_amount,
+                  debited: d.charge_info?.debited_from_operation,
+                  marketplace: d.marketplace_info?.marketplace,
+                })) || [],
+              } as Prisma.InputJsonValue,
+            },
+          });
+          logger.debug({ orderId: order.id, saleFee: billingResult.sale_fee }, 'Stored billing fee breakdown');
+        }
+      } catch (error) {
+        logger.debug({ orderId: order.id, error }, 'Could not fetch billing details for order');
+      }
+
       // Upsert shipment if exists AND update order shippingCost from shipment
       if (order.shipping?.id) {
         try {
