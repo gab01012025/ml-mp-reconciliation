@@ -469,7 +469,50 @@ export async function syncRoutes(fastify: FastifyInstance): Promise<void> {
           };
         }
 
-        // Test 3: Check rawData of payment for existing fee info
+        // Test 3: Billing API - Payment charges (/billing/integration/payment/{id}/charges)
+        try {
+          const billingCharges = await mlClient.getBillingPaymentCharges(payment.externalId);
+          results.tests = {
+            ...(results.tests as Record<string, unknown>),
+            billingPaymentCharges: {
+              success: true,
+              data: billingCharges,
+            },
+          };
+        } catch (error) {
+          results.tests = {
+            ...(results.tests as Record<string, unknown>),
+            billingPaymentCharges: {
+              success: false,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          };
+        }
+
+        // Test 4: Billing API - Period details (try current month)
+        try {
+          const now = new Date();
+          const periodKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+          const billingPeriod = await mlClient.getBillingPeriodDetails(periodKey, 3);
+          results.tests = {
+            ...(results.tests as Record<string, unknown>),
+            billingPeriodDetails: {
+              success: true,
+              periodKey,
+              data: billingPeriod,
+            },
+          };
+        } catch (error) {
+          results.tests = {
+            ...(results.tests as Record<string, unknown>),
+            billingPeriodDetails: {
+              success: false,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          };
+        }
+
+        // Test 5: Check rawData of payment for existing fee info
         const rawData = payment.rawData as Record<string, unknown> | null;
         results.tests = {
           ...(results.tests as Record<string, unknown>),

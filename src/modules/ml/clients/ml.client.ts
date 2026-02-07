@@ -346,6 +346,38 @@ export class MLClient {
   }
 
   /**
+   * Get billing payment charges (requires Invoices/Faturamento scope)
+   * Uses /billing/integration/payment/{paymentId}/charges
+   */
+  async getBillingPaymentCharges(paymentId: string): Promise<{
+    payment_details: Array<{
+      payment_info: {
+        payment_id: string;
+        payment_date: string;
+        association_amount: number;
+        payment_amount: number;
+      };
+      charge_info: {
+        detail_id: number;
+        detail_description: string;
+        detail_date: string;
+      };
+    }>;
+  }> {
+    return this.request('GET', `/billing/integration/payment/${paymentId}/charges`);
+  }
+
+  /**
+   * Get billing period payment details (requires Invoices/Faturamento scope)
+   * Uses /billing/integration/periods/key/{date}/group/ML/payment/details
+   */
+  async getBillingPeriodDetails(periodKey: string, limit = 10): Promise<unknown> {
+    return this.request('GET', `/billing/integration/periods/key/${periodKey}/group/ML/payment/details`, {
+      params: { limit },
+    });
+  }
+
+  /**
    * Get billing info for an order (contains fee breakdown)
    */
   async getOrderBilling(orderId: number): Promise<{
