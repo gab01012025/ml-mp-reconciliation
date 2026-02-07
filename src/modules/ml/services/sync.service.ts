@@ -157,6 +157,11 @@ export class MLSyncService {
         failedRecords: result.failed,
       });
 
+      // After sync, enrich orders with billing data
+      // The billing API allows multiple order_ids per request and has 5 req/min rate limit
+      const orderIds = orders.map(o => String(o.id));
+      await this.enrichOrdersWithBilling(orderIds);
+
       logger.info(result, 'ML orders sync completed');
       return result;
     } catch (error) {
@@ -233,35 +238,6 @@ export class MLSyncService {
       // Upsert payments
       for (const payment of order.payments) {
         await this.upsertPayment(tx, dbOrder.id, payment);
-      }
-
-      // Fetch billing details for fee breakdown (taxaML vs taxaMP)
-      try {
-        const billingDetails = await this.client.getBillingOrderDetails(String(order.id));
-        if (billingDetails.total > 0 && billingDetails.results?.[0]) {
-          const billingResult = billingDetails.results[0];
-          // Store billing data in the order's rawData
-          const currentRawData = (await tx.mLOrder.findUnique({ where: { id: dbOrder.id }, select: { rawData: true } }))?.rawData as Record<string, unknown> || {};
-          await tx.mLOrder.update({
-            where: { id: dbOrder.id },
-            data: {
-              rawData: {
-                ...currentRawData,
-                billing_sale_fee: billingResult.sale_fee,
-                billing_charges: billingResult.details?.map((d) => ({
-                  type: d.charge_info?.detail_sub_type,
-                  description: d.charge_info?.transaction_detail,
-                  amount: d.charge_info?.detail_amount,
-                  debited: d.charge_info?.debited_from_operation,
-                  marketplace: d.marketplace_info?.marketplace,
-                })) || [],
-              } as Prisma.InputJsonValue,
-            },
-          });
-          logger.debug({ orderId: order.id, saleFee: billingResult.sale_fee }, 'Stored billing fee breakdown');
-        }
-      } catch (error) {
-        logger.debug({ orderId: order.id, error }, 'Could not fetch billing details for order');
       }
 
       // Upsert shipment if exists AND update order shippingCost from shipment
@@ -449,6 +425,70 @@ export class MLSyncService {
       limit: options.limit || 50,
       offset: options.offset || 0,
     };
+  }
+
+  /**
+   * Enrich orders with billing fee breakdown (taxaML vs taxaMP)
+   * Uses batch requests and respects rate limiting (5 req/min)
+   */
+  async enrichOrdersWithBilling(orderIds: string[]): Promise<{ enriched: number; failed: number }> {
+    logger.info({ count: orderIds.length }, 'Enriching orders with billing fee breakdown');
+    let enriched = 0;
+    let failed = 0;
+
+    // Process in batches of 4 requests per minute (stay under 5/min limit)
+    const BATCH_SIZE = 4;
+    const BATCH_DELAY_MS = 62000;
+
+    for (let i = 0; i < orderIds.length; i += BATCH_SIZE) {
+      const batch = orderIds.slice(i, i + BATCH_SIZE);
+
+      for (const orderId of batch) {
+        try {
+          const billingDetails = await this.client.getBillingOrderDetails(orderId);
+          if (billingDetails.total > 0 && billingDetails.results?.[0]) {
+            const billingResult = billingDetails.results[0];
+            const dbOrder = await prisma.mLOrder.findUnique({
+              where: { externalId: orderId },
+              select: { id: true, rawData: true },
+            });
+            if (dbOrder) {
+              const currentRawData = (dbOrder.rawData as Record<string, unknown>) || {};
+              await prisma.mLOrder.update({
+                where: { id: dbOrder.id },
+                data: {
+                  rawData: {
+                    ...currentRawData,
+                    billing_sale_fee: billingResult.sale_fee,
+                    billing_charges: billingResult.details?.map((d) => ({
+                      type: d.charge_info?.detail_sub_type,
+                      description: d.charge_info?.transaction_detail,
+                      amount: d.charge_info?.detail_amount,
+                      debited: d.charge_info?.debited_from_operation,
+                      marketplace: d.marketplace_info?.marketplace,
+                    })) || [],
+                  } as Prisma.InputJsonValue,
+                },
+              });
+              enriched++;
+              logger.debug({ orderId, saleFee: billingResult.sale_fee }, 'Stored billing fee breakdown');
+            }
+          }
+        } catch (error) {
+          failed++;
+          logger.debug({ orderId, error: error instanceof Error ? error.message : error }, 'Could not fetch billing details');
+        }
+      }
+
+      // Wait between batches to respect rate limit (skip on last batch)
+      if (i + BATCH_SIZE < orderIds.length) {
+        logger.info({ processed: Math.min(i + BATCH_SIZE, orderIds.length), total: orderIds.length }, 'Billing enrichment batch done, waiting for rate limit...');
+        await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
+      }
+    }
+
+    logger.info({ enriched, failed, total: orderIds.length }, 'Billing enrichment complete');
+    return { enriched, failed };
   }
 }
 

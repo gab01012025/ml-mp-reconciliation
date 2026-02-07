@@ -395,6 +395,71 @@ export async function syncRoutes(fastify: FastifyInstance): Promise<void> {
   );
 
   /**
+   * Enrich existing orders with billing fee breakdown (taxaML vs taxaMP)
+   * This is a separate endpoint to enrich orders without re-syncing
+   */
+  fastify.post<{ Body: { days?: number; limit?: number } }>(
+    '/sync/ml/enrich-billing',
+    async (request: FastifyRequest<{ Body: { days?: number; limit?: number } }>, reply: FastifyReply) => {
+      const days = request.body?.days || 30;
+      const limit = request.body?.limit || 100;
+      
+      logger.info({ days, limit }, 'Starting billing enrichment for existing orders');
+      
+      try {
+        const { prisma } = await import('../shared/database/client.js');
+        
+        const dateFrom = new Date();
+        dateFrom.setDate(dateFrom.getDate() - days);
+        
+        // Find orders that don't have billing_charges yet
+        const orders = await prisma.mLOrder.findMany({
+          where: {
+            dateCreated: { gte: dateFrom },
+            status: 'PAID',
+          },
+          select: { externalId: true, rawData: true },
+          orderBy: { dateCreated: 'desc' },
+          take: limit,
+        });
+        
+        // Filter orders without billing data
+        const orderIdsToEnrich = orders
+          .filter(o => {
+            const raw = o.rawData as Record<string, unknown> | null;
+            return !raw || !Array.isArray(raw.billing_charges) || (raw.billing_charges as unknown[]).length === 0;
+          })
+          .map(o => o.externalId);
+        
+        logger.info({ total: orders.length, toEnrich: orderIdsToEnrich.length }, 'Orders to enrich with billing data');
+        
+        if (orderIdsToEnrich.length === 0) {
+          return reply.code(200).send({
+            success: true,
+            message: 'All orders already have billing data',
+            data: { total: orders.length, enriched: 0 },
+          });
+        }
+        
+        const syncService = createMLSyncService(mlClient);
+        const result = await syncService.enrichOrdersWithBilling(orderIdsToEnrich);
+        
+        return reply.code(200).send({
+          success: true,
+          message: 'Billing enrichment completed',
+          data: { total: orders.length, ...result },
+        });
+      } catch (error) {
+        logger.error({ error }, 'Billing enrichment failed');
+        return reply.code(500).send({
+          success: false,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+      }
+    }
+  );
+
+  /**
    * Diagnostic endpoint: test ML payment details and billing info APIs
    * This checks if the ML token can access fee information
    */
