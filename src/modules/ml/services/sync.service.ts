@@ -175,6 +175,26 @@ export class MLSyncService {
    */
   private async upsertOrder(order: MLOrder, sellerId: string): Promise<void> {
     await prisma.$transaction(async (tx) => {
+      // Check if order exists and get existing billing data to preserve it
+      const existingOrder = await tx.mLOrder.findUnique({
+        where: { externalId: String(order.id) },
+        select: { rawData: true },
+      });
+      
+      // Preserve billing_* fields from existing rawData when updating
+      const existingRaw = (existingOrder?.rawData as Record<string, unknown>) || {};
+      const billingFields: Record<string, unknown> = {};
+      for (const key of Object.keys(existingRaw)) {
+        if (key.startsWith('billing_')) {
+          billingFields[key] = existingRaw[key];
+        }
+      }
+
+      const newRawData = {
+        ...JSON.parse(JSON.stringify(order)),
+        ...billingFields,
+      } as Prisma.InputJsonValue;
+
       // Upsert main order
       const dbOrder = await tx.mLOrder.upsert({
         where: { externalId: String(order.id) },
@@ -192,7 +212,7 @@ export class MLSyncService {
           dateClosed: order.date_closed ? new Date(order.date_closed) : null,
           dateLastUpdated: new Date(order.last_updated),
           packId: order.pack_id ? String(order.pack_id) : null,
-          rawData: JSON.parse(JSON.stringify(order)) as Prisma.InputJsonValue,
+          rawData: newRawData,
         },
         update: {
           status: mapOrderStatus(order.status),
@@ -202,7 +222,7 @@ export class MLSyncService {
             : 0,
           dateClosed: order.date_closed ? new Date(order.date_closed) : null,
           dateLastUpdated: new Date(order.last_updated),
-          rawData: JSON.parse(JSON.stringify(order)) as Prisma.InputJsonValue,
+          rawData: newRawData,
         },
       });
 
@@ -240,20 +260,13 @@ export class MLSyncService {
         await this.upsertPayment(tx, dbOrder.id, payment);
       }
 
-      // Upsert shipment if exists AND update order shippingCost from shipment
+      // Upsert shipment if exists
+      // NOTE: We do NOT overwrite order.shippingCost with shipment.base_cost
+      // because base_cost is ML's total logistics cost, not the seller's net shipping cost.
+      // The seller's shipping cost should come from billing data (billing_charges).
       if (order.shipping?.id) {
         try {
           const shipmentDetails = await this.client.getShipment(order.shipping.id);
-          
-          // Update order shippingCost from the actual shipment cost
-          const shipmentCost = shipmentDetails.base_cost || 0;
-          if (shipmentCost > 0) {
-            await tx.mLOrder.update({
-              where: { id: dbOrder.id },
-              data: { shippingCost: shipmentCost },
-            });
-            logger.debug({ orderId: order.id, shipmentCost }, 'Updated order shippingCost from shipment');
-          }
 
           await tx.mLShipment.upsert({
             where: { externalId: String(shipmentDetails.id) },
@@ -454,12 +467,25 @@ export class MLSyncService {
             });
             if (dbOrder) {
               const currentRawData = (dbOrder.rawData as Record<string, unknown>) || {};
+              
+              // Extract transaction_amount from billing's sales_info
+              // This reflects the actual amount after marketplace coupons/discounts
+              let billingTransactionAmount: number | undefined;
+              if (billingResult.details?.[0]?.sales_info?.[0]?.transaction_amount) {
+                billingTransactionAmount = billingResult.details[0].sales_info[0].transaction_amount;
+              }
+
+              // Extract shipping info from billing
+              const billingShippingInfo = billingResult.details?.[0]?.shipping_info || null;
+
               await prisma.mLOrder.update({
                 where: { id: dbOrder.id },
                 data: {
                   rawData: {
                     ...currentRawData,
                     billing_sale_fee: billingResult.sale_fee,
+                    billing_transaction_amount: billingTransactionAmount,
+                    billing_shipping_info: billingShippingInfo,
                     billing_charges: billingResult.details?.map((d) => ({
                       type: d.charge_info?.detail_sub_type,
                       description: d.charge_info?.transaction_detail,

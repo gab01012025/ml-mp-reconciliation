@@ -319,9 +319,10 @@ function getDashboardHTML(): string {
     <div class="cards" id="cards">
       <div class="card"><div class="label">Total Pedidos</div><div class="value" id="totalPedidos">-</div></div>
       <div class="card"><div class="label">Valor Bruto</div><div class="value blue" id="totalBruto">-</div></div>
+      <div class="card"><div class="label">Descontos</div><div class="value orange" id="totalDesconto">-</div></div>
       <div class="card"><div class="label">Taxa ML</div><div class="value red" id="totalTaxaML">-</div></div>
       <div class="card"><div class="label">Taxa MP</div><div class="value red" id="totalTaxaMP">-</div></div>
-      <div class="card"><div class="label">Frete</div><div class="value orange" id="totalFrete">-</div></div>
+      <div class="card"><div class="label">Frete Vendedor</div><div class="value orange" id="totalFrete">-</div></div>
       <div class="card"><div class="label">Total Liquido</div><div class="value green" id="totalLiquido">-</div></div>
     </div>
 
@@ -357,7 +358,10 @@ function getDashboardHTML(): string {
       let key = localStorage.getItem('apiKey');
       if (!key) {
         key = prompt('Digite a chave da API (x-api-key):');
-        if (key) localStorage.setItem('apiKey', key);
+        if (key) {
+          key = key.trim();
+          localStorage.setItem('apiKey', key);
+        }
       }
       return key;
     }
@@ -459,6 +463,7 @@ function getDashboardHTML(): string {
     function renderCards(orders) {
       const paid = orders.filter(o => o.status === 'PAID');
       const totalBruto = paid.reduce((s, o) => s + (o.valorProduto || 0) * (o.quantidade || 1), 0);
+      const totalDesconto = paid.reduce((s, o) => s + (o.desconto || 0), 0);
       const totalTaxaML = paid.reduce((s, o) => s + (o.taxaML || 0), 0);
       const totalTaxaMP = paid.reduce((s, o) => s + (o.taxaMP || 0), 0);
       const totalFrete = paid.reduce((s, o) => s + (o.frete || 0), 0);
@@ -466,6 +471,7 @@ function getDashboardHTML(): string {
 
       document.getElementById('totalPedidos').textContent = paid.length;
       document.getElementById('totalBruto').textContent = formatMoney(totalBruto);
+      document.getElementById('totalDesconto').textContent = formatMoney(totalDesconto);
       document.getElementById('totalTaxaML').textContent = formatMoney(totalTaxaML);
       document.getElementById('totalTaxaMP').textContent = formatMoney(totalTaxaMP);
       document.getElementById('totalFrete').textContent = formatMoney(totalFrete);
@@ -483,7 +489,7 @@ function getDashboardHTML(): string {
 
       let html = '<table><thead><tr>';
       html += '<th>Pedido</th><th>Data</th><th>Status</th><th>Produto</th><th>Qtd</th>';
-      html += '<th>Valor Bruto</th><th>Taxa ML</th><th>Taxa MP</th><th>Frete</th>';
+      html += '<th>Valor Bruto</th><th>Desconto</th><th>Taxa ML</th><th>Taxa MP</th><th>Frete Vend.</th>';
       html += '<th>Total Liquido</th><th>SKU</th>';
       html += '</tr></thead><tbody>';
 
@@ -496,6 +502,7 @@ function getDashboardHTML(): string {
         html += '<td class="produto-cell" title="' + (o.produto || '').replace(/"/g, '&quot;') + '">' + (o.produto || '') + '</td>';
         html += '<td class="num">' + (o.quantidade || 1) + '</td>';
         html += '<td class="num">' + formatNum(o.valorProduto) + '</td>';
+        html += '<td class="num">' + (o.desconto > 0 ? formatNum(o.desconto) : '-') + '</td>';
         html += '<td class="num">' + formatNum(o.taxaML) + '</td>';
         html += '<td class="num">' + formatNum(o.taxaMP) + '</td>';
         html += '<td class="num">' + formatNum(o.frete) + '</td>';
@@ -514,7 +521,7 @@ function getDashboardHTML(): string {
         return;
       }
 
-      const headers = ['Pedido', 'Data', 'Status', 'Produto', 'Quantidade', 'Valor Bruto', 'Taxa Venda', 'Taxa ML', 'Taxa MP', 'Frete', 'Total Liquido', 'SKU'];
+      const headers = ['Pedido', 'Data', 'Status', 'Produto', 'Quantidade', 'Valor Bruto', 'Desconto', 'Taxa Venda', 'Taxa ML', 'Taxa MP', 'Frete Vendedor', 'Total Liquido', 'SKU'];
       let csv = headers.join(';') + '\\n';
 
       for (const o of dadosAtuais) {
@@ -525,6 +532,7 @@ function getDashboardHTML(): string {
           '"' + (o.produto || '').replace(/"/g, '""') + '"',
           o.quantidade || 1,
           formatNum(o.valorProduto),
+          formatNum(o.desconto || 0),
           formatNum(o.taxaVenda),
           formatNum(o.taxaML),
           formatNum(o.taxaMP),

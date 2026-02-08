@@ -109,8 +109,10 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
             let taxaMP = 0;
             for (const charge of orderRaw.billing_charges) {
               const c = charge as { type?: string; amount?: number; marketplace?: string };
+              // ML commission types
               if (c.type === 'CVVML' || c.type === 'CV') {
                 taxaML += c.amount || 0;
+              // MP commission types
               } else if (c.type === 'CVVPRC' || c.type === 'CCMP') {
                 taxaMP += c.amount || 0;
               }
@@ -124,6 +126,57 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
           return { taxaML: 0, taxaMP: 0 };
         };
 
+        // Helper: get seller's shipping cost from billing data
+        // The billing API only returns commission charges (CVVML, CVVPRC, etc.)
+        // Any non-commission charge in billing is seller-borne shipping/other cost.
+        // If billing data exists but has no non-commission charges, seller shipping = 0.
+        const COMMISSION_TYPES = ['CVVML', 'CV', 'CVVPRC', 'CCMP'];
+        const getSellerShipping = (order: typeof orders[0]): { sellerShipping: number; hasBillingData: boolean } => {
+          const orderRaw = order.rawData as Record<string, unknown> | null;
+          
+          if (orderRaw && Array.isArray(orderRaw.billing_charges)) {
+            let sellerShipping = 0;
+            for (const charge of orderRaw.billing_charges) {
+              const c = charge as { type?: string; amount?: number };
+              if (c.type && !COMMISSION_TYPES.includes(c.type) && c.amount) {
+                sellerShipping += c.amount;
+              }
+            }
+            return { sellerShipping, hasBillingData: true };
+          }
+          
+          return { sellerShipping: 0, hasBillingData: false };
+        };
+
+        // Helper: detect coupon/discount from billing data
+        // If billing_sale_fee.net exists, compare with itemsSaleFee (from order items API).
+        // If billing_transaction_amount < totalItems, the difference is a coupon.
+        const getCouponDiscount = (order: typeof orders[0], totalItems: number): number => {
+          const orderRaw = order.rawData as Record<string, unknown> | null;
+          if (!orderRaw) return 0;
+
+          // Check if billing has a transaction_amount that differs from totalItems
+          const billingTransAmount = orderRaw.billing_transaction_amount as number | undefined;
+          if (billingTransAmount && billingTransAmount > 0 && billingTransAmount < totalItems) {
+            return Number((totalItems - billingTransAmount).toFixed(2));
+          }
+
+          // Check order coupon field
+          const coupon = orderRaw.coupon as { id?: string | null; amount?: number } | undefined;
+          if (coupon && coupon.amount && coupon.amount > 0) {
+            return coupon.amount;
+          }
+
+          // Check payment coupon_amount from rawData
+          const payments = orderRaw.payments as Array<{ coupon_amount?: number }> | undefined;
+          if (payments) {
+            const totalCoupon = payments.reduce((sum, p) => sum + (p.coupon_amount || 0), 0);
+            if (totalCoupon > 0) return totalCoupon;
+          }
+
+          return 0;
+        };
+
         // Format data for Google Sheets
         const formattedOrders = orders.flatMap((order) => {
           // Calculate totals per order
@@ -135,29 +188,31 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
             (sum, item) => sum + (item.saleFee?.toNumber() || 0),
             0
           );
-          // Get shipping cost: 1) from shipment table, 2) from order field, 3) from payments
-          let shippingCost = 0;
-          if (order.shipments && order.shipments.length > 0) {
-            shippingCost = order.shipments.reduce(
-              (sum, s) => sum + (s.cost?.toNumber() || 0),
-              0
-            );
+
+          // Get seller shipping from billing (NOT from shipment base_cost which is ML's logistics cost)
+          const shippingInfo = getSellerShipping(order);
+          let sellerShipping = shippingInfo.sellerShipping;
+          
+          // Fallback: only use payment shipping_cost if NO billing data exists
+          // payment.shipping_cost is what the BUYER paid for shipping, not the seller
+          if (!shippingInfo.hasBillingData && order.payments.length > 0) {
+            // Without billing data, we can't determine seller shipping accurately.
+            // Use 0 as default - the buyer-paid shipping is NOT a cost to the seller.
+            sellerShipping = 0;
           }
-          if (shippingCost === 0) {
-            shippingCost = order.shippingCost?.toNumber() || 0;
-          }
-          if (shippingCost === 0 && order.payments.length > 0) {
-            shippingCost = order.payments.reduce(
-              (sum, p) => sum + (p.shippingCost?.toNumber() || 0),
-              0
-            );
-          }
+
           // Get fee breakdown from billing data
           const fees = getFeesBreakdown(order);
           // If billing data available, use it; otherwise fallback to sale_fee as taxaVenda
           const taxaML = fees.taxaML > 0 ? fees.taxaML : totalSaleFees;
           const taxaMP = fees.taxaMP;
-          const totalLiquido = totalItems - taxaML - taxaMP - shippingCost;
+
+          // Detect coupon/discount
+          const desconto = getCouponDiscount(order, totalItems);
+          const valorProdutoReal = totalItems - desconto;
+
+          // Total Líquido = valor produto (after coupon) - fees - seller shipping
+          const totalLiquido = valorProdutoReal - taxaML - taxaMP - sellerShipping;
 
           // Return one row per item for detailed view
           return order.items.map((item) => ({
@@ -167,11 +222,12 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
             produto: item.title,
             quantidade: item.quantity,
             valorProduto: item.unitPrice.toNumber() * item.quantity,
+            desconto: Number((desconto / order.items.length).toFixed(2)),
             taxaVenda: item.saleFee?.toNumber() || 0,
             taxaML: Number((taxaML / order.items.length).toFixed(2)),
             taxaMP: Number((taxaMP / order.items.length).toFixed(2)),
-            frete: Number((shippingCost / order.items.length).toFixed(2)),
-            totalLiquido: Number(((item.unitPrice.toNumber() * item.quantity) - (taxaML / order.items.length) - (taxaMP / order.items.length) - (shippingCost / order.items.length)).toFixed(2)),
+            frete: Number((sellerShipping / order.items.length).toFixed(2)),
+            totalLiquido: Number(((item.unitPrice.toNumber() * item.quantity) - (desconto / order.items.length) - (taxaML / order.items.length) - (taxaMP / order.items.length) - (sellerShipping / order.items.length)).toFixed(2)),
             sku: item.sku || '',
           }));
         });
@@ -253,6 +309,36 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
           return { taxaML: 0, taxaMP: 0 };
         };
 
+        // Helper: get seller shipping from billing data (same logic as /reports/orders/details)
+        const COMMISSION_TYPES_SUMMARY = ['CVVML', 'CV', 'CVVPRC', 'CCMP'];
+        const getSellerShippingSummary = (order: typeof orders[0]): { sellerShipping: number; hasBillingData: boolean } => {
+          const orderRaw = order.rawData as Record<string, unknown> | null;
+          if (orderRaw && Array.isArray(orderRaw.billing_charges)) {
+            let sellerShipping = 0;
+            for (const charge of orderRaw.billing_charges) {
+              const c = charge as { type?: string; amount?: number };
+              if (c.type && !COMMISSION_TYPES_SUMMARY.includes(c.type) && c.amount) {
+                sellerShipping += c.amount;
+              }
+            }
+            return { sellerShipping, hasBillingData: true };
+          }
+          return { sellerShipping: 0, hasBillingData: false };
+        };
+
+        // Helper: detect coupon/discount
+        const getCouponDiscountSummary = (order: typeof orders[0], totalItems: number): number => {
+          const orderRaw = order.rawData as Record<string, unknown> | null;
+          if (!orderRaw) return 0;
+          const billingTransAmount = orderRaw.billing_transaction_amount as number | undefined;
+          if (billingTransAmount && billingTransAmount > 0 && billingTransAmount < totalItems) {
+            return Number((totalItems - billingTransAmount).toFixed(2));
+          }
+          const coupon = orderRaw.coupon as { id?: string | null; amount?: number } | undefined;
+          if (coupon && coupon.amount && coupon.amount > 0) return coupon.amount;
+          return 0;
+        };
+
         // Format data - one row per order
         const formattedOrders = orders.map((order) => {
           const produtos = order.items.map(i => i.title).join(' | ');
@@ -264,28 +350,20 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
             (sum, item) => sum + (item.saleFee?.toNumber() || 0),
             0
           );
-          // Get shipping cost: 1) from shipment table, 2) from order field, 3) from payments
-          let shippingCost = 0;
-          if (order.shipments && order.shipments.length > 0) {
-            shippingCost = order.shipments.reduce(
-              (sum, s) => sum + (s.cost?.toNumber() || 0),
-              0
-            );
-          }
-          if (shippingCost === 0) {
-            shippingCost = order.shippingCost?.toNumber() || 0;
-          }
-          if (shippingCost === 0 && order.payments.length > 0) {
-            shippingCost = order.payments.reduce(
-              (sum, p) => sum + (p.shippingCost?.toNumber() || 0),
-              0
-            );
-          }
+
+          // Get seller shipping from billing (NOT from shipment base_cost)
+          const shippingInfo = getSellerShippingSummary(order);
+          const sellerShipping = shippingInfo.sellerShipping;
+
           // Get fee breakdown from billing data
           const fees = getFeesBreakdown(order);
           const taxaML = fees.taxaML > 0 ? fees.taxaML : totalFees;
           const taxaMP = fees.taxaMP;
-          const totalLiquido = totalItems - taxaML - taxaMP - shippingCost;
+
+          // Detect coupon/discount
+          const desconto = getCouponDiscountSummary(order, totalItems);
+          const valorProdutoReal = totalItems - desconto;
+          const totalLiquido = valorProdutoReal - taxaML - taxaMP - sellerShipping;
 
           return {
             pedidoId: order.externalId,
@@ -295,10 +373,11 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
             produtos: produtos.substring(0, 200),
             qtdItens: order.items.length,
             valorProdutos: Number(totalItems.toFixed(2)),
+            desconto: Number(desconto.toFixed(2)),
             taxaVenda: Number(totalFees.toFixed(2)),
             taxaML: Number(taxaML.toFixed(2)),
             taxaMP: Number(taxaMP.toFixed(2)),
-            frete: Number(shippingCost.toFixed(2)),
+            frete: Number(sellerShipping.toFixed(2)),
             totalLiquido: Number(totalLiquido.toFixed(2)),
           };
         });
