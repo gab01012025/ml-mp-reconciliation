@@ -398,13 +398,14 @@ export async function syncRoutes(fastify: FastifyInstance): Promise<void> {
    * Enrich existing orders with billing fee breakdown (taxaML vs taxaMP)
    * This is a separate endpoint to enrich orders without re-syncing
    */
-  fastify.post<{ Body: { days?: number; limit?: number } }>(
+  fastify.post<{ Body: { days?: number; limit?: number; force?: boolean } }>(
     '/sync/ml/enrich-billing',
-    async (request: FastifyRequest<{ Body: { days?: number; limit?: number } }>, reply: FastifyReply) => {
+    async (request: FastifyRequest<{ Body: { days?: number; limit?: number; force?: boolean } }>, reply: FastifyReply) => {
       const days = request.body?.days || 30;
       const limit = request.body?.limit || 100;
+      const force = request.body?.force || false;
       
-      logger.info({ days, limit }, 'Starting billing enrichment for existing orders');
+      logger.info({ days, limit, force }, 'Starting billing enrichment for existing orders');
       
       try {
         const { prisma } = await import('../shared/database/client.js');
@@ -423,11 +424,17 @@ export async function syncRoutes(fastify: FastifyInstance): Promise<void> {
           take: limit,
         });
         
-        // Filter orders without billing data
+        // Filter orders without billing data (or missing billing_transaction_amount if force)
         const orderIdsToEnrich = orders
           .filter(o => {
             const raw = o.rawData as Record<string, unknown> | null;
-            return !raw || !Array.isArray(raw.billing_charges) || (raw.billing_charges as unknown[]).length === 0;
+            if (!raw || !Array.isArray(raw.billing_charges) || (raw.billing_charges as unknown[]).length === 0) {
+              return true; // No billing data at all
+            }
+            if (force && raw.billing_transaction_amount === undefined) {
+              return true; // Has billing_charges but missing transaction_amount
+            }
+            return false;
           })
           .map(o => o.externalId);
         
