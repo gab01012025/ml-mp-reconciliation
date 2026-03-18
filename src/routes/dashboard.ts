@@ -298,7 +298,10 @@ function getDashboardHTML(): string {
         <label>Status</label>
         <select id="statusFilter">
           <option value="">Todos</option>
+          <option value="SOLD" selected>Vendidos</option>
           <option value="PAID">Pagos</option>
+          <option value="SHIPPED">Enviados</option>
+          <option value="DELIVERED">Entregues</option>
           <option value="CANCELLED">Cancelados</option>
         </select>
       </div>
@@ -372,16 +375,16 @@ function getDashboardHTML(): string {
       if (dias === 0) {
         // Hoje
         document.getElementById('startDate').value = formatDate(hoje);
-        document.getElementById('endDate').value = formatDate(new Date(hoje.getTime() + 86400000));
+        document.getElementById('endDate').value = formatDate(hoje);
       } else if (dias === 1) {
         // Ontem
         inicio.setDate(inicio.getDate() - 1);
         document.getElementById('startDate').value = formatDate(inicio);
-        document.getElementById('endDate').value = formatDate(hoje);
+        document.getElementById('endDate').value = formatDate(inicio);
       } else {
         inicio.setDate(inicio.getDate() - dias);
         document.getElementById('startDate').value = formatDate(inicio);
-        document.getElementById('endDate').value = formatDate(new Date(hoje.getTime() + 86400000));
+        document.getElementById('endDate').value = formatDate(hoje);
       }
       // Destacar botao ativo
       document.querySelectorAll('.quick-btn').forEach(b => b.classList.remove('active'));
@@ -423,7 +426,7 @@ function getDashboardHTML(): string {
       document.getElementById('tableBody').innerHTML = '<div class="loading"><div class="spinner"></div><p style="margin-top:10px">Carregando dados...</p></div>';
 
       try {
-        let url = window.location.origin + '/reports/orders/details?startDate=' + startDate + '&endDate=' + endDate + '&limit=2000';
+        let url = window.location.origin + '/reports/orders/details?startDate=' + startDate + '&endDate=' + endDate + '&limit=5000';
         const resp = await fetch(url, {
           headers: { 'x-api-key': key }
         });
@@ -443,13 +446,17 @@ function getDashboardHTML(): string {
         dadosAtuais = data.data || [];
 
         // Filtrar por status se selecionado
-        if (status) {
+        if (status === 'SOLD') {
+          // "Vendidos" = todos os nao-cancelados/reembolsados (PAID + SHIPPED + DELIVERED)
+          dadosAtuais = dadosAtuais.filter(o => ['PAID', 'SHIPPED', 'DELIVERED'].includes(o.status));
+        } else if (status) {
           dadosAtuais = dadosAtuais.filter(o => o.status === status);
         }
 
         renderCards(dadosAtuais);
         renderTable(dadosAtuais);
-        showToast(dadosAtuais.length + ' pedidos encontrados', 'success');
+        const uniqueCount = new Set(dadosAtuais.map(o => o.pedidoId)).size;
+        showToast(uniqueCount + ' pedidos encontrados (' + dadosAtuais.length + ' itens)', 'success');
 
       } catch (err) {
         showToast('Erro de conexao: ' + err.message, 'error');
@@ -461,15 +468,29 @@ function getDashboardHTML(): string {
     }
 
     function renderCards(orders) {
-      const paid = orders.filter(o => o.status === 'PAID');
-      const totalBruto = paid.reduce((s, o) => s + (o.valorProduto || 0) * (o.quantidade || 1), 0);
-      const totalDesconto = paid.reduce((s, o) => s + (o.desconto || 0), 0);
-      const totalTaxaML = paid.reduce((s, o) => s + (o.taxaML || 0), 0);
-      const totalTaxaMP = paid.reduce((s, o) => s + (o.taxaMP || 0), 0);
-      const totalFrete = paid.reduce((s, o) => s + (o.frete || 0), 0);
-      const totalLiquido = paid.reduce((s, o) => s + (o.totalLiquido || 0), 0);
+      // Count all sold orders (PAID + SHIPPED + DELIVERED), not just PAID
+      // Orders progress PAID -> SHIPPED -> DELIVERED, so older orders won't be PAID anymore
+      const sold = orders.filter(o => ['PAID', 'SHIPPED', 'DELIVERED'].includes(o.status));
+      
+      // VALOR BRUTO = sum of order.totalAmount (ML's authoritative sale value)
+      // Uses valorBrutoML field which is the item's share of order.totalAmount
+      // This matches ML's "Vendas brutas" metric
+      const totalBruto = sold.reduce((s, o) => s + (o.valorBrutoML || o.valorProduto || 0), 0);
+      
+      // DESCONTOS = listed price - actual ML sale value (marketplace coupons/discounts)
+      const totalValorListado = sold.reduce((s, o) => s + (o.valorProduto || 0), 0);
+      const totalDesconto = Math.max(0, totalValorListado - totalBruto);
+      
+      const totalTaxaML = sold.reduce((s, o) => s + (o.taxaML || 0), 0);
+      const totalTaxaMP = sold.reduce((s, o) => s + (o.taxaMP || 0), 0);
+      const totalFrete = sold.reduce((s, o) => s + (o.frete || 0), 0);
+      // TOTAL LIQUIDO = VALOR BRUTO - TAXA ML - TAXA MP - FRETE
+      // DESCONTOS is shown separately but already factored into VALOR BRUTO
+      const totalLiquido = totalBruto - totalTaxaML - totalTaxaMP - totalFrete;
 
-      document.getElementById('totalPedidos').textContent = paid.length;
+      // Count unique orders (not items/rows, since flatMap creates one row per item)
+      const uniqueOrders = new Set(sold.map(o => o.pedidoId)).size;
+      document.getElementById('totalPedidos').textContent = uniqueOrders;
       document.getElementById('totalBruto').textContent = formatMoney(totalBruto);
       document.getElementById('totalDesconto').textContent = formatMoney(totalDesconto);
       document.getElementById('totalTaxaML').textContent = formatMoney(totalTaxaML);

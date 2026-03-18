@@ -79,9 +79,11 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
           });
         }
 
-        const start = new Date(startDate);
-        const end = new Date(endDate);
-        const maxResults = limit ? parseInt(limit, 10) : 500;
+        // Timezone-safe: append time directly to date string to stay in UTC
+        // Without this, new Date('2026-02-10').getDate() returns 9 in UTC-3 (Brazil)
+        const start = new Date(startDate + 'T00:00:00.000Z');
+        const end = new Date(endDate + 'T23:59:59.999Z');
+        const maxResults = limit ? parseInt(limit, 10) : 5000;
 
         const orders = await prisma.mLOrder.findMany({
           where: {
@@ -184,6 +186,8 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
             (sum, item) => sum + item.unitPrice.toNumber() * item.quantity,
             0
           );
+          // order.totalAmount is ML's authoritative sale value (after marketplace discounts/coupons)
+          const orderTotal = order.totalAmount.toNumber();
           const totalSaleFees = order.items.reduce(
             (sum, item) => sum + (item.saleFee?.toNumber() || 0),
             0
@@ -194,42 +198,61 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
           let sellerShipping = shippingInfo.sellerShipping;
           
           // Fallback: only use payment shipping_cost if NO billing data exists
-          // payment.shipping_cost is what the BUYER paid for shipping, not the seller
           if (!shippingInfo.hasBillingData && order.payments.length > 0) {
-            // Without billing data, we can't determine seller shipping accurately.
-            // Use 0 as default - the buyer-paid shipping is NOT a cost to the seller.
             sellerShipping = 0;
           }
 
           // Get fee breakdown from billing data
           const fees = getFeesBreakdown(order);
-          // If billing data available, use it; otherwise fallback to sale_fee as taxaVenda
           const taxaML = fees.taxaML > 0 ? fees.taxaML : totalSaleFees;
           const taxaMP = fees.taxaMP;
 
-          // Detect coupon/discount
-          const desconto = getCouponDiscount(order, totalItems);
-          const valorProdutoReal = totalItems - desconto;
+          // Desconto: the REAL discount is the difference between item prices and order total
+          // order.totalAmount already has marketplace coupons/discounts applied by ML
+          // This captures ALL discounts that getCouponDiscount might miss
+          const descontoFromOrder = (totalItems > orderTotal && orderTotal > 0)
+            ? Number((totalItems - orderTotal).toFixed(2))
+            : 0;
+          const descontoCoupon = getCouponDiscount(order, totalItems);
+          const desconto = Math.max(descontoFromOrder, descontoCoupon);
 
-          // Total Líquido = valor produto (after coupon) - fees - seller shipping
-          const totalLiquido = valorProdutoReal - taxaML - taxaMP - sellerShipping;
+          // Effective sale value = item prices - all discounts (should ≈ orderTotal)
+          const valorEfetivo = totalItems - desconto;
 
-          // Return one row per item for detailed view
-          return order.items.map((item) => ({
-            pedidoId: order.externalId,
-            data: order.dateCreated.toISOString().split('T')[0],
-            status: order.status,
-            produto: item.title,
-            quantidade: item.quantity,
-            valorProduto: item.unitPrice.toNumber() * item.quantity,
-            desconto: Number((desconto / order.items.length).toFixed(2)),
-            taxaVenda: item.saleFee?.toNumber() || 0,
-            taxaML: Number((taxaML / order.items.length).toFixed(2)),
-            taxaMP: Number((taxaMP / order.items.length).toFixed(2)),
-            frete: Number((sellerShipping / order.items.length).toFixed(2)),
-            totalLiquido: Number(((item.unitPrice.toNumber() * item.quantity) - (desconto / order.items.length) - (taxaML / order.items.length) - (taxaMP / order.items.length) - (sellerShipping / order.items.length)).toFixed(2)),
-            sku: item.sku || '',
-          }));
+          // Total Líquido = effective sale value - fees - seller shipping
+          const totalLiquido = valorEfetivo - taxaML - taxaMP - sellerShipping;
+
+          // Return one row per item, distributing order-level values proportionally by item value
+          return order.items.map((item) => {
+            const itemValue = item.unitPrice.toNumber() * item.quantity;
+            const share = totalItems > 0 ? itemValue / totalItems : 1 / Math.max(order.items.length, 1);
+
+            // valorBrutoML = item's proportional share of order.totalAmount (ML's authoritative sale value)
+            const itemValorBrutoML = Number((orderTotal * share).toFixed(2));
+            const itemDesconto = Number((desconto * share).toFixed(2));
+            const itemTaxaML = Number((taxaML * share).toFixed(2));
+            const itemTaxaMP = Number((taxaMP * share).toFixed(2));
+            const itemFrete = Number((sellerShipping * share).toFixed(2));
+            const itemLiquido = Number((itemValorBrutoML - itemTaxaML - itemTaxaMP - itemFrete).toFixed(2));
+
+            return {
+              pedidoId: order.externalId,
+              packId: order.packId || null,
+              data: order.dateCreated.toISOString().split('T')[0],
+              status: order.status,
+              produto: item.title,
+              quantidade: item.quantity,
+              valorProduto: Number(itemValue.toFixed(2)),
+              valorBrutoML: itemValorBrutoML,
+              desconto: itemDesconto,
+              taxaVenda: item.saleFee?.toNumber() || 0,
+              taxaML: itemTaxaML,
+              taxaMP: itemTaxaMP,
+              frete: itemFrete,
+              totalLiquido: itemLiquido,
+              sku: item.sku || '',
+            };
+          });
         });
 
         return reply.code(200).send({
@@ -266,9 +289,10 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
           });
         }
 
-        const start = new Date(startDate);
-        const end = new Date(endDate);
-        const maxResults = limit ? parseInt(limit, 10) : 500;
+        // Timezone-safe: append time directly to date string to stay in UTC
+        const start = new Date(startDate + 'T00:00:00.000Z');
+        const end = new Date(endDate + 'T23:59:59.999Z');
+        const maxResults = limit ? parseInt(limit, 10) : 5000;
 
         const orders = await prisma.mLOrder.findMany({
           where: {
@@ -346,6 +370,7 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
             (sum, item) => sum + item.unitPrice.toNumber() * item.quantity,
             0
           );
+          const orderTotal = order.totalAmount.toNumber();
           const totalFees = order.items.reduce(
             (sum, item) => sum + (item.saleFee?.toNumber() || 0),
             0
@@ -360,10 +385,15 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
           const taxaML = fees.taxaML > 0 ? fees.taxaML : totalFees;
           const taxaMP = fees.taxaMP;
 
-          // Detect coupon/discount
-          const desconto = getCouponDiscountSummary(order, totalItems);
-          const valorProdutoReal = totalItems - desconto;
-          const totalLiquido = valorProdutoReal - taxaML - taxaMP - sellerShipping;
+          // Desconto: real discount = difference between item prices and ML's order total
+          const descontoFromOrder = (totalItems > orderTotal && orderTotal > 0)
+            ? Number((totalItems - orderTotal).toFixed(2))
+            : 0;
+          const descontoCoupon = getCouponDiscountSummary(order, totalItems);
+          const desconto = Math.max(descontoFromOrder, descontoCoupon);
+
+          const valorEfetivo = totalItems - desconto;
+          const totalLiquido = valorEfetivo - taxaML - taxaMP - sellerShipping;
 
           return {
             pedidoId: order.externalId,
