@@ -10,6 +10,7 @@ import { createMLSyncService } from '../modules/ml/services/sync.service.js';
 import { mpClient } from '../modules/mp/clients/mp.client.js';
 import { createMPSyncService } from '../modules/mp/services/sync.service.js';
 import { syncLogRepository } from '../modules/sync/repositories/sync-log.repository.js';
+import { prisma } from '../shared/database/client.js';
 
 const logger = createLogger('sync-routes');
 
@@ -631,6 +632,111 @@ export async function syncRoutes(fastify: FastifyInstance): Promise<void> {
         });
       } catch (error) {
         logger.error({ error }, 'Fee diagnostics failed');
+        return reply.code(500).send({
+          success: false,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+      }
+    }
+  );
+
+  /**
+   * Lightweight status refresh: re-checks order status on ML API for all PAID orders
+   * in a date range. Much faster than full resync because it only updates status,
+   * not shipments/billing/items.
+   */
+  fastify.post<{ Body: { dateFrom?: string; dateTo?: string; batchSize?: number } }>(
+    '/sync/ml/refresh-status',
+    async (request: FastifyRequest<{ Body: { dateFrom?: string; dateTo?: string; batchSize?: number } }>, reply: FastifyReply) => {
+      const dateFrom = request.body?.dateFrom ? new Date(request.body.dateFrom + 'T00:00:00.000Z') : (() => { const d = new Date(); d.setDate(d.getDate() - 90); return d; })();
+      const dateTo = request.body?.dateTo ? new Date(request.body.dateTo + 'T23:59:59.999Z') : new Date();
+      const batchSize = request.body?.batchSize || 50;
+
+      logger.info({ dateFrom, dateTo, batchSize }, 'Starting lightweight status refresh');
+
+      try {
+        // Get all PAID orders in date range
+        const paidOrders = await prisma.mLOrder.findMany({
+          where: {
+            dateCreated: { gte: dateFrom, lte: dateTo },
+            status: 'PAID',
+          },
+          select: { id: true, externalId: true, totalAmount: true },
+          orderBy: { dateCreated: 'desc' },
+        });
+
+        logger.info({ count: paidOrders.length }, 'Found PAID orders to refresh');
+
+        let updated = 0;
+        let cancelled = 0;
+        let errors = 0;
+        const changedOrders: Array<{ id: string; oldStatus: string; newStatus: string; amount: number }> = [];
+
+        // Process in batches
+        for (let i = 0; i < paidOrders.length; i += batchSize) {
+          const batch = paidOrders.slice(i, i + batchSize);
+
+          for (const order of batch) {
+            try {
+              const mlOrder = await mlClient.getOrder(Number(order.externalId));
+              const newStatus = mlOrder.status?.toLowerCase();
+
+              if (newStatus && newStatus !== 'paid') {
+                // Status changed - update in DB
+                const statusMap: Record<string, string> = {
+                  cancelled: 'CANCELLED',
+                  refunded: 'REFUNDED',
+                  pending: 'PENDING',
+                };
+                const dbStatus = statusMap[newStatus] || 'PAID';
+
+                await prisma.mLOrder.update({
+                  where: { id: order.id },
+                  data: { status: dbStatus as 'CANCELLED' | 'REFUNDED' | 'PENDING' | 'PAID' },
+                });
+
+                changedOrders.push({
+                  id: order.externalId,
+                  oldStatus: 'PAID',
+                  newStatus: dbStatus,
+                  amount: order.totalAmount.toNumber(),
+                });
+
+                updated++;
+                if (dbStatus === 'CANCELLED' || dbStatus === 'REFUNDED') {
+                  cancelled++;
+                }
+              }
+            } catch (err) {
+              errors++;
+              logger.warn({ orderId: order.externalId, error: err }, 'Failed to check order status');
+            }
+          }
+
+          // Brief pause between batches to respect rate limits
+          if (i + batchSize < paidOrders.length) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        }
+
+        const cancelledTotal = changedOrders
+          .filter(o => o.newStatus === 'CANCELLED' || o.newStatus === 'REFUNDED')
+          .reduce((sum, o) => sum + o.amount, 0);
+
+        return reply.code(200).send({
+          success: true,
+          message: `Status refresh completed. ${updated} orders changed, ${cancelled} cancelled/refunded (R$ ${cancelledTotal.toFixed(2)})`,
+          data: {
+            totalChecked: paidOrders.length,
+            statusChanged: updated,
+            cancelledOrRefunded: cancelled,
+            cancelledTotal: Number(cancelledTotal.toFixed(2)),
+            errors,
+            changedOrders: changedOrders.slice(0, 100), // Limit response size
+          },
+        });
+      } catch (error) {
+        logger.error({ error }, 'Status refresh failed');
         return reply.code(500).send({
           success: false,
           error: error instanceof Error ? error.message : 'Unknown error',
