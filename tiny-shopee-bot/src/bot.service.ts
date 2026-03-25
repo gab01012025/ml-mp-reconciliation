@@ -1,0 +1,204 @@
+import {
+  searchOrders,
+  getOrder,
+  isShopeeOrder,
+  isAlreadyAltered,
+  alterOrder,
+  generateNF,
+  hasAsteriskItems,
+} from './tiny-client';
+import { config } from './config';
+
+// Rastreia pedidos já processados para evitar reprocessamento
+const processedOrders = new Set<string>();
+
+/**
+ * Limpa o cache de pedidos processados (para forçar reprocessamento)
+ */
+export function clearProcessedOrders(): void {
+  processedOrders.clear();
+}
+
+/**
+ * Formata data atual no formato DD/MM/YYYY
+ */
+function formatDate(date: Date): string {
+  const d = String(date.getDate()).padStart(2, '0');
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const y = date.getFullYear();
+  return `${d}/${m}/${y}`;
+}
+
+/**
+ * Verifica se estamos no horário bloqueado para NF (13h-19h)
+ */
+function isNFBlocked(): boolean {
+  const now = new Date();
+  const hour = now.getHours();
+  return hour >= 13 && hour < 19;
+}
+
+/**
+ * Busca e processa pedidos Shopee novos
+ */
+export async function processNewShopeeOrders(customDataInicial?: string, customDataFinal?: string): Promise<{
+  found: number;
+  altered: number;
+  nfGenerated: number;
+  skippedNF: number;
+  errors: number;
+}> {
+  const stats = { found: 0, altered: 0, nfGenerated: 0, skippedNF: 0, errors: 0 };
+
+  let dataInicial: string;
+  let dataFinal: string;
+
+  if (customDataInicial && customDataFinal) {
+    dataInicial = customDataInicial;
+    dataFinal = customDataFinal;
+  } else {
+    const today = new Date();
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    dataInicial = formatDate(yesterday);
+    dataFinal = formatDate(today);
+  }
+
+  const nfBlocked = isNFBlocked();
+  if (nfBlocked) {
+    console.log(`[BOT] Horario bloqueado para NF (13h-19h). Vai alterar valores mas NAO gerar NF.`);
+  }
+
+  console.log(`\n[BOT] Buscando pedidos de ${dataInicial} a ${dataFinal}...`);
+
+  try {
+    // Busca todas as paginas de pedidos
+    let page = 1;
+    let totalPages = 1;
+    const allOrders: Array<{ id: string; numero: string; numero_ecommerce: string; valor: string; situacao: string }> = [];
+
+    while (page <= totalPages) {
+      const result = await searchOrders({
+        dataInicial,
+        dataFinal,
+        pagina: page,
+      });
+      totalPages = result.totalPages;
+      allOrders.push(...result.orders);
+      page++;
+
+      // Rate limiting - Tiny API tem limite de 60 req/min
+      await sleep(1100);
+    }
+
+    // Filtra pedidos que parecem ser da Shopee (ID alfanumerico, nao comeca com 2000)
+    // Status ignorados: Cancelado, Enviado (ja foram processados completamente)
+    const statusIgnorados = new Set(['Cancelado', 'Enviado']);
+    const potentialShopee = allOrders.filter(o => {
+      const ne = o.numero_ecommerce;
+      const isShopeeFormat = ne && ne.length > 0 && !ne.startsWith('2000') && ne !== '';
+      const notIgnored = !statusIgnorados.has(o.situacao);
+      return isShopeeFormat && notIgnored;
+    });
+
+    console.log(`[BOT] ${allOrders.length} pedidos totais, ${potentialShopee.length} possiveis Shopee pendentes`);
+
+    // Log status breakdown
+    const statusCount: Record<string, number> = {};
+    for (const o of potentialShopee) {
+      statusCount[o.situacao] = (statusCount[o.situacao] || 0) + 1;
+    }
+    console.log(`[BOT] Status breakdown:`, statusCount);
+
+    for (const order of potentialShopee) {
+      if (processedOrders.has(order.id)) continue;
+
+      try {
+        // Rate limiting - 1s entre chamadas
+        await sleep(1100);
+
+        // Obtem detalhes completos para confirmar que é Shopee
+        const detail = await getOrder(order.id);
+
+        if (!isShopeeOrder(detail)) {
+          console.log(`[BOT] Pedido ${order.id} (${order.numero}) NAO é Shopee (ecommerce: ${detail.ecommerce?.nomeEcommerce || 'N/A'}), pulando`);
+          processedOrders.add(order.id);
+          continue;
+        }
+
+        stats.found++;
+
+        // Pedido com * na descricao: nao altera valor nem gera NF
+        if (hasAsteriskItems(detail)) {
+          console.log(`[BOT] Pedido ${order.id} (${detail.numero}) tem item com * - NAO altera valor nem gera NF`);
+          stats.skippedNF++;
+          processedOrders.add(order.id);
+          continue;
+        }
+
+        // Verifica se o valor já foi alterado
+        if (isAlreadyAltered(detail)) {
+          // Valor ja alterado - verifica se precisa gerar NF
+          if (!detail.id_nota_fiscal && !nfBlocked) {
+            console.log(`[BOT] Pedido ${order.id} (${detail.numero}) valor ja alterado, gerando NF...`);
+            await sleep(1100);
+            const nf = await generateNF(order.id);
+            if (nf.success) stats.nfGenerated++;
+            else stats.errors++;
+          } else if (nfBlocked && !detail.id_nota_fiscal) {
+            console.log(`[BOT] Pedido ${order.id} (${detail.numero}) valor alterado, NF bloqueada (13h-19h)`);
+            stats.skippedNF++;
+            continue; // Nao marca como processado, volta no proximo ciclo
+          }
+          processedOrders.add(order.id);
+          continue;
+        }
+
+        // Verifica se já tem NF gerada (nao pode mais alterar)
+        if (detail.id_nota_fiscal) {
+          console.log(`[BOT] Pedido ${order.id} (${detail.numero}) ja tem NF, nao pode alterar`);
+          processedOrders.add(order.id);
+          continue;
+        }
+
+        // Altera o valor
+        console.log(`[BOT] Alterando pedido ${order.id} (${detail.numero}) - valor atual: R$${detail.total_pedido}`);
+        await sleep(1100);
+        const altered = await alterOrder(order.id, detail);
+        if (!altered) {
+          stats.errors++;
+          continue;
+        }
+        stats.altered++;
+
+        // Gera nota fiscal (se nao estiver no horario bloqueado)
+        if (!nfBlocked) {
+          await sleep(1100);
+          const nf = await generateNF(order.id);
+          if (nf.success) {
+            stats.nfGenerated++;
+          } else {
+            stats.errors++;
+          }
+          processedOrders.add(order.id);
+        } else {
+          console.log(`[BOT] Pedido ${order.id} (${detail.numero}) valor alterado, NF bloqueada (13h-19h)`);
+          stats.skippedNF++;
+          // Nao marca como processado - vai gerar NF no proximo ciclo fora do horario
+        }
+      } catch (err) {
+        console.error(`[ERRO] Falha ao processar pedido ${order.id}:`, err);
+        stats.errors++;
+      }
+    }
+  } catch (err) {
+    console.error('[ERRO] Falha na busca de pedidos:', err);
+  }
+
+  console.log(`[BOT] Resultado: ${stats.found} Shopee, ${stats.altered} alterados, ${stats.nfGenerated} NFs, ${stats.skippedNF} NFs bloqueadas, ${stats.errors} erros`);
+  return stats;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
