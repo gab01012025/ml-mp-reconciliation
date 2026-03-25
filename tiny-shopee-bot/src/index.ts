@@ -11,39 +11,40 @@ console.log(`Faixas: >=R$${config.faixaMuitoAlta}=R$${config.valorMuitoAlto} | R
 console.log(`Intervalo: a cada ${config.pollIntervalMinutes} minutos`);
 console.log('');
 
-// Health check HTTP server
+// State
 let lastRun: Date | null = null;
 let lastResult: any = null;
 let isRunning = false;
+let pendingReprocess: { de?: string; ate?: string } | null = null;
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url || '/', `http://localhost:${config.port}`);
 
-  if (url.pathname === '/health') {
+  // CORS
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  if (url.pathname === '/health' || url.pathname === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
       service: 'tiny-shopee-bot',
       uptime: process.uptime(),
       lastRun: lastRun?.toISOString() || null,
+      lastRunText: lastRun?.toLocaleString('pt-BR') || 'Nunca',
       lastResult,
       isRunning,
+      pendingReprocess: !!pendingReprocess,
     }));
   } else if (url.pathname === '/run' && req.method === 'POST') {
     if (isRunning) {
       res.writeHead(409, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Bot já está rodando' }));
+      res.end(JSON.stringify({ error: 'Bot já está rodando. Aguarde finalizar.' }));
       return;
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ message: 'Execução manual iniciada' }));
     runBot();
   } else if (url.pathname === '/reprocess' && req.method === 'POST') {
-    if (isRunning) {
-      res.writeHead(409, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Bot já está rodando' }));
-      return;
-    }
     const dataInicial = url.searchParams.get('de') || undefined;
     const dataFinal = url.searchParams.get('ate') || undefined;
     // Valida formato dd/mm/yyyy
@@ -56,6 +57,13 @@ const server = http.createServer((req, res) => {
     if (dataFinal && !dateRegex.test(dataFinal)) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Data "ate" invalida. Use dd/mm/aaaa' }));
+      return;
+    }
+    if (isRunning) {
+      // Enfileira o reprocessamento
+      pendingReprocess = { de: dataInicial, ate: dataFinal };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ message: 'Bot rodando - reprocessamento enfileirado. Vai rodar assim que terminar.', de: dataInicial || 'ontem', ate: dataFinal || 'hoje' }));
       return;
     }
     clearProcessedOrders();
@@ -86,6 +94,14 @@ async function runBot(dataInicial?: string, dataFinal?: string) {
     lastResult = { error: String(err) };
   } finally {
     isRunning = false;
+    // Processa fila de reprocessamento
+    if (pendingReprocess) {
+      const { de, ate } = pendingReprocess;
+      pendingReprocess = null;
+      console.log(`[BOT] Processando reprocessamento enfileirado: ${de || 'ontem'} a ${ate || 'hoje'}`);
+      clearProcessedOrders();
+      runBot(de, ate);
+    }
   }
 }
 
@@ -151,7 +167,7 @@ function getPageHtml(): string {
       <div class="card-header">Status</div>
       <div class="card-body">
         <div class="status-row"><span class="status-label">Estado</span><span class="status-value" id="status">${statusText}</span></div>
-        <div class="status-row"><span class="status-label">Última execução</span><span class="status-value">${lastRunText}</span></div>
+        <div class="status-row"><span class="status-label">Última execução</span><span class="status-value" id="lastRun">${lastRunText}</span></div>
         <div class="status-row"><span class="status-label">Intervalo automático</span><span class="status-value">A cada ${config.pollIntervalMinutes} min</span></div>
       </div>
     </div>
@@ -199,6 +215,18 @@ function getPageHtml(): string {
       el.style.display = 'block';
     }
 
+    // Polling de status a cada 3 segundos
+    setInterval(async () => {
+      try {
+        const r = await fetch('/status');
+        const d = await r.json();
+        document.getElementById('status').textContent = d.isRunning ? '🔄 Rodando...' : '✅ Aguardando';
+        document.getElementById('lastRun').textContent = d.lastRunText || 'Nunca';
+        if (d.lastResult) document.getElementById('result').textContent = JSON.stringify(d.lastResult, null, 2);
+        if (d.pendingReprocess) document.getElementById('status').textContent += ' (reprocessamento na fila)';
+      } catch(e) {}
+    }, 3000);
+
     async function executar() {
       const btn = document.getElementById('btnRun');
       btn.disabled = true;
@@ -217,8 +245,9 @@ function getPageHtml(): string {
       const de = document.getElementById('de').value.trim();
       const ate = document.getElementById('ate').value.trim();
       if (!de || !ate) { showMsg('msgReprocess', 'Preencha as duas datas', false); return; }
-      const regex = /^\\d{2}\\/\\d{2}\\/\\d{4}$/;
-      if (!regex.test(de) || !regex.test(ate)) { showMsg('msgReprocess', 'Formato: dd/mm/aaaa', false); return; }
+      if (!/^\\d{2}\\/\\d{2}\\/\\d{4}$/.test(de) || !/^\\d{2}\\/\\d{2}\\/\\d{4}$/.test(ate)) {
+        showMsg('msgReprocess', 'Formato invalido. Use dd/mm/aaaa', false); return;
+      }
 
       const btn = document.getElementById('btnReprocess');
       btn.disabled = true;
@@ -226,8 +255,7 @@ function getPageHtml(): string {
       try {
         const r = await fetch('/reprocess?de=' + encodeURIComponent(de) + '&ate=' + encodeURIComponent(ate), { method: 'POST' });
         const d = await r.json();
-        if (r.ok) showMsg('msgReprocess', d.message + ' (' + d.de + ' a ' + d.ate + ')', true);
-        else showMsg('msgReprocess', d.error, false);
+        showMsg('msgReprocess', d.message || d.error, r.ok);
       } catch(e) { showMsg('msgReprocess', 'Erro: ' + e.message, false); }
       btn.disabled = false;
       btn.textContent = '🔄 Reprocessar';
