@@ -25,7 +25,7 @@ interface TinyOrderDetail {
   numero_ecommerce: string;
   data_pedido: string;
   situacao: string;
-  itens: { item: TinyOrderItem | TinyOrderItem[] };
+  itens: TinyOrderItem[];
   ecommerce?: {
     nomeEcommerce?: string;
   };
@@ -135,13 +135,27 @@ export async function getOrder(id: string): Promise<TinyOrderDetail> {
   }
 
   const p = retorno.pedido;
+
+  // Normaliza itens: API pode retornar array [{item:{...}}] ou objeto {item:{...}} ou {item:[{...}]}
+  const rawItens = p.itens;
+  let items: TinyOrderItem[];
+  if (Array.isArray(rawItens)) {
+    // [{item: {...}}, {item: {...}}]
+    items = rawItens.map((i: any) => i.item || i);
+  } else if (rawItens?.item) {
+    // {item: {...}} ou {item: [{...}, {...}]}
+    items = ensureArray(rawItens.item);
+  } else {
+    items = [];
+  }
+
   return {
     id: String(p.id),
     numero: String(p.numero),
     numero_ecommerce: String(p.numero_ecommerce || ''),
     data_pedido: String(p.data_pedido),
     situacao: String(p.situacao),
-    itens: p.itens,
+    itens: items,
     ecommerce: p.ecommerce,
     total_produtos: String(p.total_produtos),
     total_pedido: String(p.total_pedido),
@@ -160,10 +174,7 @@ export function isShopeeOrder(order: TinyOrderDetail): boolean {
  * Verifica se o pedido já foi alterado (valor unitário já é <= R$3.00)
  */
 export function isAlreadyAltered(order: TinyOrderDetail): boolean {
-  const items = ensureArray(
-    Array.isArray(order.itens.item) ? order.itens.item : [order.itens.item]
-  );
-  return items.every(item => parseFloat(item.valor_unitario) <= config.valorAlto);
+  return order.itens.every(item => parseFloat(item.valor_unitario) <= config.valorAlto);
 }
 
 /**
@@ -171,10 +182,7 @@ export function isAlreadyAltered(order: TinyOrderDetail): boolean {
  * > R$60 = R$3.00 | R$15-R$60 = R$1.00 | < R$15 = R$0.50
  */
 export async function alterOrder(orderId: string, order: TinyOrderDetail): Promise<boolean> {
-  const items = ensureArray(
-    Array.isArray(order.itens.item) ? order.itens.item : [order.itens.item]
-  );
-
+  const items = order.itens;
   const totalOriginal = parseFloat(order.total_pedido);
   const valorUnitario = calcularValorUnitario(totalOriginal);
 
@@ -208,10 +216,7 @@ export async function alterOrder(orderId: string, order: TinyOrderDetail): Promi
  * Verifica se algum item do pedido tem '*' na descrição
  */
 export function hasAsteriskItems(order: TinyOrderDetail): boolean {
-  const items = ensureArray(
-    Array.isArray(order.itens.item) ? order.itens.item : [order.itens.item]
-  );
-  return items.some(item => item.descricao?.includes('*'));
+  return order.itens.some(item => item.descricao?.includes('*'));
 }
 
 /**
