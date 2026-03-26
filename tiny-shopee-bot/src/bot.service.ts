@@ -3,7 +3,8 @@ import {
   getOrder,
   isShopeeOrder,
   isAlreadyAltered,
-  alterOrder,
+  hasClientAddress,
+  createAndEmitNF,
   generateNF,
   hasAsteriskItems,
 } from './tiny-client';
@@ -156,33 +157,36 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
 
         // Verifica se já tem NF gerada (nao pode mais alterar)
         if (detail.id_nota_fiscal) {
-          console.log(`[BOT] Pedido ${order.id} (${detail.numero}) ja tem NF, nao pode alterar`);
+          console.log(`[BOT] Pedido ${order.id} (${detail.numero}) ja tem NF, pulando`);
           processedOrders.add(order.id);
           continue;
         }
 
-        // Altera o valor
-        console.log(`[BOT] Alterando pedido ${order.id} (${detail.numero}) - valor atual: R$${detail.total_pedido}`);
-        await sleep(1100);
-        const altered = await alterOrder(order.id, detail);
-        if (!altered) {
-          stats.errors++;
-          continue;
-        }
-        stats.altered++;
+        // Cria NF com valores alterados e emite
+        console.log(`[BOT] Criando NF para pedido ${order.id} (${detail.numero}) - total original: R$${detail.total_pedido}`);
 
-        // Gera nota fiscal (se nao estiver no horario bloqueado)
         if (!nfBlocked) {
           await sleep(1100);
-          const nf = await generateNF(order.id);
-          if (nf.success) {
-            stats.nfGenerated++;
+
+          if (hasClientAddress(detail)) {
+            // Tem endereço completo: cria NF com valores customizados via nota.fiscal.incluir + emitir
+            const nf = await createAndEmitNF(detail);
+            if (nf.success) {
+              stats.altered++;
+              stats.nfGenerated++;
+            } else {
+              stats.errors++;
+            }
           } else {
-            stats.errors++;
+            // Sem endereço: fallback para gerar NF pelo pedido (com valores originais)
+            console.log(`[BOT] Pedido ${order.id} sem endereço completo, gerando NF com valores originais (fallback)`);
+            const nf = await generateNF(order.id);
+            if (nf.success) stats.nfGenerated++;
+            else stats.errors++;
           }
           processedOrders.add(order.id);
         } else {
-          console.log(`[BOT] Pedido ${order.id} (${detail.numero}) valor alterado, NF bloqueada (13h-19h)`);
+          console.log(`[BOT] Pedido ${order.id} (${detail.numero}) NF bloqueada (13h-19h)`);
           stats.skippedNF++;
           // Nao marca como processado - vai gerar NF no proximo ciclo fora do horario
         }

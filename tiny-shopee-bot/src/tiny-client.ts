@@ -19,6 +19,20 @@ interface TinyOrderItem {
   valor_unitario: string;
 }
 
+interface TinyClientData {
+  nome: string;
+  tipo_pessoa: string;
+  cpf_cnpj: string;
+  ie: string;
+  endereco: string;
+  numero: string;
+  complemento: string;
+  bairro: string;
+  cidade: string;
+  uf: string;
+  cep: string;
+}
+
 interface TinyOrderDetail {
   id: string;
   numero: string;
@@ -26,6 +40,7 @@ interface TinyOrderDetail {
   data_pedido: string;
   situacao: string;
   itens: TinyOrderItem[];
+  cliente: TinyClientData;
   ecommerce?: {
     nomeEcommerce?: string;
   };
@@ -149,6 +164,8 @@ export async function getOrder(id: string): Promise<TinyOrderDetail> {
     items = [];
   }
 
+  const cli = p.cliente || {};
+
   return {
     id: String(p.id),
     numero: String(p.numero),
@@ -156,6 +173,19 @@ export async function getOrder(id: string): Promise<TinyOrderDetail> {
     data_pedido: String(p.data_pedido),
     situacao: String(p.situacao),
     itens: items,
+    cliente: {
+      nome: String(cli.nome || ''),
+      tipo_pessoa: String(cli.tipo_pessoa || 'F'),
+      cpf_cnpj: String(cli.cpf_cnpj || ''),
+      ie: String(cli.ie || ''),
+      endereco: String(cli.endereco || ''),
+      numero: String(cli.numero || ''),
+      complemento: String(cli.complemento || ''),
+      bairro: String(cli.bairro || ''),
+      cidade: String(cli.cidade || ''),
+      uf: String(cli.uf || ''),
+      cep: String(cli.cep || ''),
+    },
     ecommerce: p.ecommerce,
     total_produtos: String(p.total_produtos),
     total_pedido: String(p.total_pedido),
@@ -171,45 +201,18 @@ export function isShopeeOrder(order: TinyOrderDetail): boolean {
 }
 
 /**
- * Verifica se o pedido já foi alterado (valor unitário já é <= R$3.00)
+ * Verifica se o pedido já foi alterado (valor unitário já é <= R$15.00, o maior valor de faixa)
  */
 export function isAlreadyAltered(order: TinyOrderDetail): boolean {
-  return order.itens.every(item => parseFloat(item.valor_unitario) <= config.valorAlto);
+  return order.itens.every(item => parseFloat(item.valor_unitario) <= config.valorMuitoAlto);
 }
 
 /**
- * Altera o pedido no Tiny, setando valor unitário baseado no total original
- * > R$60 = R$3.00 | R$15-R$60 = R$1.00 | < R$15 = R$0.50
+ * Verifica se o cliente do pedido tem endereço suficiente para emissão de NF
  */
-export async function alterOrder(orderId: string, order: TinyOrderDetail): Promise<boolean> {
-  const items = order.itens;
-  const totalOriginal = parseFloat(order.total_pedido);
-  const valorUnitario = calcularValorUnitario(totalOriginal);
-
-  const dadosPedido = {
-    itens: items.map(item => ({
-      item: {
-        id_produto: item.id_produto,
-        descricao: item.descricao,
-        unidade: item.unidade,
-        quantidade: item.quantidade,
-        valor_unitario: valorUnitario.toFixed(2),
-      },
-    })),
-  };
-
-  const result = await tinyPostJson('pedido.alterar.php', { id: orderId }, { dados_pedido: dadosPedido });
-  const retorno = result.retorno || result;
-
-  if (retorno.status !== 'OK') {
-    const erros = retorno.erros;
-    const msg = Array.isArray(erros) ? erros.map((e: any) => e.erro).join(', ') : erros?.erro || 'Erro desconhecido';
-    console.error(`[ERRO] Falha ao alterar pedido ${orderId}: ${msg}`);
-    return false;
-  }
-
-  console.log(`[OK] Pedido ${orderId} alterado - total original: R$${totalOriginal.toFixed(2)} -> valor unitario: R$${valorUnitario.toFixed(2)}`);
-  return true;
+export function hasClientAddress(order: TinyOrderDetail): boolean {
+  const c = order.cliente;
+  return !!(c.endereco && c.bairro && c.cidade && c.uf && c.cep);
 }
 
 /**
@@ -220,7 +223,83 @@ export function hasAsteriskItems(order: TinyOrderDetail): boolean {
 }
 
 /**
- * Gera nota fiscal a partir do pedido
+ * Cria NF via nota.fiscal.incluir com valores customizados e emite na SEFAZ
+ */
+export async function createAndEmitNF(order: TinyOrderDetail): Promise<{ success: boolean; nfId?: string }> {
+  const totalOriginal = parseFloat(order.total_pedido);
+  const valorUnitario = calcularValorUnitario(totalOriginal);
+
+  const nota = {
+    nota_fiscal: {
+      tipo_nota: 'N',
+      natureza_operacao: 'Venda de mercadorias',
+      numero_ecommerce: order.numero_ecommerce,
+      frete_por_conta: 'R',
+      cliente: {
+        nome: order.cliente.nome,
+        tipo_pessoa: order.cliente.tipo_pessoa,
+        cpf_cnpj: order.cliente.cpf_cnpj,
+        ie: order.cliente.ie,
+        endereco: order.cliente.endereco,
+        numero: order.cliente.numero,
+        complemento: order.cliente.complemento,
+        bairro: order.cliente.bairro,
+        cep: order.cliente.cep,
+        cidade: order.cliente.cidade,
+        uf: order.cliente.uf,
+      },
+      itens: order.itens.map(item => ({
+        item: {
+          id_produto: item.id_produto,
+          descricao: item.descricao,
+          unidade: item.unidade,
+          quantidade: item.quantidade,
+          valor_unitario: valorUnitario.toFixed(3),
+        },
+      })),
+    },
+  };
+
+  // Passo 1: Incluir NF (cria rascunho com valores corretos)
+  const incluirResult = await tinyPost('nota.fiscal.incluir.php', {
+    nota: JSON.stringify(nota),
+  });
+  const incluirRetorno = incluirResult.retorno;
+
+  // nota.fiscal.incluir retorna registros como objeto ou array
+  const registro = incluirRetorno.registros?.registro;
+  const reg = Array.isArray(registro) ? registro[0] : registro;
+
+  if (incluirRetorno.status !== 'OK' || reg?.status !== 'OK') {
+    const erros = reg?.erros || incluirRetorno.erros;
+    const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro desconhecido';
+    console.error(`[ERRO] Falha ao criar NF para pedido ${order.id}: ${errList}`);
+    return { success: false };
+  }
+
+  const nfId = String(reg.id);
+  console.log(`[OK] NF ${reg.numero} criada para pedido ${order.id} (NF ID: ${nfId}) - valor: R$${valorUnitario.toFixed(2)}`);
+
+  // Passo 2: Emitir NF na SEFAZ
+  await sleep(1500);
+  const emitirResult = await tinyPost('nota.fiscal.emitir.php', { id: nfId });
+  const emitirRetorno = emitirResult.retorno;
+
+  if (emitirRetorno.status !== 'OK') {
+    const erros = emitirRetorno.erros;
+    const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro desconhecido';
+    console.error(`[ERRO] NF ${nfId} criada mas falhou ao emitir: ${errList}`);
+    return { success: false, nfId };
+  }
+
+  const situacao = emitirRetorno.nota_fiscal?.situacao;
+  console.log(`[OK] NF ${nfId} emitida na SEFAZ - situacao: ${situacao}`);
+  return { success: true, nfId };
+}
+
+/**
+ * Gera nota fiscal a partir do pedido (usa valores originais do pedido)
+ * Fallback para quando não há endereço completo do cliente
  */
 export async function generateNF(orderId: string): Promise<{ success: boolean; nfId?: string }> {
   const data = await tinyPost('gerar.nota.fiscal.pedido.php', { id: orderId });
@@ -232,12 +311,15 @@ export async function generateNF(orderId: string): Promise<{ success: boolean; n
     return { success: false };
   }
 
-  // Pode vir como registro único ou array
   const registros = ensureArray(retorno.registros?.registro ?? retorno.registros);
   const registro = registros[0]?.registro || registros[0];
   const nfId = registro?.idNotaFiscal;
-  console.log(`[OK] NF gerada para pedido ${orderId} - NF ID: ${nfId || 'N/A'}`);
+  console.log(`[OK] NF gerada (fallback) para pedido ${orderId} - NF ID: ${nfId || 'N/A'}`);
   return { success: true, nfId: nfId ? String(nfId) : undefined };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 
