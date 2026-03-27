@@ -29,6 +29,15 @@ function formatDate(date: Date): string {
 }
 
 /**
+ * Verifica se estamos no horário bloqueado para NF (13h-19h)
+ */
+function isNFBlocked(): boolean {
+  const now = new Date();
+  const hour = now.getHours();
+  return hour >= 13 && hour < 19;
+}
+
+/**
  * Busca e processa pedidos Shopee novos
  */
 export async function processNewShopeeOrders(customDataInicial?: string, customDataFinal?: string): Promise<{
@@ -52,6 +61,12 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
     yesterday.setDate(yesterday.getDate() - 1);
     dataInicial = formatDate(yesterday);
     dataFinal = formatDate(today);
+  }
+
+  const nfBlocked = isNFBlocked();
+  if (nfBlocked) {
+    console.log(`[BOT] Horario bloqueado para NF (13h-19h). Pedidos serao processados no proximo ciclo fora desse horario.`);
+    return stats;
   }
 
   console.log(`\n[BOT] Buscando pedidos de ${dataInicial} a ${dataFinal}...`);
