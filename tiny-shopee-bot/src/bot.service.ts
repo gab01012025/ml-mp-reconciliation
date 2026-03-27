@@ -151,6 +151,14 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
           continue;
         }
 
+        // Sem numero_ecommerce: pula (NF não será vinculada ao pedido Shopee)
+        if (!detail.numero_ecommerce) {
+          console.log(`[BOT] Pedido ${order.id} (${detail.numero}) sem numero_ecommerce - PULANDO (NF não linkaria com Shopee)`);
+          stats.skippedNF++;
+          processedOrders.add(order.id);
+          continue;
+        }
+
         // Cria NF com valores das faixas e emite na SEFAZ
         console.log(`[BOT] Criando NF para pedido ${order.id} (${detail.numero}) - total original: R$${detail.total_pedido}`);
         await sleep(1100);
