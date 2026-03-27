@@ -29,15 +29,6 @@ function formatDate(date: Date): string {
 }
 
 /**
- * Verifica se estamos no horário bloqueado para NF (13h-19h)
- */
-function isNFBlocked(): boolean {
-  const now = new Date();
-  const hour = now.getHours();
-  return hour >= 13 && hour < 19;
-}
-
-/**
  * Busca e processa pedidos Shopee novos
  */
 export async function processNewShopeeOrders(customDataInicial?: string, customDataFinal?: string): Promise<{
@@ -61,11 +52,6 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
     yesterday.setDate(yesterday.getDate() - 1);
     dataInicial = formatDate(yesterday);
     dataFinal = formatDate(today);
-  }
-
-  const nfBlocked = isNFBlocked();
-  if (nfBlocked) {
-    console.log(`[BOT] Horario bloqueado para NF (13h-19h). Vai alterar valores mas NAO gerar NF.`);
   }
 
   console.log(`\n[BOT] Buscando pedidos de ${dataInicial} a ${dataFinal}...`);
@@ -150,13 +136,6 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
           continue;
         }
 
-        // Horário bloqueado: não gera NF agora, tenta no próximo ciclo
-        if (nfBlocked) {
-          console.log(`[BOT] Pedido ${order.id} (${detail.numero}) NF bloqueada (13h-19h)`);
-          stats.skippedNF++;
-          continue; // Nao marca como processado
-        }
-
         // Cria NF com valores das faixas e emite na SEFAZ
         console.log(`[BOT] Criando NF para pedido ${order.id} (${detail.numero}) - total original: R$${detail.total_pedido}`);
         await sleep(1100);
@@ -178,7 +157,7 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
     console.error('[ERRO] Falha na busca de pedidos:', err);
   }
 
-  console.log(`[BOT] Resultado: ${stats.found} Shopee, ${stats.altered} alterados, ${stats.nfGenerated} NFs, ${stats.skippedNF} NFs bloqueadas, ${stats.errors} erros`);
+  console.log(`[BOT] Resultado: ${stats.found} Shopee, ${stats.altered} NFs com valor alterado, ${stats.nfGenerated} NFs emitidas, ${stats.skippedNF} pulados, ${stats.errors} erros`);
   return stats;
 }
 
