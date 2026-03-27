@@ -40,7 +40,7 @@ function isNFBlocked(): boolean {
 /**
  * Busca e processa pedidos Shopee novos
  */
-export async function processNewShopeeOrders(customDataInicial?: string, customDataFinal?: string): Promise<{
+export async function processNewShopeeOrders(customDataInicial?: string, customDataFinal?: string, skipBlockCheck = false): Promise<{
   found: number;
   altered: number;
   nfGenerated: number;
@@ -63,8 +63,7 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
     dataFinal = formatDate(today);
   }
 
-  const nfBlocked = isNFBlocked();
-  if (nfBlocked) {
+  if (!skipBlockCheck && isNFBlocked()) {
     console.log(`[BOT] Horario bloqueado para NF (13h-19h). Pedidos serao processados no proximo ciclo fora desse horario.`);
     return stats;
   }

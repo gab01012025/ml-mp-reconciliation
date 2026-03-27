@@ -42,8 +42,8 @@ const server = http.createServer((req, res) => {
       return;
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ message: 'Execução manual iniciada' }));
-    runBot();
+    res.end(JSON.stringify({ message: 'Execução manual iniciada (ignora bloqueio de horário)' }));
+    runBot(undefined, undefined, true);
   } else if (url.pathname === '/reprocess' && req.method === 'POST') {
     const dataInicial = url.searchParams.get('de') || undefined;
     const dataFinal = url.searchParams.get('ate') || undefined;
@@ -68,8 +68,8 @@ const server = http.createServer((req, res) => {
     }
     clearProcessedOrders();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ message: 'Reprocessamento iniciado', de: dataInicial || 'ontem', ate: dataFinal || 'hoje' }));
-    runBot(dataInicial, dataFinal);
+    res.end(JSON.stringify({ message: 'Reprocessamento iniciado (ignora bloqueio de horário)', de: dataInicial || 'ontem', ate: dataFinal || 'hoje' }));
+    runBot(dataInicial, dataFinal, true);
   } else {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(getPageHtml());
@@ -80,14 +80,15 @@ server.listen(config.port, () => {
   console.log(`[SERVER] Health check em http://localhost:${config.port}/health`);
 });
 
-async function runBot(dataInicial?: string, dataFinal?: string) {
+async function runBot(dataInicial?: string, dataFinal?: string, skipBlockCheck = false) {
   if (isRunning) return;
   isRunning = true;
   const mode = dataInicial ? `reprocessamento ${dataInicial} a ${dataFinal}` : 'verificação';
+  if (skipBlockCheck) console.log(`[BOT] Execucao manual - ignorando bloqueio de horario`);
   console.log(`\n[${new Date().toLocaleString('pt-BR')}] Iniciando ${mode}...`);
 
   try {
-    lastResult = await processNewShopeeOrders(dataInicial, dataFinal);
+    lastResult = await processNewShopeeOrders(dataInicial, dataFinal, skipBlockCheck);
     lastRun = new Date();
   } catch (err) {
     console.error('[ERRO] Falha na execução:', err);
