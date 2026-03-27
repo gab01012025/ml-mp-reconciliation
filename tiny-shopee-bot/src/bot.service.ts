@@ -6,7 +6,7 @@ import {
   hasClientAddress,
   createAndEmitNF,
   generateNF,
-  hasAsteriskItems,
+  hasMaskedClientData,
 } from './tiny-client';
 import { config } from './config';
 
@@ -129,9 +129,9 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
 
         stats.found++;
 
-        // Pedido com * na descricao: nao altera valor nem gera NF
-        if (hasAsteriskItems(detail)) {
-          console.log(`[BOT] Pedido ${order.id} (${detail.numero}) tem item com * - NAO altera valor nem gera NF`);
+        // Pedido com dados do cliente mascarados pela Shopee (***): nao gera NF
+        if (hasMaskedClientData(detail)) {
+          console.log(`[BOT] Pedido ${order.id} (${detail.numero}) dados do cliente mascarados (***) - NAO gera NF`);
           stats.skippedNF++;
           processedOrders.add(order.id);
           continue;

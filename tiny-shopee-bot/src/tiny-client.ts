@@ -208,18 +208,21 @@ export function isAlreadyAltered(order: TinyOrderDetail): boolean {
 }
 
 /**
- * Verifica se o cliente do pedido tem endereço suficiente para emissão de NF
+ * Verifica se o cliente do pedido tem endereço suficiente e não-mascarado para emissão de NF
  */
 export function hasClientAddress(order: TinyOrderDetail): boolean {
   const c = order.cliente;
-  return !!(c.endereco && c.bairro && c.cidade && c.uf && c.cep);
+  const hasFields = !!(c.endereco && c.bairro && c.cidade && c.uf && c.cep);
+  const isMasked = [c.nome, c.endereco].some(v => v?.includes('***'));
+  return hasFields && !isMasked;
 }
 
 /**
- * Verifica se algum item do pedido tem '*' na descrição
+ * Verifica se os dados do cliente estão mascarados pela Shopee (ex: T******s, Av******)
  */
-export function hasAsteriskItems(order: TinyOrderDetail): boolean {
-  return order.itens.some(item => item.descricao?.includes('*'));
+export function hasMaskedClientData(order: TinyOrderDetail): boolean {
+  const c = order.cliente;
+  return [c.nome, c.endereco, c.cpf_cnpj].some(v => v?.includes('***'));
 }
 
 /**
