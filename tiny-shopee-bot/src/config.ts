@@ -14,7 +14,7 @@ export const config = {
   valorBaixo: 0.50,        // pedidos abaixo de R$15
 
   // Intervalo de polling em minutos
-  pollIntervalMinutes: parseInt(process.env.POLL_INTERVAL || '5', 10),
+  pollIntervalMinutes: parseInt(process.env.POLL_INTERVAL || '30', 10),
 
   // Base URL da API do Tiny
   tinyApiUrl: 'https://api.tiny.com.br/api2',
