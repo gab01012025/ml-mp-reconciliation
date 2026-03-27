@@ -2,10 +2,8 @@ import {
   searchOrders,
   getOrder,
   isShopeeOrder,
-  isAlreadyAltered,
   hasClientAddress,
   createAndEmitNF,
-  generateNF,
   hasMaskedClientData,
 } from './tiny-client';
 import { config } from './config';
@@ -131,65 +129,46 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
 
         // Pedido com dados do cliente mascarados pela Shopee (***): nao gera NF
         if (hasMaskedClientData(detail)) {
-          console.log(`[BOT] Pedido ${order.id} (${detail.numero}) dados do cliente mascarados (***) - NAO gera NF`);
+          console.log(`[BOT] Pedido ${order.id} (${detail.numero}) dados do cliente mascarados (***) - PULANDO`);
           stats.skippedNF++;
           processedOrders.add(order.id);
           continue;
         }
 
-        // Verifica se o valor já foi alterado
-        if (isAlreadyAltered(detail)) {
-          // Valor ja alterado - verifica se precisa gerar NF
-          if (!detail.id_nota_fiscal && !nfBlocked) {
-            console.log(`[BOT] Pedido ${order.id} (${detail.numero}) valor ja alterado, gerando NF...`);
-            await sleep(1100);
-            const nf = await generateNF(order.id);
-            if (nf.success) stats.nfGenerated++;
-            else stats.errors++;
-          } else if (nfBlocked && !detail.id_nota_fiscal) {
-            console.log(`[BOT] Pedido ${order.id} (${detail.numero}) valor alterado, NF bloqueada (13h-19h)`);
-            stats.skippedNF++;
-            continue; // Nao marca como processado, volta no proximo ciclo
-          }
-          processedOrders.add(order.id);
-          continue;
-        }
-
-        // Verifica se já tem NF gerada (nao pode mais alterar)
+        // Verifica se já tem NF gerada
         if (detail.id_nota_fiscal) {
-          console.log(`[BOT] Pedido ${order.id} (${detail.numero}) ja tem NF, pulando`);
+          console.log(`[BOT] Pedido ${order.id} (${detail.numero}) ja tem NF (${detail.id_nota_fiscal}), pulando`);
           processedOrders.add(order.id);
           continue;
         }
 
-        // Cria NF com valores alterados e emite
-        console.log(`[BOT] Criando NF para pedido ${order.id} (${detail.numero}) - total original: R$${detail.total_pedido}`);
-
-        if (!nfBlocked) {
-          await sleep(1100);
-
-          if (hasClientAddress(detail)) {
-            // Tem endereço completo: cria NF com valores customizados via nota.fiscal.incluir + emitir
-            const nf = await createAndEmitNF(detail);
-            if (nf.success) {
-              stats.altered++;
-              stats.nfGenerated++;
-            } else {
-              stats.errors++;
-            }
-          } else {
-            // Sem endereço: fallback para gerar NF pelo pedido (com valores originais)
-            console.log(`[BOT] Pedido ${order.id} sem endereço completo, gerando NF com valores originais (fallback)`);
-            const nf = await generateNF(order.id);
-            if (nf.success) stats.nfGenerated++;
-            else stats.errors++;
-          }
+        // Sem endereço completo: pula (não gera NF com valores errados)
+        if (!hasClientAddress(detail)) {
+          console.log(`[BOT] Pedido ${order.id} (${detail.numero}) sem endereco completo - PULANDO`);
+          stats.skippedNF++;
           processedOrders.add(order.id);
-        } else {
+          continue;
+        }
+
+        // Horário bloqueado: não gera NF agora, tenta no próximo ciclo
+        if (nfBlocked) {
           console.log(`[BOT] Pedido ${order.id} (${detail.numero}) NF bloqueada (13h-19h)`);
           stats.skippedNF++;
-          // Nao marca como processado - vai gerar NF no proximo ciclo fora do horario
+          continue; // Nao marca como processado
         }
+
+        // Cria NF com valores das faixas e emite na SEFAZ
+        console.log(`[BOT] Criando NF para pedido ${order.id} (${detail.numero}) - total original: R$${detail.total_pedido}`);
+        await sleep(1100);
+
+        const nf = await createAndEmitNF(detail);
+        if (nf.success) {
+          stats.altered++;
+          stats.nfGenerated++;
+        } else {
+          stats.errors++;
+        }
+        processedOrders.add(order.id);
       } catch (err) {
         console.error(`[ERRO] Falha ao processar pedido ${order.id}:`, err);
         stats.errors++;
