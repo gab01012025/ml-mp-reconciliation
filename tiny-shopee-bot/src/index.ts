@@ -1,7 +1,7 @@
 import * as http from 'http';
 import * as cron from 'node-cron';
 import { config } from './config';
-import { processNewShopeeOrders, clearProcessedOrders } from './bot.service';
+import { processNewShopeeOrders, clearProcessedOrders, ProcessedNF } from './bot.service';
 
 console.log('===========================================');
 console.log('  Tiny Shopee Bot - Alteracao de Valores');
@@ -16,6 +16,8 @@ let lastRun: Date | null = null;
 let lastResult: any = null;
 let isRunning = false;
 let pendingReprocess: { de?: string; ate?: string } | null = null;
+const nfHistory: ProcessedNF[] = [];
+const MAX_NF_HISTORY = 100;
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url || '/', `http://localhost:${config.port}`);
@@ -34,6 +36,7 @@ const server = http.createServer((req, res) => {
       lastResult,
       isRunning,
       pendingReprocess: !!pendingReprocess,
+      nfHistory,
     }));
   } else if (url.pathname === '/run' && req.method === 'POST') {
     if (isRunning) {
@@ -88,8 +91,17 @@ async function runBot(dataInicial?: string, dataFinal?: string, skipBlockCheck =
   console.log(`\n[${new Date().toLocaleString('pt-BR')}] Iniciando ${mode}...`);
 
   try {
-    lastResult = await processNewShopeeOrders(dataInicial, dataFinal, skipBlockCheck);
+    const result = await processNewShopeeOrders(dataInicial, dataFinal, skipBlockCheck);
+    lastResult = result;
     lastRun = new Date();
+    // Acumula NFs no histórico
+    if (result.nfs && result.nfs.length > 0) {
+      nfHistory.unshift(...result.nfs);
+      // Limita histórico
+      if (nfHistory.length > MAX_NF_HISTORY) {
+        nfHistory.splice(MAX_NF_HISTORY);
+      }
+    }
   } catch (err) {
     console.error('[ERRO] Falha na execução:', err);
     lastResult = { error: String(err) };
@@ -156,6 +168,15 @@ function getPageHtml(): string {
     .msg-ok { background: #c8e6c9; color: #2e7d32; }
     .msg-err { background: #ffcdd2; color: #c62828; }
     .separator { border: none; border-top: 1px solid #eee; margin: 15px 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { background: #f8f9fa; text-align: left; padding: 10px 8px; border-bottom: 2px solid #dee2e6; font-weight: 600; }
+    td { padding: 8px; border-bottom: 1px solid #eee; vertical-align: middle; }
+    tr:hover { background: #f8f9fa; }
+    .chave { font-family: monospace; font-size: 11px; word-break: break-all; max-width: 200px; }
+    .btn-copy { padding: 4px 10px; font-size: 12px; border: 1px solid #4fc3f7; background: white; color: #0288d1; border-radius: 4px; cursor: pointer; white-space: nowrap; }
+    .btn-copy:hover { background: #e1f5fe; }
+    .btn-copy.copied { background: #c8e6c9; border-color: #66bb6a; color: #2e7d32; }
+    .empty-msg { text-align: center; color: #999; padding: 20px; font-size: 14px; }
   </style>
 </head>
 <body>
@@ -201,6 +222,15 @@ function getPageHtml(): string {
     </div>
 
     <div class="card">
+      <div class="card-header">📋 Notas Fiscais Emitidas (Chave de Acesso)</div>
+      <div class="card-body" style="padding: 10px;">
+        <div id="nfTable">
+          <p class="empty-msg">Nenhuma NF emitida ainda nesta sessão</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-header">Último Resultado</div>
       <div class="card-body">
         <pre id="result">${resultJson}</pre>
@@ -216,6 +246,37 @@ function getPageHtml(): string {
       el.style.display = 'block';
     }
 
+    function renderNFTable(nfs) {
+      const container = document.getElementById('nfTable');
+      if (!nfs || nfs.length === 0) {
+        container.innerHTML = '<p class="empty-msg">Nenhuma NF emitida ainda nesta sessão</p>';
+        return;
+      }
+      let html = '<table><thead><tr><th>NF</th><th>Pedido Shopee</th><th>Cliente</th><th>Valor</th><th>Chave de Acesso</th><th></th><th>Data</th></tr></thead><tbody>';
+      for (const nf of nfs) {
+        html += '<tr>';
+        html += '<td><strong>' + (nf.numero || nf.nfId) + '</strong></td>';
+        html += '<td>' + (nf.numeroEcommerce || '-') + '</td>';
+        html += '<td>' + (nf.clienteNome || '-') + '</td>';
+        html += '<td>R$ ' + (nf.valorNota ? nf.valorNota.toFixed(2) : '-') + '</td>';
+        html += '<td class="chave">' + (nf.chaveAcesso || 'N/A') + '</td>';
+        html += '<td><button class="btn-copy" onclick="copiar(this, \\'' + (nf.chaveAcesso || '') + '\\')">Copiar</button></td>';
+        html += '<td style="font-size:11px;color:#888;">' + (nf.dataProcessamento || '') + '</td>';
+        html += '</tr>';
+      }
+      html += '</tbody></table>';
+      container.innerHTML = html;
+    }
+
+    function copiar(btn, text) {
+      if (!text) return;
+      navigator.clipboard.writeText(text).then(() => {
+        btn.textContent = '✅ Copiado!';
+        btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = 'Copiar'; btn.classList.remove('copied'); }, 2000);
+      });
+    }
+
     // Polling de status a cada 3 segundos
     setInterval(async () => {
       try {
@@ -225,6 +286,7 @@ function getPageHtml(): string {
         document.getElementById('lastRun').textContent = d.lastRunText || 'Nunca';
         if (d.lastResult) document.getElementById('result').textContent = JSON.stringify(d.lastResult, null, 2);
         if (d.pendingReprocess) document.getElementById('status').textContent += ' (reprocessamento na fila)';
+        renderNFTable(d.nfHistory);
       } catch(e) {}
     }, 3000);
 

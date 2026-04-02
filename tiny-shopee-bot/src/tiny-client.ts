@@ -225,10 +225,20 @@ export function hasMaskedClientData(order: TinyOrderDetail): boolean {
   return [c.nome, c.endereco, c.cpf_cnpj].some(v => v?.includes('***'));
 }
 
+export interface NFResult {
+  success: boolean;
+  nfId?: string;
+  numero?: string;
+  chaveAcesso?: string;
+  valorNota?: number;
+  clienteNome?: string;
+  numeroEcommerce?: string;
+}
+
 /**
  * Cria NF via nota.fiscal.incluir com valores customizados e emite na SEFAZ
  */
-export async function createAndEmitNF(order: TinyOrderDetail): Promise<{ success: boolean; nfId?: string }> {
+export async function createAndEmitNF(order: TinyOrderDetail): Promise<NFResult> {
   const totalOriginal = parseFloat(order.total_pedido);
   const valorUnitario = calcularValorUnitario(totalOriginal);
 
@@ -297,7 +307,32 @@ export async function createAndEmitNF(order: TinyOrderDetail): Promise<{ success
 
   const situacao = emitirRetorno.nota_fiscal?.situacao;
   console.log(`[OK] NF ${nfId} emitida na SEFAZ - situacao: ${situacao}`);
-  return { success: true, nfId };
+
+  // Passo 3: Obter chave de acesso da NF emitida
+  let chaveAcesso: string | undefined;
+  let numeroNF: string | undefined;
+  try {
+    await sleep(1500);
+    const obterResult = await tinyPost('nota.fiscal.obter.php', { id: nfId });
+    const nfData = obterResult.retorno?.nota_fiscal;
+    if (nfData) {
+      chaveAcesso = nfData.chave_acesso || undefined;
+      numeroNF = nfData.numero || reg.numero;
+      console.log(`[OK] Chave de acesso NF ${nfId}: ${chaveAcesso || 'N/A'}`);
+    }
+  } catch (err) {
+    console.error(`[AVISO] NF ${nfId} emitida mas falha ao obter chave_acesso:`, err);
+  }
+
+  return {
+    success: true,
+    nfId,
+    numero: numeroNF || String(reg.numero),
+    chaveAcesso,
+    valorNota: valorUnitario * order.itens.reduce((sum, i) => sum + parseFloat(i.quantidade), 0),
+    clienteNome: order.cliente.nome,
+    numeroEcommerce: order.numero_ecommerce,
+  };
 }
 
 /**

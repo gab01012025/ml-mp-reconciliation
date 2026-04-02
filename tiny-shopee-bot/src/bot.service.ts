@@ -5,6 +5,7 @@ import {
   hasClientAddress,
   createAndEmitNF,
   hasMaskedClientData,
+  NFResult,
 } from './tiny-client';
 import { config } from './config';
 
@@ -37,17 +38,30 @@ function isNFBlocked(): boolean {
   return hour >= 13 && hour < 19;
 }
 
-/**
- * Busca e processa pedidos Shopee novos
- */
-export async function processNewShopeeOrders(customDataInicial?: string, customDataFinal?: string, skipBlockCheck = false): Promise<{
+export interface ProcessedNF {
+  numero: string;
+  nfId: string;
+  chaveAcesso: string;
+  clienteNome: string;
+  numeroEcommerce: string;
+  valorNota: number;
+  dataProcessamento: string;
+}
+
+export interface BotResult {
   found: number;
   altered: number;
   nfGenerated: number;
   skippedNF: number;
   errors: number;
-}> {
-  const stats = { found: 0, altered: 0, nfGenerated: 0, skippedNF: 0, errors: 0 };
+  nfs: ProcessedNF[];
+}
+
+/**
+ * Busca e processa pedidos Shopee novos
+ */
+export async function processNewShopeeOrders(customDataInicial?: string, customDataFinal?: string, skipBlockCheck = false): Promise<BotResult> {
+  const stats: BotResult = { found: 0, altered: 0, nfGenerated: 0, skippedNF: 0, errors: 0, nfs: [] };
 
   let dataInicial: string;
   let dataFinal: string;
@@ -166,6 +180,17 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
         if (nf.success) {
           stats.altered++;
           stats.nfGenerated++;
+          if (nf.chaveAcesso) {
+            stats.nfs.push({
+              numero: nf.numero || '',
+              nfId: nf.nfId || '',
+              chaveAcesso: nf.chaveAcesso,
+              clienteNome: nf.clienteNome || '',
+              numeroEcommerce: nf.numeroEcommerce || '',
+              valorNota: nf.valorNota || 0,
+              dataProcessamento: new Date().toLocaleString('pt-BR'),
+            });
+          }
         } else {
           stats.errors++;
         }
