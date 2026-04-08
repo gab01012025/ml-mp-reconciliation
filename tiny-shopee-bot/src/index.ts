@@ -80,14 +80,12 @@ const server = http.createServer(async (req, res) => {
     const user = (params.get('username') || '').trim();
     const pass = (params.get('password') || '').trim();
 
-    console.log(`[SERVER] Login attempt: user='${user}' (expected='${config.demoUser}')`);
+    console.log(`[SERVER] Login attempt: user='${user}' (expected='${config.demoUser}') passLen=${pass.length} (expectedLen=${config.demoPass.length})`);
     if (user === config.demoUser && pass === config.demoPass) {
       const token = createSession(user);
-      res.writeHead(302, {
-        'Set-Cookie': `session=${token}; Path=/; HttpOnly; SameSite=Lax`,
-        'Location': '/',
-      });
-      res.end();
+      console.log(`[SERVER] Login OK — session token created`);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Entrando...</title></head><body><script>document.cookie="session=${token}; path=/; max-age=86400; samesite=lax"; window.location.href="/";</script><p>Redirecionando...</p></body></html>`);
     } else {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(getLoginHtml('Usuário ou senha inválidos'));
@@ -101,7 +99,7 @@ const server = http.createServer(async (req, res) => {
     const token = parseCookieSession(req);
     if (token) sessions.delete(token);
     res.writeHead(302, {
-      'Set-Cookie': 'session=; Path=/; HttpOnly; Max-Age=0',
+      'Set-Cookie': 'session=; Path=/; HttpOnly; Max-Age=0; Secure',
       'Location': '/login',
     });
     res.end();
