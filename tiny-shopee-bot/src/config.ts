@@ -21,6 +21,10 @@ export const config = {
 
   // Porta do servidor HTTP para health check
   port: parseInt(process.env.PORT || '3001', 10),
+
+  // Demo credentials for Shopee Open Platform reviewer
+  demoUser: process.env.DEMO_USER || 'admin',
+  demoPass: process.env.DEMO_PASS || 'shopee2026',
 };
 
 /**
