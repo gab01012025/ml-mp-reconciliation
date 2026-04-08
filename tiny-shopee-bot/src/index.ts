@@ -23,6 +23,7 @@ const MAX_NF_HISTORY = 100;
 let totalOrdersSynced = 0;
 let totalNFsEmitted = 0;
 const startTime = new Date();
+let automationPaused = config.automationPausedDefault;
 
 // Session management
 const sessions = new Map<string, { user: string; created: Date }>();
@@ -76,9 +77,10 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/login' && req.method === 'POST') {
     const body = await parseBody(req);
     const params = new URLSearchParams(body);
-    const user = params.get('username') || '';
-    const pass = params.get('password') || '';
+    const user = (params.get('username') || '').trim();
+    const pass = (params.get('password') || '').trim();
 
+    console.log(`[SERVER] Login attempt: user='${user}' (expected='${config.demoUser}')`);
     if (user === config.demoUser && pass === config.demoPass) {
       const token = createSession(user);
       res.writeHead(302, {
@@ -127,6 +129,7 @@ const server = http.createServer(async (req, res) => {
       nfHistory,
       totalOrdersSynced,
       totalNFsEmitted,
+      automationPaused,
       logs: getLogs().slice(0, 50),
     }));
   } else if (url.pathname === '/run' && req.method === 'POST') {
@@ -162,6 +165,11 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ message: 'Reprocessamento iniciado', de: dataInicial || 'ontem', ate: dataFinal || 'hoje' }));
     runBot(dataInicial, dataFinal, true);
+  } else if (url.pathname === '/toggle-automation' && req.method === 'POST') {
+    automationPaused = !automationPaused;
+    console.log(`[SERVER] Automação ${automationPaused ? 'PAUSADA' : 'ATIVADA'} pelo painel`);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ automationPaused, message: automationPaused ? 'Automação pausada. Apenas sincronização manual funciona.' : 'Automação reativada. Sincronização automática a cada ' + config.pollIntervalMinutes + ' min.' }));
   } else {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(getDashboardHtml());
@@ -208,14 +216,22 @@ async function runBot(dataInicial?: string, dataFinal?: string, skipBlockCheck =
   }
 }
 
-// Agenda execução a cada N minutos
+// Agenda execução a cada N minutos (respects pause)
 const cronExpression = `*/${config.pollIntervalMinutes} * * * *`;
 cron.schedule(cronExpression, () => {
+  if (automationPaused) {
+    console.log('[BOT] Automação pausada — ciclo automático ignorado');
+    return;
+  }
   runBot();
 });
 
-// Executa imediatamente na primeira vez
-runBot();
+// Executa imediatamente na primeira vez (se não pausado)
+if (automationPaused) {
+  console.log('[BOT] Automação iniciada em modo PAUSADO — painel ativo, sync automático desligado');
+} else {
+  runBot();
+}
 
 function getLoginHtml(error?: string): string {
   return `<!DOCTYPE html>
@@ -403,7 +419,7 @@ function getDashboardHtml(): string {
       <div class="stat-card purple">
         <div class="stat-label">Última Sincronização</div>
         <div class="stat-value" id="lastSync" style="font-size:14px;">${lastRunText}</div>
-        <div class="stat-sub">Automático a cada ${config.pollIntervalMinutes} min</div>
+        <div class="stat-sub" id="autoStatus">${automationPaused ? '⏸ Automação pausada' : 'Automático a cada ' + config.pollIntervalMinutes + ' min'}</div>
       </div>
     </div>
 
@@ -436,6 +452,14 @@ function getDashboardHtml(): string {
     <div class="card">
       <div class="card-header">⚡ Importar Pedidos da Shopee</div>
       <div class="card-body">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; padding:12px 16px; background:${automationPaused ? '#fff7e6' : '#f6ffed'}; border-radius:8px; border:1px solid ${automationPaused ? '#ffd591' : '#b7eb8f'};">
+          <div>
+            <strong style="font-size:14px;">${automationPaused ? '⏸ Automação Pausada' : '▶ Automação Ativa'}</strong>
+            <div style="font-size:12px;color:#888;margin-top:2px;" id="autoLabel">${automationPaused ? 'Apenas sincronização manual funciona' : 'Sincronizando automaticamente a cada ' + config.pollIntervalMinutes + ' min'}</div>
+          </div>
+          <button class="btn ${automationPaused ? 'btn-primary' : 'btn-secondary'}" id="btnToggle" onclick="toggleAuto()" style="width:auto;padding:8px 18px;">${automationPaused ? '▶ Ativar' : '⏸ Pausar'}</button>
+        </div>
+        <div id="msgToggle" class="msg msg-ok"></div>
         <div id="msgRun" class="msg msg-ok"></div>
         <div class="actions" style="margin-bottom: 20px;">
           <button class="btn btn-primary" id="btnSync" onclick="syncNow()">▶ Sincronizar Agora</button>
@@ -545,6 +569,7 @@ function getDashboardHtml(): string {
         document.getElementById('lastSync').textContent = d.lastRunText || 'Aguardando';
         document.getElementById('totalOrders').textContent = d.totalOrdersSynced || '0';
         document.getElementById('totalNFs').textContent = d.totalNFsEmitted || '0';
+        document.getElementById('autoStatus').textContent = d.automationPaused ? '⏸ Automação pausada' : 'Automático a cada ${config.pollIntervalMinutes} min';
         if (d.lastResult) document.getElementById('result').textContent = JSON.stringify(d.lastResult, null, 2);
         renderNFTable(d.nfHistory);
         renderLogs(d.logs);
@@ -560,6 +585,18 @@ function getDashboardHtml(): string {
         showMsg('msgRun', r.ok ? d.message : d.error, r.ok);
       } catch(e) { showMsg('msgRun', 'Erro: ' + e.message, false); }
       btn.disabled = false; btn.textContent = '▶ Sincronizar Agora';
+    }
+
+    async function toggleAuto() {
+      const btn = document.getElementById('btnToggle');
+      btn.disabled = true;
+      try {
+        const r = await fetch('/toggle-automation', { method: 'POST' });
+        const d = await r.json();
+        showMsg('msgToggle', d.message, true);
+        setTimeout(() => location.reload(), 1000);
+      } catch(e) { showMsg('msgToggle', 'Erro: ' + e.message, false); }
+      btn.disabled = false;
     }
 
     async function reprocessar() {

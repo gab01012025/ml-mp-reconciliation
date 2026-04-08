@@ -25,6 +25,9 @@ export const config = {
   // Demo credentials for Shopee Open Platform reviewer
   demoUser: process.env.DEMO_USER || 'admin',
   demoPass: process.env.DEMO_PASS || 'shopee2026',
+
+  // Start with automation paused (true = only manual sync works)
+  automationPausedDefault: process.env.AUTOMATION_PAUSED !== 'false',
 };
 
 /**
