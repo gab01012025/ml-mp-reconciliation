@@ -66,48 +66,54 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://localhost:${config.port}`);
   res.setHeader('Access-Control-Allow-Origin', '*');
 
-  // Public endpoints
+  // Public: health
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'shopee-integration-platform', uptime: process.uptime() }));
+    res.end(JSON.stringify({ status: 'ok', service: 'shopee-integration-platform', version: 'v2.2-spa', uptime: process.uptime() }));
     return;
   }
 
-  // Login page
-  if (url.pathname === '/login' && req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(getLoginHtml());
+  // Public: version check (for debugging deploys)
+  if (url.pathname === '/version') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ version: 'v2.2-spa', deployed: startTime.toISOString() }));
     return;
   }
 
-  // Login action
-  if (url.pathname === '/login' && req.method === 'POST') {
-    const body = await parseBody(req);
-    let user = '', pass = '';
-    // Support both form-urlencoded and JSON
-    const contentType = req.headers['content-type'] || '';
-    if (contentType.includes('application/json')) {
-      try { const j = JSON.parse(body); user = (j.username || '').trim(); pass = (j.password || '').trim(); } catch {}
-    } else {
-      const params = new URLSearchParams(body);
-      user = (params.get('username') || '').trim();
-      pass = (params.get('password') || '').trim();
+  // Public: login page
+  if (url.pathname === '/login') {
+    if (req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(getLoginHtml());
+      return;
     }
+    if (req.method === 'POST') {
+      const body = await parseBody(req);
+      let user = '', pass = '';
+      const contentType = req.headers['content-type'] || '';
+      if (contentType.includes('application/json')) {
+        try { const j = JSON.parse(body); user = (j.username || '').trim(); pass = (j.password || '').trim(); } catch {}
+      } else {
+        const params = new URLSearchParams(body);
+        user = (params.get('username') || '').trim();
+        pass = (params.get('password') || '').trim();
+      }
 
-    console.log(`[SERVER] Login attempt: user='${user}' (expected='${config.demoUser}')`);
-    if (user === config.demoUser && pass === config.demoPass) {
-      const token = createSession(user);
-      console.log(`[SERVER] Login OK — token created`);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, token }));
-    } else {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: 'Usuário ou senha inválidos' }));
+      console.log(`[SERVER] Login attempt: user='${user}' (expected='${config.demoUser}')`);
+      if (user === config.demoUser && pass === config.demoPass) {
+        const token = createSession(user);
+        console.log(`[SERVER] Login OK — token created`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, token }));
+      } else {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Usuário ou senha inválidos' }));
+      }
+      return;
     }
-    return;
   }
 
-  // Logout
+  // Public: logout (just clears localStorage via JS)
   if (url.pathname === '/logout') {
     const token = getAuthToken(req, url);
     if (token) sessions.delete(token);
@@ -116,16 +122,17 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // All routes below require auth
+  // Public: dashboard page (auth is checked client-side via JS)
+  if (url.pathname === '/' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(getDashboardHtml());
+    return;
+  }
+
+  // ---------- All API routes below require auth via Authorization header ----------
   if (!isAuthenticated(req, url)) {
-    // For API calls return 401, for page loads redirect to login
-    if (req.headers.accept?.includes('application/json') || url.pathname === '/status') {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Não autenticado' }));
-    } else {
-      res.writeHead(302, { 'Location': '/login' });
-      res.end();
-    }
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Não autenticado' }));
     return;
   }
 
@@ -185,8 +192,8 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ automationPaused, message: automationPaused ? 'Automação pausada. Apenas sincronização manual funciona.' : 'Automação reativada. Sincronização automática a cada ' + config.pollIntervalMinutes + ' min.' }));
   } else {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(getDashboardHtml());
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
   }
 });
 
@@ -281,6 +288,7 @@ function getLoginHtml(error?: string): string {
       <p>Sincronização automática de pedidos e notas fiscais</p>
     </div>
     <div id="errorBox" class="error" style="display:none;"></div>
+    <div id="debugBox" style="display:none;font-size:11px;color:#888;background:#f5f5f5;padding:8px 12px;border-radius:6px;margin-bottom:16px;word-break:break-all;"></div>
     <form id="loginForm" onsubmit="doLogin(event)">
       <div class="form-group">
         <label>Usuário</label>
@@ -293,14 +301,19 @@ function getLoginHtml(error?: string): string {
       <button type="submit" class="btn-login" id="btnLogin">Entrar</button>
     </form>
     <script>
+      // If already logged in, go to dashboard
+      if (localStorage.getItem('auth_token')) { window.location.href = '/'; }
+
       async function doLogin(e) {
         e.preventDefault();
-        const btn = document.getElementById('btnLogin');
-        const errBox = document.getElementById('errorBox');
+        var btn = document.getElementById('btnLogin');
+        var errBox = document.getElementById('errorBox');
+        var dbg = document.getElementById('debugBox');
         errBox.style.display = 'none';
         btn.disabled = true; btn.textContent = 'Entrando...';
+        dbg.style.display = 'block'; dbg.textContent = 'Enviando...';
         try {
-          const r = await fetch('/login', {
+          var r = await fetch('/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -308,22 +321,25 @@ function getLoginHtml(error?: string): string {
               password: document.getElementById('password').value
             })
           });
-          const d = await r.json();
+          var d = await r.json();
+          dbg.textContent = 'Resp: status=' + r.status + ' ok=' + d.ok + ' token=' + (d.token ? 'sim' : 'nao');
           if (d.ok && d.token) {
             localStorage.setItem('auth_token', d.token);
-            window.location.href = '/?token=' + encodeURIComponent(d.token);
+            dbg.textContent = 'Token salvo! Redirecionando...';
+            window.location.href = '/';
           } else {
             errBox.textContent = d.error || 'Login falhou';
             errBox.style.display = 'block';
           }
         } catch(err) {
+          dbg.textContent = 'ERRO: ' + err.message;
           errBox.textContent = 'Erro de conexão: ' + err.message;
           errBox.style.display = 'block';
         }
         btn.disabled = false; btn.textContent = 'Entrar';
       }
     </script>
-    <div class="footer">v2.0 — Integração Shopee + Tiny ERP</div>
+    <div class="footer">v2.2-spa — Integração Shopee + Tiny ERP</div>
   </div>
 </body>
 </html>`;
@@ -556,17 +572,15 @@ function getDashboardHtml(): string {
   </div>
 
   <script>
-    // Token-based auth: get token from localStorage or URL
-    const urlParams = new URLSearchParams(window.location.search);
-    const urlToken = urlParams.get('token');
-    if (urlToken) { localStorage.setItem('auth_token', urlToken); }
-    const authToken = localStorage.getItem('auth_token');
+    // SPA Auth: check localStorage for token, redirect if missing
+    var authToken = localStorage.getItem('auth_token');
     if (!authToken) { window.location.href = '/login'; }
-    // Clean URL (remove token param) without reloading
-    if (urlToken && window.history.replaceState) {
-      window.history.replaceState({}, document.title, '/');
+    var authHeaders = { 'Authorization': 'Bearer ' + authToken };
+
+    function handleAuthError() {
+      localStorage.removeItem('auth_token');
+      window.location.href = '/login';
     }
-    const authHeaders = { 'Authorization': 'Bearer ' + authToken };
 
     function showMsg(id, text, ok) {
       const el = document.getElementById(id);
@@ -619,8 +633,8 @@ function getDashboardHtml(): string {
 
     setInterval(async () => {
       try {
-        const r = await fetch('/status', { headers: authHeaders });
-        if (r.status === 401 || r.redirected) { localStorage.removeItem('auth_token'); window.location.href = '/login'; return; }
+        var r = await fetch('/status', { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
         const d = await r.json();
         document.getElementById('statusText').innerHTML = d.isRunning ? '🔄 Sincronizando...' : '🟢 Conectado';
         document.getElementById('lastSync').textContent = d.lastRunText || 'Aguardando';
@@ -634,40 +648,43 @@ function getDashboardHtml(): string {
     }, 3000);
 
     async function syncNow() {
-      const btn = document.getElementById('btnSync');
+      var btn = document.getElementById('btnSync');
       btn.disabled = true; btn.textContent = '⏳ Sincronizando...';
       try {
-        const r = await fetch('/run', { method: 'POST', headers: authHeaders });
-        const d = await r.json();
+        var r = await fetch('/run', { method: 'POST', headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
         showMsg('msgRun', r.ok ? d.message : d.error, r.ok);
       } catch(e) { showMsg('msgRun', 'Erro: ' + e.message, false); }
       btn.disabled = false; btn.textContent = '▶ Sincronizar Agora';
     }
 
     async function toggleAuto() {
-      const btn = document.getElementById('btnToggle');
+      var btn = document.getElementById('btnToggle');
       btn.disabled = true;
       try {
-        const r = await fetch('/toggle-automation', { method: 'POST', headers: authHeaders });
-        const d = await r.json();
+        var r = await fetch('/toggle-automation', { method: 'POST', headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
         showMsg('msgToggle', d.message, true);
-        setTimeout(() => location.reload(), 1000);
+        setTimeout(function() { location.reload(); }, 1000);
       } catch(e) { showMsg('msgToggle', 'Erro: ' + e.message, false); }
       btn.disabled = false;
     }
 
     async function reprocessar() {
-      const de = document.getElementById('de').value.trim();
-      const ate = document.getElementById('ate').value.trim();
+      var de = document.getElementById('de').value.trim();
+      var ate = document.getElementById('ate').value.trim();
       if (!de || !ate) { showMsg('msgReprocess', 'Preencha as duas datas', false); return; }
       if (!/^\\d{2}\\/\\d{2}\\/\\d{4}$/.test(de) || !/^\\d{2}\\/\\d{2}\\/\\d{4}$/.test(ate)) {
         showMsg('msgReprocess', 'Formato inválido. Use dd/mm/aaaa', false); return;
       }
-      const btn = document.getElementById('btnReprocess');
+      var btn = document.getElementById('btnReprocess');
       btn.disabled = true; btn.textContent = '⏳ Reprocessando...';
       try {
-        const r = await fetch('/reprocess?de=' + encodeURIComponent(de) + '&ate=' + encodeURIComponent(ate), { method: 'POST', headers: authHeaders });
-        const d = await r.json();
+        var r = await fetch('/reprocess?de=' + encodeURIComponent(de) + '&ate=' + encodeURIComponent(ate), { method: 'POST', headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
         showMsg('msgReprocess', d.message || d.error, r.ok);
       } catch(e) { showMsg('msgReprocess', 'Erro: ' + e.message, false); }
       btn.disabled = false; btn.textContent = '🔄 Reprocessar';
