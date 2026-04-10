@@ -34,17 +34,24 @@ function createSession(user: string): string {
   return token;
 }
 
-function isAuthenticated(req: http.IncomingMessage): boolean {
+function getAuthToken(req: http.IncomingMessage, url: URL): string | null {
+  // Check Authorization header: Bearer <token>
+  const authHeader = req.headers.authorization || '';
+  if (authHeader.startsWith('Bearer ')) return authHeader.slice(7);
+  // Check query param ?token=
+  const qToken = url.searchParams.get('token');
+  if (qToken) return qToken;
+  // Check cookie fallback
   const cookieHeader = req.headers.cookie || '';
   const match = cookieHeader.match(/session=([^;]+)/);
-  if (!match) return false;
-  return sessions.has(match[1]);
+  if (match) return match[1];
+  return null;
 }
 
-function parseCookieSession(req: http.IncomingMessage): string | null {
-  const cookieHeader = req.headers.cookie || '';
-  const match = cookieHeader.match(/session=([^;]+)/);
-  return match ? match[1] : null;
+function isAuthenticated(req: http.IncomingMessage, url: URL): boolean {
+  const token = getAuthToken(req, url);
+  if (!token) return false;
+  return sessions.has(token);
 }
 
 function parseBody(req: http.IncomingMessage): Promise<string> {
@@ -76,40 +83,49 @@ const server = http.createServer(async (req, res) => {
   // Login action
   if (url.pathname === '/login' && req.method === 'POST') {
     const body = await parseBody(req);
-    const params = new URLSearchParams(body);
-    const user = (params.get('username') || '').trim();
-    const pass = (params.get('password') || '').trim();
+    let user = '', pass = '';
+    // Support both form-urlencoded and JSON
+    const contentType = req.headers['content-type'] || '';
+    if (contentType.includes('application/json')) {
+      try { const j = JSON.parse(body); user = (j.username || '').trim(); pass = (j.password || '').trim(); } catch {}
+    } else {
+      const params = new URLSearchParams(body);
+      user = (params.get('username') || '').trim();
+      pass = (params.get('password') || '').trim();
+    }
 
-    console.log(`[SERVER] Login attempt: user='${user}' (expected='${config.demoUser}') passLen=${pass.length} (expectedLen=${config.demoPass.length})`);
+    console.log(`[SERVER] Login attempt: user='${user}' (expected='${config.demoUser}')`);
     if (user === config.demoUser && pass === config.demoPass) {
       const token = createSession(user);
-      console.log(`[SERVER] Login OK — session token created`);
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Entrando...</title></head><body><script>document.cookie="session=${token}; path=/; max-age=86400; samesite=lax"; window.location.href="/";</script><p>Redirecionando...</p></body></html>`);
+      console.log(`[SERVER] Login OK — token created`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, token }));
     } else {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(getLoginHtml('Usuário ou senha inválidos'));
-      return;
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Usuário ou senha inválidos' }));
     }
     return;
   }
 
   // Logout
   if (url.pathname === '/logout') {
-    const token = parseCookieSession(req);
+    const token = getAuthToken(req, url);
     if (token) sessions.delete(token);
-    res.writeHead(302, {
-      'Set-Cookie': 'session=; Path=/; HttpOnly; Max-Age=0; Secure',
-      'Location': '/login',
-    });
-    res.end();
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body><script>localStorage.removeItem('auth_token');window.location.href='/login';</script></body></html>`);
     return;
   }
 
   // All routes below require auth
-  if (!isAuthenticated(req)) {
-    res.writeHead(302, { 'Location': '/login' });
-    res.end();
+  if (!isAuthenticated(req, url)) {
+    // For API calls return 401, for page loads redirect to login
+    if (req.headers.accept?.includes('application/json') || url.pathname === '/status') {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Não autenticado' }));
+    } else {
+      res.writeHead(302, { 'Location': '/login' });
+      res.end();
+    }
     return;
   }
 
@@ -264,18 +280,49 @@ function getLoginHtml(error?: string): string {
       <h1>Shopee Integration Platform</h1>
       <p>Sincronização automática de pedidos e notas fiscais</p>
     </div>
-    ${error ? `<div class="error">${error}</div>` : ''}
-    <form method="POST" action="/login">
+    <div id="errorBox" class="error" style="display:none;"></div>
+    <form id="loginForm" onsubmit="doLogin(event)">
       <div class="form-group">
         <label>Usuário</label>
-        <input type="text" name="username" placeholder="Digite seu usuário" required autofocus>
+        <input type="text" id="username" placeholder="Digite seu usuário" required autofocus>
       </div>
       <div class="form-group">
         <label>Senha</label>
-        <input type="password" name="password" placeholder="Digite sua senha" required>
+        <input type="password" id="password" placeholder="Digite sua senha" required>
       </div>
-      <button type="submit" class="btn-login">Entrar</button>
+      <button type="submit" class="btn-login" id="btnLogin">Entrar</button>
     </form>
+    <script>
+      async function doLogin(e) {
+        e.preventDefault();
+        const btn = document.getElementById('btnLogin');
+        const errBox = document.getElementById('errorBox');
+        errBox.style.display = 'none';
+        btn.disabled = true; btn.textContent = 'Entrando...';
+        try {
+          const r = await fetch('/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              username: document.getElementById('username').value,
+              password: document.getElementById('password').value
+            })
+          });
+          const d = await r.json();
+          if (d.ok && d.token) {
+            localStorage.setItem('auth_token', d.token);
+            window.location.href = '/?token=' + encodeURIComponent(d.token);
+          } else {
+            errBox.textContent = d.error || 'Login falhou';
+            errBox.style.display = 'block';
+          }
+        } catch(err) {
+          errBox.textContent = 'Erro de conexão: ' + err.message;
+          errBox.style.display = 'block';
+        }
+        btn.disabled = false; btn.textContent = 'Entrar';
+      }
+    </script>
     <div class="footer">v2.0 — Integração Shopee + Tiny ERP</div>
   </div>
 </body>
@@ -392,7 +439,7 @@ function getDashboardHtml(): string {
     <div class="brand"><span>🛒</span> Shopee Integration Platform</div>
     <div class="nav-right">
       <span class="user">👤 ${config.demoUser}</span>
-      <a href="/logout">Sair</a>
+      <a href="#" onclick="localStorage.removeItem('auth_token');window.location.href='/logout';return false;">Sair</a>
     </div>
   </div>
 
@@ -509,6 +556,18 @@ function getDashboardHtml(): string {
   </div>
 
   <script>
+    // Token-based auth: get token from localStorage or URL
+    const urlParams = new URLSearchParams(window.location.search);
+    const urlToken = urlParams.get('token');
+    if (urlToken) { localStorage.setItem('auth_token', urlToken); }
+    const authToken = localStorage.getItem('auth_token');
+    if (!authToken) { window.location.href = '/login'; }
+    // Clean URL (remove token param) without reloading
+    if (urlToken && window.history.replaceState) {
+      window.history.replaceState({}, document.title, '/');
+    }
+    const authHeaders = { 'Authorization': 'Bearer ' + authToken };
+
     function showMsg(id, text, ok) {
       const el = document.getElementById(id);
       el.textContent = text;
@@ -560,8 +619,8 @@ function getDashboardHtml(): string {
 
     setInterval(async () => {
       try {
-        const r = await fetch('/status');
-        if (r.status === 302 || r.redirected) { window.location = '/login'; return; }
+        const r = await fetch('/status', { headers: authHeaders });
+        if (r.status === 401 || r.redirected) { localStorage.removeItem('auth_token'); window.location.href = '/login'; return; }
         const d = await r.json();
         document.getElementById('statusText').innerHTML = d.isRunning ? '🔄 Sincronizando...' : '🟢 Conectado';
         document.getElementById('lastSync').textContent = d.lastRunText || 'Aguardando';
@@ -578,7 +637,7 @@ function getDashboardHtml(): string {
       const btn = document.getElementById('btnSync');
       btn.disabled = true; btn.textContent = '⏳ Sincronizando...';
       try {
-        const r = await fetch('/run', { method: 'POST' });
+        const r = await fetch('/run', { method: 'POST', headers: authHeaders });
         const d = await r.json();
         showMsg('msgRun', r.ok ? d.message : d.error, r.ok);
       } catch(e) { showMsg('msgRun', 'Erro: ' + e.message, false); }
@@ -589,7 +648,7 @@ function getDashboardHtml(): string {
       const btn = document.getElementById('btnToggle');
       btn.disabled = true;
       try {
-        const r = await fetch('/toggle-automation', { method: 'POST' });
+        const r = await fetch('/toggle-automation', { method: 'POST', headers: authHeaders });
         const d = await r.json();
         showMsg('msgToggle', d.message, true);
         setTimeout(() => location.reload(), 1000);
@@ -607,7 +666,7 @@ function getDashboardHtml(): string {
       const btn = document.getElementById('btnReprocess');
       btn.disabled = true; btn.textContent = '⏳ Reprocessando...';
       try {
-        const r = await fetch('/reprocess?de=' + encodeURIComponent(de) + '&ate=' + encodeURIComponent(ate), { method: 'POST' });
+        const r = await fetch('/reprocess?de=' + encodeURIComponent(de) + '&ate=' + encodeURIComponent(ate), { method: 'POST', headers: authHeaders });
         const d = await r.json();
         showMsg('msgReprocess', d.message || d.error, r.ok);
       } catch(e) { showMsg('msgReprocess', 'Erro: ' + e.message, false); }
