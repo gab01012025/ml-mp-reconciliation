@@ -215,9 +215,10 @@ export async function searchOrdersByDate(dataInicial: string, dataFinal: string)
 }
 
 /**
- * Busca pedidos do ML em janela de N dias atrás (apenas pagos), com shipping_id
+ * Busca pedidos do ML recentes com shipping pendente de envio (útil para "data de coleta").
+ * Inclui todos os status de pedido, mas prioriza aqueles com shipping ainda a ser despachado.
  */
-export async function searchRecentPaidOrders(daysBack: number = 30): Promise<MLOrderSummary[]> {
+export async function searchRecentPaidOrders(daysBack: number = 45): Promise<MLOrderSummary[]> {
   const t = loadTokens();
   if (!t) throw new Error('ML não conectado');
 
@@ -227,31 +228,49 @@ export async function searchRecentPaidOrders(daysBack: number = 30): Promise<MLO
   const toIso = now.toISOString();
 
   const all: MLOrderSummary[] = [];
-  let offset = 0;
-  const limit = 50;
-  for (let page = 0; page < 30; page++) {
-    const data = await mlGet('/orders/search', {
-      seller: String(t.user_id),
-      'order.status': 'paid',
-      'order.date_created.from': fromIso,
-      'order.date_created.to': toIso,
-      sort: 'date_desc',
-      offset: String(offset),
-      limit: String(limit),
-    });
-    const results = data.results || [];
-    for (const o of results) {
-      all.push({
-        id: o.id,
-        status: o.status,
-        date_closed: o.date_closed,
-        total_amount: o.total_amount,
-        shipping_id: o.shipping?.id,
-      });
+  const seen = new Set<number>();
+  // Tenta vários filtros pra maximizar cobertura
+  const queries: Array<Record<string, string>> = [
+    { 'shipping.status': 'ready_to_ship' },
+    { 'shipping.status': 'handling' },
+    { 'order.status': 'paid' },
+  ];
+
+  for (const extra of queries) {
+    let offset = 0;
+    const limit = 50;
+    for (let page = 0; page < 30; page++) {
+      try {
+        const data = await mlGet('/orders/search', {
+          seller: String(t.user_id),
+          'order.date_created.from': fromIso,
+          'order.date_created.to': toIso,
+          sort: 'date_desc',
+          offset: String(offset),
+          limit: String(limit),
+          ...extra,
+        });
+        const results = data.results || [];
+        for (const o of results) {
+          if (seen.has(o.id)) continue;
+          seen.add(o.id);
+          all.push({
+            id: o.id,
+            status: o.status,
+            date_closed: o.date_closed,
+            total_amount: o.total_amount,
+            shipping_id: o.shipping?.id,
+          });
+        }
+        if (results.length < limit) break;
+        offset += limit;
+      } catch (err) {
+        console.warn('[ML] searchRecentPaidOrders query falhou:', extra, err);
+        break;
+      }
     }
-    if (results.length < limit) break;
-    offset += limit;
   }
+  console.log(`[ML] searchRecentPaidOrders: ${all.length} pedidos únicos retornados`);
   return all;
 }
 
@@ -259,27 +278,81 @@ export interface MLShipmentInfo {
   id: number;
   status?: string;
   substatus?: string;
-  estimated_handling_limit_date?: string; // YYYY-MM-DD
+  estimated_handling_limit_date?: string; // YYYY-MM-DD local BR
   date_first_printed?: string;
   date_handling?: string;
+  raw_date_source?: string;
+  raw?: any;
 }
 
 /**
- * Busca dados do shipment ML — extrai a data de coleta do vendedor
+ * Busca dados do shipment ML — extrai a data de coleta do vendedor.
+ * Tenta múltiplos campos conforme versão da API.
  */
 export async function getShipment(shipmentId: number): Promise<MLShipmentInfo> {
   const data = await mlGet(`/shipments/${shipmentId}`);
-  const ehl = data.shipping_option?.estimated_handling_limit?.date
-    || data.estimated_handling_limit?.date
-    || null;
+
+  // Caminhos possíveis para a data limite de coleta/handoff, em ordem de preferência
+  const candidates: Array<[string, any]> = [
+    ['lead_time.estimated_handling_limit.date', data.lead_time?.estimated_handling_limit?.date],
+    ['shipping_option.estimated_handling_limit.date', data.shipping_option?.estimated_handling_limit?.date],
+    ['estimated_handling_limit.date', data.estimated_handling_limit?.date],
+    ['shipping_option.estimated_schedule_limit.date', data.shipping_option?.estimated_schedule_limit?.date],
+    ['lead_time.estimated_schedule_limit.date', data.lead_time?.estimated_schedule_limit?.date],
+    ['date_handling', data.date_handling],
+  ];
+
+  let rawDate: string | undefined;
+  let rawSource: string | undefined;
+  for (const [src, val] of candidates) {
+    if (val) { rawDate = String(val); rawSource = src; break; }
+  }
+
+  // ML retorna em ISO com timezone brasileiro geralmente; pega só a parte da data local (-03:00)
+  let localDate: string | undefined;
+  if (rawDate) {
+    // Se vier com timezone, primeiro 10 chars já são YYYY-MM-DD local
+    localDate = rawDate.slice(0, 10);
+  }
+
   return {
     id: data.id,
     status: data.status,
     substatus: data.substatus,
-    estimated_handling_limit_date: ehl ? String(ehl).slice(0, 10) : undefined,
+    estimated_handling_limit_date: localDate,
     date_first_printed: data.date_first_printed,
     date_handling: data.date_handling,
+    raw_date_source: rawSource,
+    raw: data,
   };
+}
+
+/**
+ * Usado para debug: retorna uma amostra de shipments com todos os campos relevantes
+ */
+export async function debugSampleShipments(limit: number = 10): Promise<any[]> {
+  const orders = await searchRecentPaidOrders(15);
+  const sample = orders.slice(0, limit);
+  const out: any[] = [];
+  for (const o of sample) {
+    if (!o.shipping_id) { out.push({ order_id: o.id, shipping_id: null, status: o.status }); continue; }
+    try {
+      const info = await getShipment(o.shipping_id);
+      out.push({
+        order_id: o.id,
+        shipping_id: o.shipping_id,
+        status: info.status,
+        substatus: info.substatus,
+        date_source: info.raw_date_source,
+        handling_limit_date: info.estimated_handling_limit_date,
+        lead_time: info.raw?.lead_time,
+        shipping_option_keys: info.raw?.shipping_option ? Object.keys(info.raw.shipping_option) : null,
+      });
+    } catch (e: any) {
+      out.push({ order_id: o.id, shipping_id: o.shipping_id, error: e.message });
+    }
+  }
+  return out;
 }
 
 function ddmmyyyyToIso(d: string, endOfDay: boolean): string {

@@ -75,14 +75,14 @@ const server = http.createServer(async (req, res) => {
   // Public: health
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.2-coleta', uptime: process.uptime() }));
+    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.3-debug', uptime: process.uptime() }));
     return;
   }
 
   // Public: version check (for debugging deploys)
   if (url.pathname === '/version') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ version: 'v3.2-coleta', deployed: startTime.toISOString() }));
+    res.end(JSON.stringify({ version: 'v3.3-debug', deployed: startTime.toISOString() }));
     return;
   }
 
@@ -259,6 +259,15 @@ const server = http.createServer(async (req, res) => {
     ml.disconnect();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, message: 'Conta ML desconectada' }));
+  } else if (url.pathname === '/ml/debug' && req.method === 'GET') {
+    try {
+      const sample = await ml.debugSampleShipments(12);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, sample }, null, 2));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
   } else if (url.pathname === '/ml/process-day' && req.method === 'POST') {
     const date = url.searchParams.get('date') || '';
     const mode = (url.searchParams.get('mode') || 'coleta').toLowerCase();
@@ -852,6 +861,7 @@ function getDashboardHtml(): string {
             <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px;">
               <button class="btn btn-primary btn-sm" onclick="mlQuickRun('hoje')" id="btnMLHoje">📅 Coleta Hoje</button>
               <button class="btn btn-primary btn-sm" onclick="mlQuickRun('amanha')" id="btnMLAmanha">📅 Coleta Amanhã</button>
+              <button class="btn btn-secondary btn-sm" onclick="mlDebug()" id="btnMLDebug">🔍 Inspecionar API ML</button>
             </div>
 
             <hr style="border:none; border-top:1px solid #f0f0f0; margin: 6px 0 14px;">
@@ -1112,6 +1122,21 @@ function getDashboardHtml(): string {
         await r.json();
         refreshMLStatus();
       } catch(e) {}
+    }
+
+    async function mlDebug() {
+      var btn = document.getElementById('btnMLDebug');
+      btn.disabled = true; btn.textContent = '⏳ Inspecionando...';
+      try {
+        var r = await fetch('/ml/debug', { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
+        var box = document.getElementById('mlLastResultBox');
+        box.style.display = 'block';
+        document.getElementById('mlLastResult').textContent = JSON.stringify(d, null, 2);
+        showMsg('msgML', 'Debug: amostra de ' + (d.sample ? d.sample.length : 0) + ' shipments exibida abaixo. Verifique os campos de data.', true);
+      } catch(e) { showMsg('msgML', 'Erro: ' + e.message, false); }
+      btn.disabled = false; btn.textContent = '🔍 Inspecionar API ML';
     }
 
     // Inicializa status ML e atualiza periodicamente
