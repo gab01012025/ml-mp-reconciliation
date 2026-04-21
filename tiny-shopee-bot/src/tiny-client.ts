@@ -139,29 +139,50 @@ export async function searchOrders(params: {
 }
 
 /**
- * Busca pedido(s) Tiny por numero_ecommerce (ID externo do marketplace)
+ * Busca pedido(s) Tiny por numero_ecommerce (ID externo do marketplace).
+ * Faz retry em erros transitórios do Tiny ("Tente novamente mais tarde").
  */
 export async function searchByNumeroEcommerce(numeroEcommerce: string): Promise<TinyOrderSummary[]> {
-  const data = await tinyPost('pedidos.pesquisa.php', { numero_ecommerce: numeroEcommerce });
-  const retorno = data.retorno;
-  if (retorno.status !== 'OK') {
-    const erro = retorno.erros?.[0]?.erro || retorno.erros?.erro || '';
-    if (String(erro).includes('não retornou registros')) return [];
-    throw new Error(`Tiny API error (numero_ecommerce=${numeroEcommerce}): ${erro}`);
+  let lastErr: any;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const data = await tinyPost('pedidos.pesquisa.php', { numero_ecommerce: numeroEcommerce });
+      const retorno = data.retorno;
+      if (retorno.status !== 'OK') {
+        const erro = retorno.erros?.[0]?.erro || retorno.erros?.erro || '';
+        const erroStr = String(erro);
+        if (erroStr.includes('não retornou registros')) return [];
+        // Erros transitórios do Tiny — retry
+        if (erroStr.includes('Tente novamente') || erroStr.includes('executar a consulta')) {
+          lastErr = new Error(`Tiny transitório: ${erroStr}`);
+          await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+          continue;
+        }
+        throw new Error(`Tiny API error (numero_ecommerce=${numeroEcommerce}): ${erroStr}`);
+      }
+      const rawPedidos = ensureArray(retorno.pedidos);
+      return rawPedidos.map((p: any) => {
+        const ped = p.pedido || p;
+        return {
+          id: String(ped.id),
+          numero: String(ped.numero),
+          numero_ecommerce: String(ped.numero_ecommerce || ''),
+          data_pedido: String(ped.data_pedido),
+          nome: String(ped.nome),
+          valor: String(ped.valor),
+          situacao: String(ped.situacao),
+        };
+      });
+    } catch (err: any) {
+      lastErr = err;
+      // Se for erro de rede/timeout, retry
+      if (attempt < 2) {
+        await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+        continue;
+      }
+    }
   }
-  const rawPedidos = ensureArray(retorno.pedidos);
-  return rawPedidos.map((p: any) => {
-    const ped = p.pedido || p;
-    return {
-      id: String(ped.id),
-      numero: String(ped.numero),
-      numero_ecommerce: String(ped.numero_ecommerce || ''),
-      data_pedido: String(ped.data_pedido),
-      nome: String(ped.nome),
-      valor: String(ped.valor),
-      situacao: String(ped.situacao),
-    };
-  });
+  throw lastErr;
 }
 
 /**
