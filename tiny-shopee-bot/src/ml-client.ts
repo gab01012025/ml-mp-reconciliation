@@ -278,9 +278,11 @@ export interface MLShipmentInfo {
   id: number;
   status?: string;
   substatus?: string;
-  estimated_handling_limit_date?: string; // YYYY-MM-DD local BR
+  estimated_handling_limit_date?: string; // YYYY-MM-DD local BR — data efetiva de "coleta" (pay_before no Full)
+  pay_before_full?: string; // ISO completo do pay_before (deadline emissão NF)
   date_first_printed?: string;
   date_handling?: string;
+  logistic_type?: string;
   raw_date_source?: string;
   raw?: any;
 }
@@ -315,12 +317,19 @@ export async function getShipment(shipmentId: number): Promise<MLShipmentInfo> {
     return undefined;
   };
 
-  // Caminhos possíveis para a data limite de coleta/handoff, em ordem de preferência
+  // Caminhos possíveis para a data-limite de emissão de NF / coleta, em ordem de preferência.
+  // IMPORTANTE: Para Full (`logistic_type=fulfillment`), os campos de coleta do seller ficam null;
+  // o prazo real que o painel ML usa em "Coleta | Amanhã → NF-e para gerenciar" é
+  // `estimated_delivery_time.pay_before` (deadline para a NF estar emitida).
+  const payBeforeLead = leadTime?.estimated_delivery_time?.pay_before;
+  const payBeforeShip = data.shipping_option?.estimated_delivery_time?.pay_before;
   const candidates: Array<[string, any]> = [
+    ['lead_time.estimated_delivery_time.pay_before', payBeforeLead],
+    ['shipping_option.estimated_delivery_time.pay_before', payBeforeShip],
+    ['lead_time.buffering.date', leadTime?.buffering?.date],
     ['lead_time.estimated_handling_limit', leadTime?.estimated_handling_limit],
     ['lead_time.estimated_schedule_limit', leadTime?.estimated_schedule_limit],
     ['lead_time.pickup_promise', leadTime?.pickup_promise],
-    ['lead_time.handling_date', leadTime?.handling_date],
     ['shipping_option.estimated_schedule_limit', data.shipping_option?.estimated_schedule_limit],
     ['shipping_option.estimated_handling_limit', data.shipping_option?.estimated_handling_limit],
     ['shipping_option.pickup_promise', data.shipping_option?.pickup_promise],
@@ -347,8 +356,10 @@ export async function getShipment(shipmentId: number): Promise<MLShipmentInfo> {
     status: data.status,
     substatus: data.substatus,
     estimated_handling_limit_date: localDate,
+    pay_before_full: payBeforeLead || payBeforeShip,
     date_first_printed: data.date_first_printed,
     date_handling: data.date_handling,
+    logistic_type: data.logistic_type,
     raw_date_source: rawSource,
     raw: { ...data, __lead_time_endpoint: leadTime },
   };
@@ -370,8 +381,8 @@ export async function debugSampleShipments(limit: number = 10): Promise<any[]> {
         shipping_id: o.shipping_id,
         status: info.status,
         substatus: info.substatus,
-        logistic_type: info.raw?.logistic_type || info.raw?.logistic?.type,
-        mode: info.raw?.mode,
+        logistic_type: info.logistic_type,
+        pay_before: info.pay_before_full,
         date_source: info.raw_date_source,
         handling_limit_date: info.estimated_handling_limit_date,
         shipping_option: info.raw?.shipping_option ? {

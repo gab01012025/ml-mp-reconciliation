@@ -314,15 +314,19 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
 }
 
 /**
- * Processa pedidos ML cuja DATA DE COLETA (estimated_handling_limit do shipment) seja igual à dataColeta.
- * Usa a API ML para descobrir quais pedidos têm coleta no dia, depois busca cada um no Tiny e cria NF.
+ * Processa pedidos ML cujo DEADLINE DE NF (pay_before) cai até o fim do dia selecionado.
+ * Para pedidos Full (logistic_type=fulfillment) não existe data de coleta do seller — o ML
+ * agrupa os pedidos em "Coleta | Hoje/Amanhã" pelo `estimated_delivery_time.pay_before`,
+ * que é o deadline para a NF estar emitida antes da expedição.
  */
 export async function processMercadoLivreByCollectionDate(dataColeta: string): Promise<BotResult> {
   const stats: BotResult = { found: 0, altered: 0, nfGenerated: 0, skippedNF: 0, errors: 0, nfs: [] };
   const discount = config.mlDiscountPercent;
   const isoTarget = ddmmyyyyToIsoDate(dataColeta);
+  // Fim do dia selecionado em horário BR (-03:00)
+  const targetEnd = new Date(`${isoTarget}T23:59:59.999-03:00`).getTime();
 
-  console.log(`\n[BOT-ML] Buscando pedidos com COLETA em ${dataColeta} (=${isoTarget}) — desconto ${discount}% para CPF`);
+  console.log(`\n[BOT-ML] Buscando pedidos com deadline NF (pay_before) até ${dataColeta} 23:59 (=${isoTarget}) — desconto ${discount}% para CPF`);
 
   if (!ml.isConnected()) {
     console.error('[BOT-ML] Conta Mercado Livre não conectada — abortando.');
@@ -332,7 +336,7 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
   let mlOrders: ml.MLOrderSummary[];
   try {
     mlOrders = await ml.searchRecentPaidOrders(45);
-    console.log(`[BOT-ML] ${mlOrders.length} pedidos pagos retornados pela API ML (últimos 45 dias)`);
+    console.log(`[BOT-ML] ${mlOrders.length} pedidos retornados pela API ML (últimos 45 dias)`);
   } catch (err) {
     console.error('[BOT-ML] Falha ao buscar pedidos no ML:', err);
     return stats;
@@ -346,14 +350,19 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
       shipChecked++;
       await sleep(220);
       const ship = await ml.getShipment(o.shipping_id);
-      if (ship.estimated_handling_limit_date === isoTarget) {
+      // Ignora pedidos que já foram expedidos
+      if (ship.status && ship.status !== 'ready_to_ship' && ship.status !== 'handling' && ship.status !== 'pending') continue;
+      const payBefore = ship.pay_before_full;
+      if (!payBefore) continue;
+      const t = new Date(payBefore).getTime();
+      if (Number.isFinite(t) && t <= targetEnd) {
         matchingOrderIds.push(o.id);
       }
     } catch (err) {
       console.warn(`[BOT-ML] Falha ao obter shipment ${o.shipping_id}:`, (err as any)?.message || err);
     }
   }
-  console.log(`[BOT-ML] ${shipChecked} shipments verificados, ${matchingOrderIds.length} com coleta em ${dataColeta}`);
+  console.log(`[BOT-ML] ${shipChecked} shipments verificados, ${matchingOrderIds.length} com pay_before <= ${dataColeta} 23:59`);
 
   for (const mlOrderId of matchingOrderIds) {
     try {
