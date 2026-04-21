@@ -335,8 +335,9 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
 
   let mlOrders: ml.MLOrderSummary[];
   try {
-    mlOrders = await ml.searchRecentPaidOrders(45);
-    console.log(`[BOT-ML] ${mlOrders.length} pedidos retornados pela API ML (últimos 45 dias)`);
+    // 7 dias é suficiente: pay_before do Full é sempre 1-3 dias após o pagamento
+    mlOrders = await ml.searchRecentPaidOrders(7);
+    console.log(`[BOT-ML] ${mlOrders.length} pedidos pendentes (ready_to_ship últimos 7 dias)`);
   } catch (err) {
     console.error('[BOT-ML] Falha ao buscar pedidos no ML:', err);
     return stats;

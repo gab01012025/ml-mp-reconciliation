@@ -152,14 +152,32 @@ async function mlGet(path: string, params?: Record<string, string>): Promise<any
   const token = await getValidAccessToken();
   const url = new URL(`${ML_API_URL}${path}`);
   if (params) Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
-  const res = await fetch(url.toString(), {
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(`ML API ${path} failed: ${res.status} ${JSON.stringify(data)}`);
+
+  // Tentativa com 1 retry em caso de 429/5xx ou body vazio
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const res = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      if ((res.status === 429 || res.status >= 500) && attempt === 0) {
+        await new Promise(r => setTimeout(r, 800));
+        continue;
+      }
+      throw new Error(`ML API ${path} failed: ${res.status} ${text.slice(0, 200)}`);
+    }
+    if (!text || text.trim().length === 0) {
+      if (attempt === 0) { await new Promise(r => setTimeout(r, 500)); continue; }
+      return null;
+    }
+    try {
+      return JSON.parse(text);
+    } catch {
+      if (attempt === 0) { await new Promise(r => setTimeout(r, 500)); continue; }
+      throw new Error(`ML API ${path} returned non-JSON: ${text.slice(0, 200)}`);
+    }
   }
-  return data;
+  return null;
 }
 
 export interface MLOrderSummary {
@@ -215,10 +233,10 @@ export async function searchOrdersByDate(dataInicial: string, dataFinal: string)
 }
 
 /**
- * Busca pedidos do ML recentes com shipping pendente de envio (útil para "data de coleta").
- * Inclui todos os status de pedido, mas prioriza aqueles com shipping ainda a ser despachado.
+ * Busca pedidos do ML recentes pendentes de envio (úteis para "data de coleta / deadline NF").
+ * Só status `ready_to_ship` — esses são os que precisam de NF.
  */
-export async function searchRecentPaidOrders(daysBack: number = 45): Promise<MLOrderSummary[]> {
+export async function searchRecentPaidOrders(daysBack: number = 7): Promise<MLOrderSummary[]> {
   const t = loadTokens();
   if (!t) throw new Error('ML não conectado');
 
@@ -229,48 +247,40 @@ export async function searchRecentPaidOrders(daysBack: number = 45): Promise<MLO
 
   const all: MLOrderSummary[] = [];
   const seen = new Set<number>();
-  // Tenta vários filtros pra maximizar cobertura
-  const queries: Array<Record<string, string>> = [
-    { 'shipping.status': 'ready_to_ship' },
-    { 'shipping.status': 'handling' },
-    { 'order.status': 'paid' },
-  ];
 
-  for (const extra of queries) {
-    let offset = 0;
-    const limit = 50;
-    for (let page = 0; page < 30; page++) {
-      try {
-        const data = await mlGet('/orders/search', {
-          seller: String(t.user_id),
-          'order.date_created.from': fromIso,
-          'order.date_created.to': toIso,
-          sort: 'date_desc',
-          offset: String(offset),
-          limit: String(limit),
-          ...extra,
+  let offset = 0;
+  const limit = 50;
+  for (let page = 0; page < 60; page++) {
+    try {
+      const data = await mlGet('/orders/search', {
+        seller: String(t.user_id),
+        'order.date_created.from': fromIso,
+        'order.date_created.to': toIso,
+        'shipping.status': 'ready_to_ship',
+        sort: 'date_desc',
+        offset: String(offset),
+        limit: String(limit),
+      });
+      const results = data?.results || [];
+      for (const o of results) {
+        if (seen.has(o.id)) continue;
+        seen.add(o.id);
+        all.push({
+          id: o.id,
+          status: o.status,
+          date_closed: o.date_closed,
+          total_amount: o.total_amount,
+          shipping_id: o.shipping?.id,
         });
-        const results = data.results || [];
-        for (const o of results) {
-          if (seen.has(o.id)) continue;
-          seen.add(o.id);
-          all.push({
-            id: o.id,
-            status: o.status,
-            date_closed: o.date_closed,
-            total_amount: o.total_amount,
-            shipping_id: o.shipping?.id,
-          });
-        }
-        if (results.length < limit) break;
-        offset += limit;
-      } catch (err) {
-        console.warn('[ML] searchRecentPaidOrders query falhou:', extra, err);
-        break;
       }
+      if (results.length < limit) break;
+      offset += limit;
+    } catch (err) {
+      console.warn('[ML] searchRecentPaidOrders falhou na página', page, err);
+      break;
     }
   }
-  console.log(`[ML] searchRecentPaidOrders: ${all.length} pedidos únicos retornados`);
+  console.log(`[ML] searchRecentPaidOrders (${daysBack}d, ready_to_ship): ${all.length} pedidos`);
   return all;
 }
 
@@ -369,7 +379,7 @@ export async function getShipment(shipmentId: number): Promise<MLShipmentInfo> {
  * Usado para debug: retorna uma amostra de shipments com todos os campos relevantes
  */
 export async function debugSampleShipments(limit: number = 10): Promise<any[]> {
-  const orders = await searchRecentPaidOrders(15);
+  const orders = await searchRecentPaidOrders(7);
   const sample = orders.slice(0, limit);
   const out: any[] = [];
   for (const o of sample) {
