@@ -287,27 +287,43 @@ export interface MLShipmentInfo {
 
 /**
  * Busca dados do shipment ML — extrai a data de coleta do vendedor.
- * Tenta múltiplos campos conforme versão da API.
+ * Tenta múltiplos campos conforme versão da API, incluindo endpoint /lead_time.
  */
 export async function getShipment(shipmentId: number): Promise<MLShipmentInfo> {
   const data = await mlGet(`/shipments/${shipmentId}`);
 
+  // Buscar lead_time separadamente (endpoint dedicado costuma ter as datas reais)
+  let leadTime: any = null;
+  try {
+    leadTime = await mlGet(`/shipments/${shipmentId}/lead_time`);
+  } catch (err: any) {
+    // silencioso — nem todos shipments têm esse endpoint disponível
+  }
+
   // Normaliza um valor que pode ser string direta ou objeto { date, type }
   const pickDate = (v: any): string | undefined => {
     if (!v) return undefined;
-    if (typeof v === 'string') return v;
-    if (typeof v === 'object' && v.date) return String(v.date);
+    if (typeof v === 'string') {
+      // Descarta estados como "estimated" que não são datas
+      if (/^\d{4}-\d{2}-\d{2}/.test(v)) return v;
+      return undefined;
+    }
+    if (typeof v === 'object') {
+      if (v.date && typeof v.date === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v.date)) return v.date;
+      if (v.from && typeof v.from === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v.from)) return v.from;
+    }
     return undefined;
   };
 
   // Caminhos possíveis para a data limite de coleta/handoff, em ordem de preferência
   const candidates: Array<[string, any]> = [
+    ['lead_time.estimated_handling_limit', leadTime?.estimated_handling_limit],
+    ['lead_time.estimated_schedule_limit', leadTime?.estimated_schedule_limit],
+    ['lead_time.pickup_promise', leadTime?.pickup_promise],
+    ['lead_time.handling_date', leadTime?.handling_date],
     ['shipping_option.estimated_schedule_limit', data.shipping_option?.estimated_schedule_limit],
     ['shipping_option.estimated_handling_limit', data.shipping_option?.estimated_handling_limit],
     ['shipping_option.pickup_promise', data.shipping_option?.pickup_promise],
-    ['shipping_option.delivery_promise', data.shipping_option?.delivery_promise],
-    ['lead_time.estimated_handling_limit', data.lead_time?.estimated_handling_limit],
-    ['lead_time.estimated_schedule_limit', data.lead_time?.estimated_schedule_limit],
     ['estimated_handling_limit', data.estimated_handling_limit],
     ['date_handling', data.date_handling],
   ];
@@ -334,7 +350,7 @@ export async function getShipment(shipmentId: number): Promise<MLShipmentInfo> {
     date_first_printed: data.date_first_printed,
     date_handling: data.date_handling,
     raw_date_source: rawSource,
-    raw: data,
+    raw: { ...data, __lead_time_endpoint: leadTime },
   };
 }
 
@@ -354,6 +370,8 @@ export async function debugSampleShipments(limit: number = 10): Promise<any[]> {
         shipping_id: o.shipping_id,
         status: info.status,
         substatus: info.substatus,
+        logistic_type: info.raw?.logistic_type || info.raw?.logistic?.type,
+        mode: info.raw?.mode,
         date_source: info.raw_date_source,
         handling_limit_date: info.estimated_handling_limit_date,
         shipping_option: info.raw?.shipping_option ? {
@@ -363,7 +381,8 @@ export async function debugSampleShipments(limit: number = 10): Promise<any[]> {
           delivery_promise: info.raw.shipping_option.delivery_promise,
           processing_time: info.raw.shipping_option.processing_time,
         } : null,
-        lead_time: info.raw?.lead_time,
+        lead_time_endpoint: info.raw?.__lead_time_endpoint,
+        top_level_keys: info.raw ? Object.keys(info.raw).filter(k => !k.startsWith('__')) : null,
       });
     } catch (e: any) {
       out.push({ order_id: o.id, shipping_id: o.shipping_id, error: e.message });
