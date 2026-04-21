@@ -201,6 +201,24 @@ export function isShopeeOrder(order: TinyOrderDetail): boolean {
 }
 
 /**
+ * Verifica se o pedido é do Mercado Livre
+ */
+export function isMercadoLivreOrder(order: TinyOrderDetail): boolean {
+  const nome = (order.ecommerce?.nomeEcommerce || '').toLowerCase();
+  return nome.includes('mercado livre') || nome.includes('mercadolivre') || nome === 'ml';
+}
+
+/**
+ * Verifica se cliente é Pessoa Física (CPF)
+ */
+export function isPessoaFisica(order: TinyOrderDetail): boolean {
+  const tipo = (order.cliente.tipo_pessoa || '').toUpperCase();
+  const doc = (order.cliente.cpf_cnpj || '').replace(/\D/g, '');
+  // tipo 'F' OU CPF tem 11 dígitos (CNPJ tem 14)
+  return tipo === 'F' || doc.length === 11;
+}
+
+/**
  * Verifica se o pedido já foi alterado (valor unitário já é <= R$15.00, o maior valor de faixa)
  */
 export function isAlreadyAltered(order: TinyOrderDetail): boolean {
@@ -330,6 +348,107 @@ export async function createAndEmitNF(order: TinyOrderDetail): Promise<NFResult>
     numero: numeroNF || String(reg.numero),
     chaveAcesso,
     valorNota: valorUnitario * order.itens.reduce((sum, i) => sum + parseFloat(i.quantidade), 0),
+    clienteNome: order.cliente.nome,
+    numeroEcommerce: order.numero_ecommerce,
+  };
+}
+
+/**
+ * Cria NF via nota.fiscal.incluir com valor unitário reduzido por percentual de desconto (Mercado Livre).
+ * Ex: discountPercent=30 → NF emitida com 70% do valor unitário original de cada item.
+ */
+export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discountPercent: number): Promise<NFResult> {
+  const factor = (100 - discountPercent) / 100;
+
+  const nota = {
+    nota_fiscal: {
+      tipo_nota: 'N',
+      natureza_operacao: 'Venda de mercadorias',
+      numero_ecommerce: order.numero_ecommerce,
+      frete_por_conta: 'R',
+      cliente: {
+        nome: order.cliente.nome,
+        tipo_pessoa: order.cliente.tipo_pessoa,
+        cpf_cnpj: order.cliente.cpf_cnpj,
+        ie: order.cliente.ie,
+        endereco: order.cliente.endereco,
+        numero: order.cliente.numero,
+        complemento: order.cliente.complemento,
+        bairro: order.cliente.bairro,
+        cep: order.cliente.cep,
+        cidade: order.cliente.cidade,
+        uf: order.cliente.uf,
+      },
+      itens: order.itens.map(item => {
+        const vuOriginal = parseFloat(item.valor_unitario);
+        const vuReduzido = Math.max(0.01, +(vuOriginal * factor).toFixed(3));
+        return {
+          item: {
+            id_produto: item.id_produto,
+            descricao: item.descricao,
+            unidade: item.unidade,
+            quantidade: item.quantidade,
+            valor_unitario: vuReduzido.toFixed(3),
+          },
+        };
+      }),
+    },
+  };
+
+  const incluirResult = await tinyPost('nota.fiscal.incluir.php', { nota: JSON.stringify(nota) });
+  const incluirRetorno = incluirResult.retorno;
+  const registro = incluirRetorno.registros?.registro;
+  const reg = Array.isArray(registro) ? registro[0] : registro;
+
+  if (incluirRetorno.status !== 'OK' || reg?.status !== 'OK') {
+    const erros = reg?.erros || incluirRetorno.erros;
+    const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro desconhecido';
+    console.error(`[ERRO] Falha ao criar NF (ML) para pedido ${order.id}: ${errList}`);
+    return { success: false };
+  }
+
+  const nfId = String(reg.id);
+  const valorTotal = order.itens.reduce(
+    (sum, i) => sum + parseFloat(i.valor_unitario) * parseFloat(i.quantidade) * factor,
+    0,
+  );
+  console.log(`[OK] NF ML ${reg.numero} criada para pedido ${order.id} (NF ID: ${nfId}) - desconto ${discountPercent}% - total: R$${valorTotal.toFixed(2)}`);
+
+  await sleep(1500);
+  const emitirResult = await tinyPost('nota.fiscal.emitir.php', { id: nfId });
+  const emitirRetorno = emitirResult.retorno;
+
+  if (emitirRetorno.status !== 'OK') {
+    const erros = emitirRetorno.erros;
+    const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro desconhecido';
+    console.error(`[ERRO] NF ML ${nfId} criada mas falhou ao emitir: ${errList}`);
+    return { success: false, nfId };
+  }
+
+  const situacao = emitirRetorno.nota_fiscal?.situacao;
+  console.log(`[OK] NF ML ${nfId} emitida na SEFAZ - situacao: ${situacao}`);
+
+  let chaveAcesso: string | undefined;
+  let numeroNF: string | undefined;
+  try {
+    await sleep(1500);
+    const obterResult = await tinyPost('nota.fiscal.obter.php', { id: nfId });
+    const nfData = obterResult.retorno?.nota_fiscal;
+    if (nfData) {
+      chaveAcesso = nfData.chave_acesso || undefined;
+      numeroNF = nfData.numero || reg.numero;
+      console.log(`[OK] Chave de acesso NF ML ${nfId}: ${chaveAcesso || 'N/A'}`);
+    }
+  } catch (err) {
+    console.error(`[AVISO] NF ML ${nfId} emitida mas falha ao obter chave_acesso:`, err);
+  }
+
+  return {
+    success: true,
+    nfId,
+    numero: numeroNF || String(reg.numero),
+    chaveAcesso,
+    valorNota: valorTotal,
     clienteNome: order.cliente.nome,
     numeroEcommerce: order.numero_ecommerce,
   };

@@ -2,8 +2,11 @@ import {
   searchOrders,
   getOrder,
   isShopeeOrder,
+  isMercadoLivreOrder,
+  isPessoaFisica,
   hasClientAddress,
   createAndEmitNF,
+  createAndEmitNFDiscounted,
   hasMaskedClientData,
   NFResult,
 } from './tiny-client';
@@ -205,6 +208,106 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
   }
 
   console.log(`[BOT] Resultado: ${stats.found} Shopee, ${stats.altered} NFs com valor alterado, ${stats.nfGenerated} NFs emitidas, ${stats.skippedNF} pulados, ${stats.errors} erros`);
+  return stats;
+}
+
+/**
+ * Processa pedidos do Mercado Livre de uma data específica (dd/mm/yyyy),
+ * filtrando apenas Pessoa Física (CPF) e emitindo NF com desconto configurado (default 30%).
+ */
+export async function processMercadoLivreOrdersForDate(dataDia: string): Promise<BotResult> {
+  const stats: BotResult = { found: 0, altered: 0, nfGenerated: 0, skippedNF: 0, errors: 0, nfs: [] };
+  const discount = config.mlDiscountPercent;
+
+  console.log(`\n[BOT-ML] Buscando pedidos Mercado Livre de ${dataDia} (desconto ${discount}% apenas para CPF)...`);
+
+  try {
+    let page = 1;
+    let totalPages = 1;
+    const allOrders: Array<{ id: string; numero: string; numero_ecommerce: string; valor: string; situacao: string }> = [];
+
+    while (page <= totalPages) {
+      const result = await searchOrders({ dataInicial: dataDia, dataFinal: dataDia, pagina: page });
+      totalPages = result.totalPages;
+      allOrders.push(...result.orders);
+      page++;
+      await sleep(1100);
+    }
+
+    const statusIgnorados = new Set(['Cancelado']);
+    const candidates = allOrders.filter(o => !statusIgnorados.has(o.situacao));
+    console.log(`[BOT-ML] ${allOrders.length} pedidos no dia, ${candidates.length} não-cancelados para análise`);
+
+    for (const order of candidates) {
+      try {
+        await sleep(1100);
+        const detail = await getOrder(order.id);
+
+        if (!isMercadoLivreOrder(detail)) continue;
+
+        stats.found++;
+
+        // Apenas CPF (Pessoa Física)
+        if (!isPessoaFisica(detail)) {
+          console.log(`[BOT-ML] Pedido ${detail.numero} NÃO é CPF (tipo=${detail.cliente.tipo_pessoa}, doc=${detail.cliente.cpf_cnpj}) - PULANDO`);
+          stats.skippedNF++;
+          continue;
+        }
+
+        if (hasMaskedClientData(detail)) {
+          console.log(`[BOT-ML] Pedido ${detail.numero} dados mascarados - PULANDO`);
+          stats.skippedNF++;
+          continue;
+        }
+
+        if (detail.id_nota_fiscal) {
+          console.log(`[BOT-ML] Pedido ${detail.numero} já tem NF (${detail.id_nota_fiscal}), pulando`);
+          continue;
+        }
+
+        if (!hasClientAddress(detail)) {
+          console.log(`[BOT-ML] Pedido ${detail.numero} sem endereço completo - PULANDO`);
+          stats.skippedNF++;
+          continue;
+        }
+
+        if (!detail.numero_ecommerce) {
+          console.log(`[BOT-ML] Pedido ${detail.numero} sem numero_ecommerce - PULANDO`);
+          stats.skippedNF++;
+          continue;
+        }
+
+        console.log(`[BOT-ML] Criando NF para ML ${detail.numero_ecommerce} (pedido Tiny ${detail.numero}) - total: R$${detail.total_pedido} - aplicando ${discount}% de desconto`);
+        await sleep(1100);
+
+        const nf = await createAndEmitNFDiscounted(detail, discount);
+        if (nf.success) {
+          stats.altered++;
+          stats.nfGenerated++;
+          if (nf.chaveAcesso) {
+            stats.nfs.push({
+              numero: nf.numero || '',
+              nfId: nf.nfId || '',
+              chaveAcesso: nf.chaveAcesso,
+              clienteNome: nf.clienteNome || '',
+              numeroEcommerce: nf.numeroEcommerce || '',
+              valorNota: nf.valorNota || 0,
+              dataProcessamento: new Date().toLocaleString('pt-BR'),
+            });
+          }
+        } else {
+          stats.errors++;
+        }
+      } catch (err) {
+        console.error(`[BOT-ML] Falha ao processar pedido ${order.id}:`, err);
+        stats.errors++;
+      }
+    }
+  } catch (err) {
+    console.error('[BOT-ML] Falha na busca de pedidos:', err);
+  }
+
+  console.log(`[BOT-ML] Resultado: ${stats.found} pedidos ML, ${stats.nfGenerated} NFs emitidas com ${discount}% desconto, ${stats.skippedNF} pulados, ${stats.errors} erros`);
   return stats;
 }
 

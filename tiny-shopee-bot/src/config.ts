@@ -28,6 +28,15 @@ export const config = {
 
   // Start with automation paused (true = only manual sync works)
   automationPausedDefault: process.env.AUTOMATION_PAUSED !== 'false',
+
+  // Mercado Livre OAuth (App MLCheck)
+  mlClientId: process.env.ML_CLIENT_ID || '7462399727089965',
+  mlClientSecret: process.env.ML_CLIENT_SECRET || 'hkDcv4NWZOeyLSAm293dL5rJ0gNi6FYJ',
+  mlRedirectUri: process.env.ML_REDIRECT_URI || 'https://synchub.webmedula.com.br/ml/callback',
+  mlTokenStorePath: process.env.ML_TOKEN_STORE || '/tmp/ml-tokens.json',
+
+  // Mercado Livre: desconto aplicado sobre o valor dos produtos (ex: 30 = 30% off → NF emitida com 70% do valor)
+  mlDiscountPercent: parseFloat(process.env.ML_DISCOUNT_PERCENT || '30'),
 };
 
 /**

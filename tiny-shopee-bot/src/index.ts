@@ -2,8 +2,9 @@ import * as http from 'http';
 import * as crypto from 'crypto';
 import * as cron from 'node-cron';
 import { config } from './config';
-import { processNewShopeeOrders, clearProcessedOrders, ProcessedNF } from './bot.service';
+import { processNewShopeeOrders, processMercadoLivreOrdersForDate, clearProcessedOrders, ProcessedNF } from './bot.service';
 import { getLogs } from './log-buffer';
+import * as ml from './ml-client';
 
 console.log('===========================================');
 console.log('  Tiny Shopee Bot - Alteracao de Valores');
@@ -24,6 +25,11 @@ let totalOrdersSynced = 0;
 let totalNFsEmitted = 0;
 const startTime = new Date();
 let automationPaused = config.automationPausedDefault;
+
+// ML state
+let mlIsRunning = false;
+let mlLastResult: any = null;
+const mlOauthStates = new Set<string>();
 
 // Session management
 const sessions = new Map<string, { user: string; created: Date }>();
@@ -69,14 +75,14 @@ const server = http.createServer(async (req, res) => {
   // Public: health
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.0', uptime: process.uptime() }));
+    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.1-ml', uptime: process.uptime() }));
     return;
   }
 
   // Public: version check (for debugging deploys)
   if (url.pathname === '/version') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ version: 'v3.0-hub', deployed: startTime.toISOString() }));
+    res.end(JSON.stringify({ version: 'v3.1-ml', deployed: startTime.toISOString() }));
     return;
   }
 
@@ -126,6 +132,53 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(getDashboardHtml());
+    return;
+  }
+
+  // Public: ML OAuth start — redireciona usuário para ML authorize
+  if (url.pathname === '/ml/connect' && req.method === 'GET') {
+    const state = crypto.randomUUID();
+    mlOauthStates.add(state);
+    // Expira o state em 10 min
+    setTimeout(() => mlOauthStates.delete(state), 10 * 60 * 1000);
+    const authUrl = ml.buildAuthorizeUrl(state);
+    res.writeHead(302, { Location: authUrl });
+    res.end();
+    return;
+  }
+
+  // Public: ML OAuth callback — recebe code e troca por tokens
+  if (url.pathname === '/ml/callback' && req.method === 'GET') {
+    const code = url.searchParams.get('code');
+    const state = url.searchParams.get('state') || '';
+    const errParam = url.searchParams.get('error');
+
+    if (errParam) {
+      res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;text-align:center;"><h2>❌ Autorização cancelada</h2><p>${errParam}</p><a href="/">Voltar</a></body></html>`);
+      return;
+    }
+    if (!code) {
+      res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;text-align:center;"><h2>❌ Código ausente</h2><a href="/">Voltar</a></body></html>`);
+      return;
+    }
+    if (!mlOauthStates.has(state)) {
+      console.warn(`[ML] state inválido ou expirado: ${state}`);
+    } else {
+      mlOauthStates.delete(state);
+    }
+
+    try {
+      const tokens = await ml.exchangeCodeForTokens(code);
+      console.log(`[ML] Conectado com sucesso — user_id=${tokens.user_id}`);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Mercado Livre Conectado</title></head><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:40px;text-align:center;background:#f0f2f5;"><div style="max-width:480px;margin:60px auto;background:white;padding:40px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.08);"><h1 style="color:#16a34a;font-size:48px;margin-bottom:10px;">✅</h1><h2 style="color:#1a1a2e;margin-bottom:16px;">Mercado Livre conectado!</h2><p style="color:#666;font-size:14px;margin-bottom:24px;">Seller ID: <strong>${tokens.user_id}</strong></p><a href="/" style="display:inline-block;padding:12px 28px;background:#0f3460;color:white;text-decoration:none;border-radius:8px;font-weight:600;">Voltar ao painel</a></div></body></html>`);
+    } catch (err: any) {
+      console.error('[ML] Erro no callback:', err);
+      res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;text-align:center;"><h2>❌ Falha ao conectar</h2><pre style="background:#f5f5f5;padding:15px;text-align:left;max-width:600px;margin:20px auto;overflow:auto;">${String(err.message || err)}</pre><a href="/">Voltar</a></body></html>`);
+    }
     return;
   }
 
@@ -191,6 +244,37 @@ const server = http.createServer(async (req, res) => {
     console.log(`[SERVER] Automação ${automationPaused ? 'PAUSADA' : 'ATIVADA'} pelo painel`);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ automationPaused, message: automationPaused ? 'Automação pausada. Apenas sincronização manual funciona.' : 'Automação reativada. Sincronização automática a cada ' + config.pollIntervalMinutes + ' min.' }));
+  } else if (url.pathname === '/ml/status' && req.method === 'GET') {
+    const info = ml.getConnectionInfo();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      connected: info.connected,
+      userId: info.userId,
+      expiresAt: info.expiresAt,
+      discountPercent: config.mlDiscountPercent,
+      isRunning: mlIsRunning,
+      lastResult: mlLastResult,
+    }));
+  } else if (url.pathname === '/ml/disconnect' && req.method === 'POST') {
+    ml.disconnect();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, message: 'Conta ML desconectada' }));
+  } else if (url.pathname === '/ml/process-day' && req.method === 'POST') {
+    const date = url.searchParams.get('date') || '';
+    const dateRegex = /^\d{2}\/\d{2}\/\d{4}$/;
+    if (!dateRegex.test(date)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Data inválida. Use dd/mm/aaaa' }));
+      return;
+    }
+    if (mlIsRunning) {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Processamento ML já em andamento. Aguarde finalizar.' }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ message: `Processamento ML iniciado para ${date}`, date }));
+    runMLBot(date);
   } else {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not found' }));
@@ -234,6 +318,28 @@ async function runBot(dataInicial?: string, dataFinal?: string, skipBlockCheck =
       clearProcessedOrders();
       runBot(de, ate);
     }
+  }
+}
+
+async function runMLBot(date: string) {
+  if (mlIsRunning) return;
+  mlIsRunning = true;
+  console.log(`\n[${new Date().toLocaleString('pt-BR')}] Iniciando processamento ML para ${date}...`);
+  try {
+    const result = await processMercadoLivreOrdersForDate(date);
+    mlLastResult = { date, ...result };
+    totalOrdersSynced += result.found;
+    totalNFsEmitted += result.nfGenerated;
+    if (result.nfs && result.nfs.length > 0) {
+      const tagged = result.nfs.map(n => ({ ...n, _canal: 'Mercado Livre' } as any));
+      nfHistory.unshift(...tagged);
+      if (nfHistory.length > MAX_NF_HISTORY) nfHistory.splice(MAX_NF_HISTORY);
+    }
+  } catch (err) {
+    console.error('[ML-BOT] Falha na execução:', err);
+    mlLastResult = { date, error: String(err) };
+  } finally {
+    mlIsRunning = false;
   }
 }
 
@@ -309,7 +415,7 @@ function getLoginHtml(error?: string): string {
       <div class="int-badge"><span class="dot"></span> Mercado Livre</div>
       <div class="int-badge"><span class="dot"></span> Tiny ERP</div>
     </div>
-    <div class="footer">SyncHub v3.0 — Integrador de Marketplaces e ERPs</div>
+    <div class="footer">SyncHub v3.1 — Integrador de Marketplaces e ERPs</div>
   </div>
   <script>
     if (localStorage.getItem('auth_token')) { window.location.href = '/'; }
@@ -494,12 +600,13 @@ function getDashboardHtml(): string {
       <a href="#" class="active"><span class="icon">📊</span> Dashboard</a>
       <a href="#integracoes"><span class="icon">🔗</span> Integrações</a>
       <a href="#sync"><span class="icon">⚡</span> Sincronização</a>
+      <a href="#ml-sync"><span class="icon">🏪</span> Mercado Livre</a>
       <a href="#nfs"><span class="icon">📋</span> Notas Fiscais</a>
       <div class="section-label">Sistema</div>
       <a href="#logs"><span class="icon">📄</span> Logs</a>
       <a href="#config"><span class="icon">⚙️</span> Configurações</a>
     </nav>
-    <div class="sidebar-footer">SyncHub v3.0<br>Integrador ERP/HUB</div>
+    <div class="sidebar-footer">SyncHub v3.1<br>Integrador ERP/HUB</div>
   </div>
 
   <!-- Main -->
@@ -614,8 +721,8 @@ function getDashboardHtml(): string {
             </div>
 
             <!-- Mercado Livre -->
-            <div class="int-card">
-              <div class="int-status-badge active"><span>●</span> Ativo</div>
+            <div class="int-card" id="mlCard">
+              <div class="int-status-badge active" id="mlStatusBadge"><span>●</span> Ativo</div>
               <div class="int-header">
                 <div class="int-logo ml">🏪</div>
                 <div>
@@ -624,15 +731,18 @@ function getDashboardHtml(): string {
                 </div>
               </div>
               <ul class="int-features">
-                <li><span class="check">✓</span> Importação automática de pedidos</li>
-                <li><span class="check">✓</span> Sincronização de estoque</li>
-                <li><span class="check">✓</span> Atualização de preços</li>
-                <li><span class="check">✓</span> Envio de NF-e ao marketplace</li>
+                <li><span class="check">✓</span> OAuth 2.0 autenticado</li>
+                <li><span class="check">✓</span> NF-e com ${config.mlDiscountPercent}% de desconto (CPF)</li>
+                <li><span class="check">✓</span> Processamento por data específica</li>
+                <li><span class="check">✓</span> Filtro automático Pessoa Física</li>
               </ul>
               <div class="int-meta">
-                <div class="int-meta-item">Tipo: <strong>API REST</strong></div>
-                <div class="int-meta-item">Sync: <strong>A cada ${config.pollIntervalMinutes} min</strong></div>
-                <div class="int-meta-item">Desde: <strong>${startDateStr}</strong></div>
+                <div class="int-meta-item">Tipo: <strong>API REST / OAuth</strong></div>
+                <div class="int-meta-item">Desconto: <strong>${config.mlDiscountPercent}%</strong></div>
+                <div class="int-meta-item" id="mlConnMeta">Status: <strong>...</strong></div>
+              </div>
+              <div style="margin-top:14px;" id="mlActionBox">
+                <a href="/ml/connect" class="btn btn-primary btn-sm" id="btnMLConnect" style="text-decoration:none;display:none;">🔗 Conectar conta Mercado Livre</a>
               </div>
             </div>
 
@@ -704,6 +814,46 @@ function getDashboardHtml(): string {
         </div>
       </div>
 
+      <!-- Mercado Livre Processing -->
+      <div class="card" id="ml-sync">
+        <div class="card-header">
+          🏪 Mercado Livre — NF com ${config.mlDiscountPercent}% de Desconto (CPF)
+          <span class="card-badge" id="mlHeaderBadge">...</span>
+        </div>
+        <div class="card-body">
+          <div id="mlNotConnected" style="display:none; padding:16px; background:#fffbeb; border-radius:8px; border:1px solid #fde68a; margin-bottom:16px;">
+            <strong style="font-size:14px;">⚠ Conta Mercado Livre não conectada</strong>
+            <div style="font-size:12px;color:#888;margin:6px 0 12px;">Você precisa autorizar o SyncHub a acessar sua conta ML antes de processar pedidos.</div>
+            <a href="/ml/connect" class="btn btn-primary btn-sm" style="text-decoration:none;">🔗 Conectar conta Mercado Livre</a>
+          </div>
+          <div id="mlConnected" style="display:none;">
+            <div style="padding:12px 16px; background:#f0fdf4; border-radius:8px; border:1px solid #bbf7d0; margin-bottom:16px; display:flex; justify-content:space-between; align-items:center;">
+              <div>
+                <strong style="font-size:14px;">✓ Conta ML conectada</strong>
+                <div style="font-size:12px;color:#666;margin-top:2px;">Seller ID: <span id="mlSellerId" style="font-family:monospace;">...</span></div>
+              </div>
+              <button class="btn btn-secondary btn-sm" onclick="mlDisconnect()">Desconectar</button>
+            </div>
+
+            <p style="font-size:13px; color:#666; margin-bottom:12px;">
+              Selecione o dia para processar os pedidos do Mercado Livre. Apenas pedidos de <strong>CPF</strong> (Pessoa Física) receberão NF. O valor dos produtos será reduzido em <strong>${config.mlDiscountPercent}%</strong> antes da emissão.
+            </p>
+            <div id="msgML" class="msg msg-ok"></div>
+            <div class="inline-form">
+              <div class="form-sm">
+                <label>Dia para processar</label>
+                <input type="text" id="mlDate" placeholder="dd/mm/aaaa" maxlength="10">
+              </div>
+              <button class="btn btn-primary btn-sm" id="btnML" onclick="processMLDay()">🏪 Gerar NFs Mercado Livre</button>
+            </div>
+            <div id="mlLastResultBox" style="margin-top:16px; display:none;">
+              <p style="font-size:12px;color:#888;font-weight:600;margin-bottom:6px;">Último processamento ML:</p>
+              <pre id="mlLastResult" style="background:#f8fafc; padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap; border:1px solid #e2e8f0;"></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- NFs Table -->
       <div class="card" id="nfs">
         <div class="card-header">📋 Notas Fiscais Emitidas</div>
@@ -756,10 +906,12 @@ function getDashboardHtml(): string {
       var h = '<table><thead><tr><th>NF</th><th>Pedido</th><th>Canal</th><th>Cliente</th><th>Valor</th><th>Chave de Acesso</th><th></th><th>Data</th></tr></thead><tbody>';
       for (var i = 0; i < nfs.length; i++) {
         var n = nfs[i];
+        var canal = n._canal || 'Shopee';
+        var canalBadge = canal === 'Mercado Livre' ? 'badge-orange' : 'badge-blue';
         h += '<tr>';
         h += '<td><strong>' + (n.numero || n.nfId) + '</strong></td>';
         h += '<td><span class="badge badge-orange">' + (n.numeroEcommerce || '-') + '</span></td>';
-        h += '<td><span class="badge badge-blue">Shopee</span></td>';
+        h += '<td><span class="badge ' + canalBadge + '">' + canal + '</span></td>';
         h += '<td>' + (n.clienteNome || '-') + '</td>';
         h += '<td>R$ ' + (n.valorNota ? n.valorNota.toFixed(2) : '-') + '</td>';
         h += '<td class="chave">' + (n.chaveAcesso || 'N/A') + '</td>';
@@ -864,6 +1016,72 @@ function getDashboardHtml(): string {
       } catch(e) { showMsg('msgReprocess', 'Erro: ' + e.message, false); }
       btn.disabled = false; btn.textContent = '🔄 Reprocessar';
     }
+
+    async function refreshMLStatus() {
+      try {
+        var r = await fetch('/ml/status', { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
+        var notConn = document.getElementById('mlNotConnected');
+        var conn = document.getElementById('mlConnected');
+        var badge = document.getElementById('mlHeaderBadge');
+        var connMeta = document.getElementById('mlConnMeta');
+        var btnConnect = document.getElementById('btnMLConnect');
+        if (d.connected) {
+          notConn.style.display = 'none';
+          conn.style.display = 'block';
+          document.getElementById('mlSellerId').textContent = d.userId || '-';
+          badge.className = 'card-badge badge-green';
+          badge.textContent = 'Conectado';
+          connMeta.innerHTML = 'Status: <strong style="color:#16a34a;">Conectado</strong>';
+          if (btnConnect) btnConnect.style.display = 'none';
+        } else {
+          notConn.style.display = 'block';
+          conn.style.display = 'none';
+          badge.className = 'card-badge badge-orange';
+          badge.textContent = 'Desconectado';
+          connMeta.innerHTML = 'Status: <strong style="color:#ea580c;">Desconectado</strong>';
+          if (btnConnect) btnConnect.style.display = 'inline-flex';
+        }
+        if (d.lastResult) {
+          var box = document.getElementById('mlLastResultBox');
+          if (box) {
+            box.style.display = 'block';
+            document.getElementById('mlLastResult').textContent = JSON.stringify(d.lastResult, null, 2);
+          }
+        }
+      } catch(e) {}
+    }
+
+    async function processMLDay() {
+      var date = document.getElementById('mlDate').value.trim();
+      if (!/^\\d{2}\\/\\d{2}\\/\\d{4}$/.test(date)) {
+        showMsg('msgML', 'Formato inválido. Use dd/mm/aaaa', false); return;
+      }
+      var btn = document.getElementById('btnML');
+      btn.disabled = true; btn.textContent = '⏳ Processando...';
+      try {
+        var r = await fetch('/ml/process-day?date=' + encodeURIComponent(date), { method: 'POST', headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
+        showMsg('msgML', d.message || d.error, r.ok);
+      } catch(e) { showMsg('msgML', 'Erro: ' + e.message, false); }
+      btn.disabled = false; btn.textContent = '🏪 Gerar NFs Mercado Livre';
+    }
+
+    async function mlDisconnect() {
+      if (!confirm('Desconectar a conta Mercado Livre? Você precisará autorizar novamente depois.')) return;
+      try {
+        var r = await fetch('/ml/disconnect', { method: 'POST', headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        await r.json();
+        refreshMLStatus();
+      } catch(e) {}
+    }
+
+    // Inicializa status ML e atualiza periodicamente
+    refreshMLStatus();
+    setInterval(refreshMLStatus, 5000);
   </script>
 </body>
 </html>`;
