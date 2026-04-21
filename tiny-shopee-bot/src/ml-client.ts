@@ -292,20 +292,31 @@ export interface MLShipmentInfo {
 export async function getShipment(shipmentId: number): Promise<MLShipmentInfo> {
   const data = await mlGet(`/shipments/${shipmentId}`);
 
+  // Normaliza um valor que pode ser string direta ou objeto { date, type }
+  const pickDate = (v: any): string | undefined => {
+    if (!v) return undefined;
+    if (typeof v === 'string') return v;
+    if (typeof v === 'object' && v.date) return String(v.date);
+    return undefined;
+  };
+
   // Caminhos possíveis para a data limite de coleta/handoff, em ordem de preferência
   const candidates: Array<[string, any]> = [
-    ['lead_time.estimated_handling_limit.date', data.lead_time?.estimated_handling_limit?.date],
-    ['shipping_option.estimated_handling_limit.date', data.shipping_option?.estimated_handling_limit?.date],
-    ['estimated_handling_limit.date', data.estimated_handling_limit?.date],
-    ['shipping_option.estimated_schedule_limit.date', data.shipping_option?.estimated_schedule_limit?.date],
-    ['lead_time.estimated_schedule_limit.date', data.lead_time?.estimated_schedule_limit?.date],
+    ['shipping_option.estimated_schedule_limit', data.shipping_option?.estimated_schedule_limit],
+    ['shipping_option.estimated_handling_limit', data.shipping_option?.estimated_handling_limit],
+    ['shipping_option.pickup_promise', data.shipping_option?.pickup_promise],
+    ['shipping_option.delivery_promise', data.shipping_option?.delivery_promise],
+    ['lead_time.estimated_handling_limit', data.lead_time?.estimated_handling_limit],
+    ['lead_time.estimated_schedule_limit', data.lead_time?.estimated_schedule_limit],
+    ['estimated_handling_limit', data.estimated_handling_limit],
     ['date_handling', data.date_handling],
   ];
 
   let rawDate: string | undefined;
   let rawSource: string | undefined;
   for (const [src, val] of candidates) {
-    if (val) { rawDate = String(val); rawSource = src; break; }
+    const d = pickDate(val);
+    if (d) { rawDate = d; rawSource = src; break; }
   }
 
   // ML retorna em ISO com timezone brasileiro geralmente; pega só a parte da data local (-03:00)
@@ -345,8 +356,14 @@ export async function debugSampleShipments(limit: number = 10): Promise<any[]> {
         substatus: info.substatus,
         date_source: info.raw_date_source,
         handling_limit_date: info.estimated_handling_limit_date,
+        shipping_option: info.raw?.shipping_option ? {
+          estimated_schedule_limit: info.raw.shipping_option.estimated_schedule_limit,
+          estimated_handling_limit: info.raw.shipping_option.estimated_handling_limit,
+          pickup_promise: info.raw.shipping_option.pickup_promise,
+          delivery_promise: info.raw.shipping_option.delivery_promise,
+          processing_time: info.raw.shipping_option.processing_time,
+        } : null,
         lead_time: info.raw?.lead_time,
-        shipping_option_keys: info.raw?.shipping_option ? Object.keys(info.raw.shipping_option) : null,
       });
     } catch (e: any) {
       out.push({ order_id: o.id, shipping_id: o.shipping_id, error: e.message });
