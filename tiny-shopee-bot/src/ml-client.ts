@@ -169,6 +169,7 @@ export interface MLOrderSummary {
   total_amount: number;
   buyer_doc_type?: string; // CPF / CNPJ
   buyer_doc?: string;
+  shipping_id?: number;
 }
 
 /**
@@ -204,12 +205,81 @@ export async function searchOrdersByDate(dataInicial: string, dataFinal: string)
         total_amount: o.total_amount,
         buyer_doc_type: billing.doc_type,
         buyer_doc: billing.doc_number,
+        shipping_id: o.shipping?.id,
       });
     }
     if (results.length < limit) break;
     offset += limit;
   }
   return all;
+}
+
+/**
+ * Busca pedidos do ML em janela de N dias atrás (apenas pagos), com shipping_id
+ */
+export async function searchRecentPaidOrders(daysBack: number = 30): Promise<MLOrderSummary[]> {
+  const t = loadTokens();
+  if (!t) throw new Error('ML não conectado');
+
+  const now = new Date();
+  const past = new Date(now.getTime() - daysBack * 24 * 60 * 60 * 1000);
+  const fromIso = past.toISOString();
+  const toIso = now.toISOString();
+
+  const all: MLOrderSummary[] = [];
+  let offset = 0;
+  const limit = 50;
+  for (let page = 0; page < 30; page++) {
+    const data = await mlGet('/orders/search', {
+      seller: String(t.user_id),
+      'order.status': 'paid',
+      'order.date_created.from': fromIso,
+      'order.date_created.to': toIso,
+      sort: 'date_desc',
+      offset: String(offset),
+      limit: String(limit),
+    });
+    const results = data.results || [];
+    for (const o of results) {
+      all.push({
+        id: o.id,
+        status: o.status,
+        date_closed: o.date_closed,
+        total_amount: o.total_amount,
+        shipping_id: o.shipping?.id,
+      });
+    }
+    if (results.length < limit) break;
+    offset += limit;
+  }
+  return all;
+}
+
+export interface MLShipmentInfo {
+  id: number;
+  status?: string;
+  substatus?: string;
+  estimated_handling_limit_date?: string; // YYYY-MM-DD
+  date_first_printed?: string;
+  date_handling?: string;
+}
+
+/**
+ * Busca dados do shipment ML — extrai a data de coleta do vendedor
+ */
+export async function getShipment(shipmentId: number): Promise<MLShipmentInfo> {
+  const data = await mlGet(`/shipments/${shipmentId}`);
+  const ehl = data.shipping_option?.estimated_handling_limit?.date
+    || data.estimated_handling_limit?.date
+    || null;
+  return {
+    id: data.id,
+    status: data.status,
+    substatus: data.substatus,
+    estimated_handling_limit_date: ehl ? String(ehl).slice(0, 10) : undefined,
+    date_first_printed: data.date_first_printed,
+    date_handling: data.date_handling,
+  };
 }
 
 function ddmmyyyyToIso(d: string, endOfDay: boolean): string {

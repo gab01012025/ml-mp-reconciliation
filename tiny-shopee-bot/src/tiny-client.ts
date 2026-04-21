@@ -139,6 +139,32 @@ export async function searchOrders(params: {
 }
 
 /**
+ * Busca pedido(s) Tiny por numero_ecommerce (ID externo do marketplace)
+ */
+export async function searchByNumeroEcommerce(numeroEcommerce: string): Promise<TinyOrderSummary[]> {
+  const data = await tinyPost('pedidos.pesquisa.php', { numero_ecommerce: numeroEcommerce });
+  const retorno = data.retorno;
+  if (retorno.status !== 'OK') {
+    const erro = retorno.erros?.[0]?.erro || retorno.erros?.erro || '';
+    if (String(erro).includes('não retornou registros')) return [];
+    throw new Error(`Tiny API error (numero_ecommerce=${numeroEcommerce}): ${erro}`);
+  }
+  const rawPedidos = ensureArray(retorno.pedidos);
+  return rawPedidos.map((p: any) => {
+    const ped = p.pedido || p;
+    return {
+      id: String(ped.id),
+      numero: String(ped.numero),
+      numero_ecommerce: String(ped.numero_ecommerce || ''),
+      data_pedido: String(ped.data_pedido),
+      nome: String(ped.nome),
+      valor: String(ped.valor),
+      situacao: String(ped.situacao),
+    };
+  });
+}
+
+/**
  * Obtém detalhes completos de um pedido
  */
 export async function getOrder(id: string): Promise<TinyOrderDetail> {

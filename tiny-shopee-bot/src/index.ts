@@ -2,7 +2,7 @@ import * as http from 'http';
 import * as crypto from 'crypto';
 import * as cron from 'node-cron';
 import { config } from './config';
-import { processNewShopeeOrders, processMercadoLivreOrdersForDate, clearProcessedOrders, ProcessedNF } from './bot.service';
+import { processNewShopeeOrders, processMercadoLivreOrdersForDate, processMercadoLivreByCollectionDate, clearProcessedOrders, ProcessedNF } from './bot.service';
 import { getLogs } from './log-buffer';
 import * as ml from './ml-client';
 
@@ -75,14 +75,14 @@ const server = http.createServer(async (req, res) => {
   // Public: health
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.1-ml', uptime: process.uptime() }));
+    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.2-coleta', uptime: process.uptime() }));
     return;
   }
 
   // Public: version check (for debugging deploys)
   if (url.pathname === '/version') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ version: 'v3.1-ml', deployed: startTime.toISOString() }));
+    res.end(JSON.stringify({ version: 'v3.2-coleta', deployed: startTime.toISOString() }));
     return;
   }
 
@@ -261,10 +261,16 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ ok: true, message: 'Conta ML desconectada' }));
   } else if (url.pathname === '/ml/process-day' && req.method === 'POST') {
     const date = url.searchParams.get('date') || '';
+    const mode = (url.searchParams.get('mode') || 'coleta').toLowerCase();
     const dateRegex = /^\d{2}\/\d{2}\/\d{4}$/;
     if (!dateRegex.test(date)) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Data inválida. Use dd/mm/aaaa' }));
+      return;
+    }
+    if (mode !== 'coleta' && mode !== 'pedido') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'mode inválido. Use coleta ou pedido' }));
       return;
     }
     if (mlIsRunning) {
@@ -273,8 +279,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ message: `Processamento ML iniciado para ${date}`, date }));
-    runMLBot(date);
+    res.end(JSON.stringify({ message: `Processamento ML iniciado para ${date} (${mode})`, date, mode }));
+    runMLBot(date, mode as 'coleta' | 'pedido');
   } else {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not found' }));
@@ -321,13 +327,15 @@ async function runBot(dataInicial?: string, dataFinal?: string, skipBlockCheck =
   }
 }
 
-async function runMLBot(date: string) {
+async function runMLBot(date: string, mode: 'coleta' | 'pedido' = 'coleta') {
   if (mlIsRunning) return;
   mlIsRunning = true;
-  console.log(`\n[${new Date().toLocaleString('pt-BR')}] Iniciando processamento ML para ${date}...`);
+  console.log(`\n[${new Date().toLocaleString('pt-BR')}] Iniciando processamento ML — modo=${mode} data=${date}...`);
   try {
-    const result = await processMercadoLivreOrdersForDate(date);
-    mlLastResult = { date, ...result };
+    const result = mode === 'coleta'
+      ? await processMercadoLivreByCollectionDate(date)
+      : await processMercadoLivreOrdersForDate(date);
+    mlLastResult = { date, mode, ...result };
     totalOrdersSynced += result.found;
     totalNFsEmitted += result.nfGenerated;
     if (result.nfs && result.nfs.length > 0) {
@@ -337,7 +345,7 @@ async function runMLBot(date: string) {
     }
   } catch (err) {
     console.error('[ML-BOT] Falha na execução:', err);
-    mlLastResult = { date, error: String(err) };
+    mlLastResult = { date, mode, error: String(err) };
   } finally {
     mlIsRunning = false;
   }
@@ -415,7 +423,7 @@ function getLoginHtml(error?: string): string {
       <div class="int-badge"><span class="dot"></span> Mercado Livre</div>
       <div class="int-badge"><span class="dot"></span> Tiny ERP</div>
     </div>
-    <div class="footer">SyncHub v3.1 — Integrador de Marketplaces e ERPs</div>
+    <div class="footer">SyncHub v3.2 — Integrador de Marketplaces e ERPs</div>
   </div>
   <script>
     if (localStorage.getItem('auth_token')) { window.location.href = '/'; }
@@ -606,7 +614,7 @@ function getDashboardHtml(): string {
       <a href="#logs"><span class="icon">📄</span> Logs</a>
       <a href="#config"><span class="icon">⚙️</span> Configurações</a>
     </nav>
-    <div class="sidebar-footer">SyncHub v3.1<br>Integrador ERP/HUB</div>
+    <div class="sidebar-footer">SyncHub v3.2<br>Integrador ERP/HUB</div>
   </div>
 
   <!-- Main -->
@@ -835,17 +843,27 @@ function getDashboardHtml(): string {
               <button class="btn btn-secondary btn-sm" onclick="mlDisconnect()">Desconectar</button>
             </div>
 
-            <p style="font-size:13px; color:#666; margin-bottom:12px;">
-              Selecione o dia para processar os pedidos do Mercado Livre. Apenas pedidos de <strong>CPF</strong> (Pessoa Física) receberão NF. O valor dos produtos será reduzido em <strong>${config.mlDiscountPercent}%</strong> antes da emissão.
+            <p style="font-size:13px; color:#666; margin-bottom:14px;">
+              Gera NF para os pedidos do Mercado Livre cuja <strong>data de coleta</strong> seja o dia escolhido. Apenas <strong>CPF</strong> (Pessoa Física), com desconto de <strong>${config.mlDiscountPercent}%</strong> sobre o valor dos produtos. Pedidos que já têm NF são ignorados.
             </p>
+
             <div id="msgML" class="msg msg-ok"></div>
+
+            <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px;">
+              <button class="btn btn-primary btn-sm" onclick="mlQuickRun('hoje')" id="btnMLHoje">📅 Coleta Hoje</button>
+              <button class="btn btn-primary btn-sm" onclick="mlQuickRun('amanha')" id="btnMLAmanha">📅 Coleta Amanhã</button>
+            </div>
+
+            <hr style="border:none; border-top:1px solid #f0f0f0; margin: 6px 0 14px;">
+            <p style="font-size:12px; color:#888; margin-bottom:10px; font-weight:600;">Ou escolha um dia específico de coleta</p>
             <div class="inline-form">
               <div class="form-sm">
-                <label>Dia para processar</label>
+                <label>Data de coleta</label>
                 <input type="text" id="mlDate" placeholder="dd/mm/aaaa" maxlength="10">
               </div>
-              <button class="btn btn-primary btn-sm" id="btnML" onclick="processMLDay()">🏪 Gerar NFs Mercado Livre</button>
+              <button class="btn btn-secondary btn-sm" id="btnML" onclick="processMLDay()">🏪 Gerar NFs</button>
             </div>
+
             <div id="mlLastResultBox" style="margin-top:16px; display:none;">
               <p style="font-size:12px;color:#888;font-weight:600;margin-bottom:6px;">Último processamento ML:</p>
               <pre id="mlLastResult" style="background:#f8fafc; padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap; border:1px solid #e2e8f0;"></pre>
@@ -1058,15 +1076,32 @@ function getDashboardHtml(): string {
       if (!/^\\d{2}\\/\\d{2}\\/\\d{4}$/.test(date)) {
         showMsg('msgML', 'Formato inválido. Use dd/mm/aaaa', false); return;
       }
-      var btn = document.getElementById('btnML');
+      await runMLProcess(date, 'coleta', 'btnML', '🏪 Gerar NFs');
+    }
+
+    async function mlQuickRun(when) {
+      var d = new Date();
+      if (when === 'amanha') d.setDate(d.getDate() + 1);
+      var dd = String(d.getDate()).padStart(2,'0');
+      var mm = String(d.getMonth()+1).padStart(2,'0');
+      var yyyy = d.getFullYear();
+      var date = dd + '/' + mm + '/' + yyyy;
+      var btnId = when === 'amanha' ? 'btnMLAmanha' : 'btnMLHoje';
+      var label = when === 'amanha' ? '📅 Coleta Amanhã' : '📅 Coleta Hoje';
+      await runMLProcess(date, 'coleta', btnId, label);
+    }
+
+    async function runMLProcess(date, mode, btnId, btnLabel) {
+      var btn = document.getElementById(btnId);
       btn.disabled = true; btn.textContent = '⏳ Processando...';
       try {
-        var r = await fetch('/ml/process-day?date=' + encodeURIComponent(date), { method: 'POST', headers: authHeaders });
+        var qs = '?date=' + encodeURIComponent(date) + '&mode=' + encodeURIComponent(mode);
+        var r = await fetch('/ml/process-day' + qs, { method: 'POST', headers: authHeaders });
         if (r.status === 401) { handleAuthError(); return; }
         var d = await r.json();
         showMsg('msgML', d.message || d.error, r.ok);
       } catch(e) { showMsg('msgML', 'Erro: ' + e.message, false); }
-      btn.disabled = false; btn.textContent = '🏪 Gerar NFs Mercado Livre';
+      btn.disabled = false; btn.textContent = btnLabel;
     }
 
     async function mlDisconnect() {

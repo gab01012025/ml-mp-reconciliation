@@ -1,6 +1,7 @@
 import {
   searchOrders,
   getOrder,
+  searchByNumeroEcommerce,
   isShopeeOrder,
   isMercadoLivreOrder,
   isPessoaFisica,
@@ -11,6 +12,7 @@ import {
   NFResult,
 } from './tiny-client';
 import { config } from './config';
+import * as ml from './ml-client';
 
 // Rastreia pedidos já processados para evitar reprocessamento
 const processedOrders = new Set<string>();
@@ -309,6 +311,130 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
 
   console.log(`[BOT-ML] Resultado: ${stats.found} pedidos ML, ${stats.nfGenerated} NFs emitidas com ${discount}% desconto, ${stats.skippedNF} pulados, ${stats.errors} erros`);
   return stats;
+}
+
+/**
+ * Processa pedidos ML cuja DATA DE COLETA (estimated_handling_limit do shipment) seja igual à dataColeta.
+ * Usa a API ML para descobrir quais pedidos têm coleta no dia, depois busca cada um no Tiny e cria NF.
+ */
+export async function processMercadoLivreByCollectionDate(dataColeta: string): Promise<BotResult> {
+  const stats: BotResult = { found: 0, altered: 0, nfGenerated: 0, skippedNF: 0, errors: 0, nfs: [] };
+  const discount = config.mlDiscountPercent;
+  const isoTarget = ddmmyyyyToIsoDate(dataColeta);
+
+  console.log(`\n[BOT-ML] Buscando pedidos com COLETA em ${dataColeta} (=${isoTarget}) — desconto ${discount}% para CPF`);
+
+  if (!ml.isConnected()) {
+    console.error('[BOT-ML] Conta Mercado Livre não conectada — abortando.');
+    return stats;
+  }
+
+  let mlOrders: ml.MLOrderSummary[];
+  try {
+    mlOrders = await ml.searchRecentPaidOrders(45);
+    console.log(`[BOT-ML] ${mlOrders.length} pedidos pagos retornados pela API ML (últimos 45 dias)`);
+  } catch (err) {
+    console.error('[BOT-ML] Falha ao buscar pedidos no ML:', err);
+    return stats;
+  }
+
+  const matchingOrderIds: number[] = [];
+  let shipChecked = 0;
+  for (const o of mlOrders) {
+    if (!o.shipping_id) continue;
+    try {
+      shipChecked++;
+      await sleep(220);
+      const ship = await ml.getShipment(o.shipping_id);
+      if (ship.estimated_handling_limit_date === isoTarget) {
+        matchingOrderIds.push(o.id);
+      }
+    } catch (err) {
+      console.warn(`[BOT-ML] Falha ao obter shipment ${o.shipping_id}:`, (err as any)?.message || err);
+    }
+  }
+  console.log(`[BOT-ML] ${shipChecked} shipments verificados, ${matchingOrderIds.length} com coleta em ${dataColeta}`);
+
+  for (const mlOrderId of matchingOrderIds) {
+    try {
+      await sleep(1100);
+      const tinyMatches = await searchByNumeroEcommerce(String(mlOrderId));
+      if (tinyMatches.length === 0) {
+        console.log(`[BOT-ML] Pedido ML ${mlOrderId} não encontrado no Tiny — PULANDO`);
+        stats.skippedNF++;
+        continue;
+      }
+
+      for (const summary of tinyMatches) {
+        await sleep(1100);
+        const detail = await getOrder(summary.id);
+
+        if (!isMercadoLivreOrder(detail)) {
+          console.log(`[BOT-ML] Pedido Tiny ${summary.numero} não é ML — PULANDO`);
+          continue;
+        }
+
+        stats.found++;
+
+        if (!isPessoaFisica(detail)) {
+          console.log(`[BOT-ML] Pedido ${detail.numero} NÃO é CPF (tipo=${detail.cliente.tipo_pessoa}) - PULANDO`);
+          stats.skippedNF++;
+          continue;
+        }
+        if (hasMaskedClientData(detail)) {
+          console.log(`[BOT-ML] Pedido ${detail.numero} dados mascarados - PULANDO`);
+          stats.skippedNF++;
+          continue;
+        }
+        if (detail.id_nota_fiscal) {
+          console.log(`[BOT-ML] Pedido ${detail.numero} já tem NF (${detail.id_nota_fiscal}), pulando`);
+          continue;
+        }
+        if (!hasClientAddress(detail)) {
+          console.log(`[BOT-ML] Pedido ${detail.numero} sem endereço - PULANDO`);
+          stats.skippedNF++;
+          continue;
+        }
+        if (!detail.numero_ecommerce) {
+          console.log(`[BOT-ML] Pedido ${detail.numero} sem numero_ecommerce - PULANDO`);
+          stats.skippedNF++;
+          continue;
+        }
+
+        console.log(`[BOT-ML] Criando NF p/ ML ${detail.numero_ecommerce} (Tiny ${detail.numero}) total R$${detail.total_pedido} desconto ${discount}%`);
+        await sleep(1100);
+        const nf = await createAndEmitNFDiscounted(detail, discount);
+        if (nf.success) {
+          stats.altered++;
+          stats.nfGenerated++;
+          if (nf.chaveAcesso) {
+            stats.nfs.push({
+              numero: nf.numero || '',
+              nfId: nf.nfId || '',
+              chaveAcesso: nf.chaveAcesso,
+              clienteNome: nf.clienteNome || '',
+              numeroEcommerce: nf.numeroEcommerce || '',
+              valorNota: nf.valorNota || 0,
+              dataProcessamento: new Date().toLocaleString('pt-BR'),
+            });
+          }
+        } else {
+          stats.errors++;
+        }
+      }
+    } catch (err) {
+      console.error(`[BOT-ML] Falha ao processar pedido ML ${mlOrderId}:`, err);
+      stats.errors++;
+    }
+  }
+
+  console.log(`[BOT-ML] Resultado coleta=${dataColeta}: ${stats.found} pedidos, ${stats.nfGenerated} NFs com ${discount}%, ${stats.skippedNF} pulados, ${stats.errors} erros`);
+  return stats;
+}
+
+function ddmmyyyyToIsoDate(d: string): string {
+  const [dd, mm, yyyy] = d.split('/');
+  return `${yyyy}-${mm}-${dd}`;
 }
 
 function sleep(ms: number): Promise<void> {
