@@ -153,31 +153,44 @@ async function mlGet(path: string, params?: Record<string, string>): Promise<any
   const url = new URL(`${ML_API_URL}${path}`);
   if (params) Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
 
-  // Tentativa com 1 retry em caso de 429/5xx ou body vazio
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const res = await fetch(url.toString(), {
-      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-    });
-    const text = await res.text();
-    if (!res.ok) {
-      if ((res.status === 429 || res.status >= 500) && attempt === 0) {
-        await new Promise(r => setTimeout(r, 800));
+  // Retry com backoff exponencial em 429/5xx ou body vazio
+  let lastErr: any;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const res = await fetch(url.toString(), {
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      });
+      const text = await res.text();
+      if (res.status === 429) {
+        const retryAfter = parseInt(res.headers.get('retry-after') || '0', 10);
+        const wait = retryAfter > 0 ? retryAfter * 1000 : Math.min(2000 * Math.pow(2, attempt), 30000);
+        console.warn(`[ML] 429 rate limit em ${path} — aguardando ${wait}ms (tentativa ${attempt + 1}/5)`);
+        await new Promise(r => setTimeout(r, wait));
         continue;
       }
-      throw new Error(`ML API ${path} failed: ${res.status} ${text.slice(0, 200)}`);
-    }
-    if (!text || text.trim().length === 0) {
-      if (attempt === 0) { await new Promise(r => setTimeout(r, 500)); continue; }
-      return null;
-    }
-    try {
-      return JSON.parse(text);
-    } catch {
-      if (attempt === 0) { await new Promise(r => setTimeout(r, 500)); continue; }
-      throw new Error(`ML API ${path} returned non-JSON: ${text.slice(0, 200)}`);
+      if (!res.ok) {
+        if (res.status >= 500 && attempt < 4) {
+          await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+          continue;
+        }
+        throw new Error(`ML API ${path} failed: ${res.status} ${text.slice(0, 200)}`);
+      }
+      if (!text || text.trim().length === 0) {
+        if (attempt < 4) { await new Promise(r => setTimeout(r, 600)); continue; }
+        return null;
+      }
+      try {
+        return JSON.parse(text);
+      } catch {
+        if (attempt < 4) { await new Promise(r => setTimeout(r, 600)); continue; }
+        throw new Error(`ML API ${path} returned non-JSON: ${text.slice(0, 200)}`);
+      }
+    } catch (err: any) {
+      lastErr = err;
+      if (attempt < 4) { await new Promise(r => setTimeout(r, 800 * (attempt + 1))); continue; }
     }
   }
-  return null;
+  throw lastErr || new Error(`ML API ${path}: máximo de tentativas atingido`);
 }
 
 export interface MLOrderSummary {
@@ -298,25 +311,17 @@ export interface MLShipmentInfo {
 }
 
 /**
- * Busca dados do shipment ML — extrai a data de coleta do vendedor.
- * Tenta múltiplos campos conforme versão da API, incluindo endpoint /lead_time.
+ * Busca dados do shipment ML — extrai a data de coleta / deadline NF.
+ * Usa apenas o endpoint /shipments/:id (pay_before está em shipping_option.estimated_delivery_time)
+ * para reduzir consumo de rate limit.
  */
 export async function getShipment(shipmentId: number): Promise<MLShipmentInfo> {
   const data = await mlGet(`/shipments/${shipmentId}`);
-
-  // Buscar lead_time separadamente (endpoint dedicado costuma ter as datas reais)
-  let leadTime: any = null;
-  try {
-    leadTime = await mlGet(`/shipments/${shipmentId}/lead_time`);
-  } catch (err: any) {
-    // silencioso — nem todos shipments têm esse endpoint disponível
-  }
 
   // Normaliza um valor que pode ser string direta ou objeto { date, type }
   const pickDate = (v: any): string | undefined => {
     if (!v) return undefined;
     if (typeof v === 'string') {
-      // Descarta estados como "estimated" que não são datas
       if (/^\d{4}-\d{2}-\d{2}/.test(v)) return v;
       return undefined;
     }
@@ -327,24 +332,15 @@ export async function getShipment(shipmentId: number): Promise<MLShipmentInfo> {
     return undefined;
   };
 
-  // Caminhos possíveis para a data-limite de emissão de NF / coleta, em ordem de preferência.
-  // IMPORTANTE: Para Full (`logistic_type=fulfillment`), os campos de coleta do seller ficam null;
-  // o prazo real que o painel ML usa em "Coleta | Amanhã → NF-e para gerenciar" é
-  // `estimated_delivery_time.pay_before` (deadline para a NF estar emitida).
-  const payBeforeLead = leadTime?.estimated_delivery_time?.pay_before;
-  const payBeforeShip = data.shipping_option?.estimated_delivery_time?.pay_before;
+  // pay_before do shipping_option é o que o painel ML usa para "Coleta | Hoje/Amanhã"
+  const payBeforeShip = data?.shipping_option?.estimated_delivery_time?.pay_before;
   const candidates: Array<[string, any]> = [
-    ['lead_time.estimated_delivery_time.pay_before', payBeforeLead],
     ['shipping_option.estimated_delivery_time.pay_before', payBeforeShip],
-    ['lead_time.buffering.date', leadTime?.buffering?.date],
-    ['lead_time.estimated_handling_limit', leadTime?.estimated_handling_limit],
-    ['lead_time.estimated_schedule_limit', leadTime?.estimated_schedule_limit],
-    ['lead_time.pickup_promise', leadTime?.pickup_promise],
-    ['shipping_option.estimated_schedule_limit', data.shipping_option?.estimated_schedule_limit],
-    ['shipping_option.estimated_handling_limit', data.shipping_option?.estimated_handling_limit],
-    ['shipping_option.pickup_promise', data.shipping_option?.pickup_promise],
-    ['estimated_handling_limit', data.estimated_handling_limit],
-    ['date_handling', data.date_handling],
+    ['shipping_option.estimated_schedule_limit', data?.shipping_option?.estimated_schedule_limit],
+    ['shipping_option.estimated_handling_limit', data?.shipping_option?.estimated_handling_limit],
+    ['shipping_option.pickup_promise', data?.shipping_option?.pickup_promise],
+    ['estimated_handling_limit', data?.estimated_handling_limit],
+    ['date_handling', data?.date_handling],
   ];
 
   let rawDate: string | undefined;
@@ -354,24 +350,22 @@ export async function getShipment(shipmentId: number): Promise<MLShipmentInfo> {
     if (d) { rawDate = d; rawSource = src; break; }
   }
 
-  // ML retorna em ISO com timezone brasileiro geralmente; pega só a parte da data local (-03:00)
   let localDate: string | undefined;
   if (rawDate) {
-    // Se vier com timezone, primeiro 10 chars já são YYYY-MM-DD local
     localDate = rawDate.slice(0, 10);
   }
 
   return {
-    id: data.id,
-    status: data.status,
-    substatus: data.substatus,
+    id: data?.id,
+    status: data?.status,
+    substatus: data?.substatus,
     estimated_handling_limit_date: localDate,
-    pay_before_full: payBeforeLead || payBeforeShip,
-    date_first_printed: data.date_first_printed,
-    date_handling: data.date_handling,
-    logistic_type: data.logistic_type,
+    pay_before_full: payBeforeShip,
+    date_first_printed: data?.date_first_printed,
+    date_handling: data?.date_handling,
+    logistic_type: data?.logistic_type,
     raw_date_source: rawSource,
-    raw: { ...data, __lead_time_endpoint: leadTime },
+    raw: data,
   };
 }
 

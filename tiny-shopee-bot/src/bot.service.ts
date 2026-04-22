@@ -349,7 +349,7 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
     if (!o.shipping_id) continue;
     try {
       shipChecked++;
-      await sleep(220);
+      await sleep(450);
       const ship = await ml.getShipment(o.shipping_id);
       // Ignora pedidos que já foram expedidos
       if (ship.status && ship.status !== 'ready_to_ship' && ship.status !== 'handling' && ship.status !== 'pending') continue;
