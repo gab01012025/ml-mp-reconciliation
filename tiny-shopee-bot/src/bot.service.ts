@@ -345,12 +345,14 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
 
   const matchingOrderIds: number[] = [];
   let shipChecked = 0;
+  let consecutive429 = 0;
   for (const o of mlOrders) {
     if (!o.shipping_id) continue;
     try {
       shipChecked++;
       await sleep(450);
       const ship = await ml.getShipment(o.shipping_id);
+      consecutive429 = 0;
       // Ignora pedidos que já foram expedidos
       if (ship.status && ship.status !== 'ready_to_ship' && ship.status !== 'handling' && ship.status !== 'pending') continue;
       const payBefore = ship.pay_before_full;
@@ -359,10 +361,22 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
       if (Number.isFinite(t) && t <= targetEnd) {
         matchingOrderIds.push(o.id);
       }
-    } catch (err) {
-      console.warn(`[BOT-ML] Falha ao obter shipment ${o.shipping_id}:`, (err as any)?.message || err);
+    } catch (err: any) {
+      const msg = String(err?.message || err);
+      console.warn(`[BOT-ML] Falha ao obter shipment ${o.shipping_id}: ${msg}`);
+      // Fail-fast em 429 persistente: ML excedeu cota — não adianta continuar
+      if (msg.includes('429') || msg.includes('máximo de tentativas')) {
+        consecutive429++;
+        if (consecutive429 >= 5) {
+          console.error('[BOT-ML] Cota da API ML excedida (5x 429 seguidos). Interrompendo execução. Tente novamente em alguns minutos.');
+          ml.flushShipmentCache();
+          stats.errors++;
+          return stats;
+        }
+      }
     }
   }
+  ml.flushShipmentCache();
   console.log(`[BOT-ML] ${shipChecked} shipments verificados, ${matchingOrderIds.length} com pay_before <= ${dataColeta} 23:59`);
 
   for (const mlOrderId of matchingOrderIds) {

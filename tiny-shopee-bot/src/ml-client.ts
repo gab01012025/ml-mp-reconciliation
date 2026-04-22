@@ -316,6 +316,10 @@ export interface MLShipmentInfo {
  * para reduzir consumo de rate limit.
  */
 export async function getShipment(shipmentId: number): Promise<MLShipmentInfo> {
+  // Cache em disco com TTL — evita reconsultar o mesmo shipment a cada execução
+  const cached = readShipmentCache(shipmentId);
+  if (cached) return cached;
+
   const data = await mlGet(`/shipments/${shipmentId}`);
 
   // Normaliza um valor que pode ser string direta ou objeto { date, type }
@@ -355,7 +359,7 @@ export async function getShipment(shipmentId: number): Promise<MLShipmentInfo> {
     localDate = rawDate.slice(0, 10);
   }
 
-  return {
+  const info: MLShipmentInfo = {
     id: data?.id,
     status: data?.status,
     substatus: data?.substatus,
@@ -367,6 +371,56 @@ export async function getShipment(shipmentId: number): Promise<MLShipmentInfo> {
     raw_date_source: rawSource,
     raw: data,
   };
+  writeShipmentCache(shipmentId, info);
+  return info;
+}
+
+// ============================================================================
+// Cache de shipments (TTL configurável) — reduz drasticamente chamadas à API ML
+// ============================================================================
+interface ShipmentCacheEntry { ts: number; info: MLShipmentInfo }
+let shipmentCache: Record<string, ShipmentCacheEntry> | null = null;
+
+function loadShipmentCache(): Record<string, ShipmentCacheEntry> {
+  if (shipmentCache) return shipmentCache;
+  try {
+    if (fs.existsSync(config.mlShipmentCachePath)) {
+      shipmentCache = JSON.parse(fs.readFileSync(config.mlShipmentCachePath, 'utf-8'));
+      return shipmentCache!;
+    }
+  } catch (err) {
+    console.warn('[ML] Falha ao ler cache de shipments:', err);
+  }
+  shipmentCache = {};
+  return shipmentCache;
+}
+
+function persistShipmentCache(): void {
+  if (!shipmentCache) return;
+  try {
+    fs.writeFileSync(config.mlShipmentCachePath, JSON.stringify(shipmentCache), 'utf-8');
+  } catch (err) {
+    console.warn('[ML] Falha ao salvar cache de shipments:', err);
+  }
+}
+
+function readShipmentCache(id: number): MLShipmentInfo | null {
+  const cache = loadShipmentCache();
+  const entry = cache[String(id)];
+  if (!entry) return null;
+  if (Date.now() - entry.ts > config.mlShipmentCacheTtlMs) return null;
+  return entry.info;
+}
+
+function writeShipmentCache(id: number, info: MLShipmentInfo): void {
+  const cache = loadShipmentCache();
+  cache[String(id)] = { ts: Date.now(), info };
+  // Persiste a cada 20 entradas novas para não saturar IO
+  if (Object.keys(cache).length % 20 === 0) persistShipmentCache();
+}
+
+export function flushShipmentCache(): void {
+  persistShipmentCache();
 }
 
 /**
