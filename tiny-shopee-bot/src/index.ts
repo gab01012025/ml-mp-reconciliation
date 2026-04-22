@@ -75,14 +75,14 @@ const server = http.createServer(async (req, res) => {
   // Public: health
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.8-tinyRetry', uptime: process.uptime() }));
+    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.9-30days', uptime: process.uptime() }));
     return;
   }
 
   // Public: version check (for debugging deploys)
   if (url.pathname === '/version') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ version: 'v3.8-tinyRetry', deployed: startTime.toISOString() }));
+    res.end(JSON.stringify({ version: 'v3.9-30days', deployed: startTime.toISOString() }));
     return;
   }
 
@@ -130,7 +130,12 @@ const server = http.createServer(async (req, res) => {
 
   // Public: dashboard page (auth is checked client-side via JS)
   if (url.pathname === '/' && req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+      'Pragma': 'no-cache',
+      'Expires': '0',
+    });
     res.end(getDashboardHtml());
     return;
   }
