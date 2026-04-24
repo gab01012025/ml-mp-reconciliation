@@ -75,14 +75,14 @@ const server = http.createServer(async (req, res) => {
   // Public: health
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.11-cache', uptime: process.uptime() }));
+    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.12-slow', uptime: process.uptime() }));
     return;
   }
 
   // Public: version check (for debugging deploys)
   if (url.pathname === '/version') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ version: 'v3.11-cache', deployed: startTime.toISOString() }));
+    res.end(JSON.stringify({ version: 'v3.12-slow', deployed: startTime.toISOString() }));
     return;
   }
 

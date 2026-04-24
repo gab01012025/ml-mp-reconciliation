@@ -345,12 +345,16 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
 
   const matchingOrderIds: number[] = [];
   let shipChecked = 0;
+  let cacheHits = 0;
   let consecutive429 = 0;
   for (const o of mlOrders) {
     if (!o.shipping_id) continue;
     try {
       shipChecked++;
-      await sleep(450);
+      // Verifica se já está em cache antes de gastar delay
+      const wasCached = ml.isShipmentCached(o.shipping_id);
+      if (wasCached) cacheHits++;
+      else await sleep(1500); // 1.5s entre chamadas reais à API ML (~40 req/min)
       const ship = await ml.getShipment(o.shipping_id);
       consecutive429 = 0;
       // Ignora pedidos que já foram expedidos
@@ -367,8 +371,8 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
       // Fail-fast em 429 persistente: ML excedeu cota — não adianta continuar
       if (msg.includes('429') || msg.includes('máximo de tentativas')) {
         consecutive429++;
-        if (consecutive429 >= 5) {
-          console.error('[BOT-ML] Cota da API ML excedida (5x 429 seguidos). Interrompendo execução. Tente novamente em alguns minutos.');
+        if (consecutive429 >= 3) {
+          console.error('[BOT-ML] Cota da API ML excedida (3x 429 seguidos). Interrompendo. Aguarde 30-60min e tente novamente — o cache preservará o progresso já feito.');
           ml.flushShipmentCache();
           stats.errors++;
           return stats;
@@ -377,7 +381,7 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
     }
   }
   ml.flushShipmentCache();
-  console.log(`[BOT-ML] ${shipChecked} shipments verificados, ${matchingOrderIds.length} com pay_before <= ${dataColeta} 23:59`);
+  console.log(`[BOT-ML] ${shipChecked} shipments verificados (${cacheHits} via cache, ${shipChecked - cacheHits} via API), ${matchingOrderIds.length} com pay_before <= ${dataColeta} 23:59`);
 
   for (const mlOrderId of matchingOrderIds) {
     try {

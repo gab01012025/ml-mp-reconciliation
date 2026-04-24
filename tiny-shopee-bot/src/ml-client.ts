@@ -423,6 +423,10 @@ export function flushShipmentCache(): void {
   persistShipmentCache();
 }
 
+export function isShipmentCached(id: number): boolean {
+  return readShipmentCache(id) !== null;
+}
+
 /**
  * Usado para debug: retorna uma amostra de shipments com todos os campos relevantes
  */
