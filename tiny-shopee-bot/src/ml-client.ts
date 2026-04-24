@@ -415,8 +415,8 @@ function readShipmentCache(id: number): MLShipmentInfo | null {
 function writeShipmentCache(id: number, info: MLShipmentInfo): void {
   const cache = loadShipmentCache();
   cache[String(id)] = { ts: Date.now(), info };
-  // Persiste a cada 20 entradas novas para não saturar IO
-  if (Object.keys(cache).length % 20 === 0) persistShipmentCache();
+  // Persiste IMEDIATAMENTE — cota do ML é tão escassa que cada chamada bem sucedida vale ouro
+  persistShipmentCache();
 }
 
 export function flushShipmentCache(): void {

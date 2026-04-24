@@ -354,7 +354,7 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
       // Verifica se já está em cache antes de gastar delay
       const wasCached = ml.isShipmentCached(o.shipping_id);
       if (wasCached) cacheHits++;
-      else await sleep(1500); // 1.5s entre chamadas reais à API ML (~40 req/min)
+      else await sleep(3000); // 3s entre chamadas reais — ML está extremamente agressivo com 429
       const ship = await ml.getShipment(o.shipping_id);
       consecutive429 = 0;
       // Ignora pedidos que já foram expedidos
