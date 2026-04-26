@@ -246,10 +246,11 @@ export async function searchOrdersByDate(dataInicial: string, dataFinal: string)
 }
 
 /**
- * Busca pedidos do ML recentes pendentes de envio (úteis para "data de coleta / deadline NF").
- * Só status `ready_to_ship` — esses são os que precisam de NF.
+ * Busca pedidos do ML recentes com status `paid` (pagos).
+ * Filtragem por data de coleta (pay_before) é feita no bot.service.ts.
+ * Removido filtro shipping.status=ready_to_ship que não retorna nada para pedidos Full.
  */
-export async function searchRecentPaidOrders(daysBack: number = 7): Promise<MLOrderSummary[]> {
+export async function searchRecentPaidOrders(daysBack: number = 30): Promise<MLOrderSummary[]> {
   const t = loadTokens();
   if (!t) throw new Error('ML não conectado');
 
@@ -269,7 +270,7 @@ export async function searchRecentPaidOrders(daysBack: number = 7): Promise<MLOr
         seller: String(t.user_id),
         'order.date_created.from': fromIso,
         'order.date_created.to': toIso,
-        'shipping.status': 'ready_to_ship',
+        'order.status': 'paid',
         sort: 'date_desc',
         offset: String(offset),
         limit: String(limit),
@@ -293,7 +294,7 @@ export async function searchRecentPaidOrders(daysBack: number = 7): Promise<MLOr
       break;
     }
   }
-  console.log(`[ML] searchRecentPaidOrders (${daysBack}d, ready_to_ship): ${all.length} pedidos`);
+  console.log(`[ML] searchRecentPaidOrders (${daysBack}d, paid): ${all.length} pedidos`);
   return all;
 }
 
