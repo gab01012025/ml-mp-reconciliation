@@ -347,12 +347,29 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
   let shipChecked = 0;
   let cacheHits = 0;
   let consecutive429 = 0;
+
+  const shipmentCacheFlags = new Map<number, boolean>();
   for (const o of mlOrders) {
+    if (!o.shipping_id) continue;
+    if (!shipmentCacheFlags.has(o.shipping_id)) {
+      shipmentCacheFlags.set(o.shipping_id, ml.isShipmentCached(o.shipping_id));
+    }
+  }
+
+  const mlOrdersPrioritized = [...mlOrders].sort((a, b) => {
+    const aCached = a.shipping_id ? (shipmentCacheFlags.get(a.shipping_id) || false) : false;
+    const bCached = b.shipping_id ? (shipmentCacheFlags.get(b.shipping_id) || false) : false;
+    return Number(bCached) - Number(aCached);
+  });
+  const cachedCandidates = mlOrdersPrioritized.filter(o => o.shipping_id && shipmentCacheFlags.get(o.shipping_id)).length;
+  console.log(`[BOT-ML] Estratégia cache-first: ${cachedCandidates} pedidos com shipment já em cache processados antes de chamar API`);
+
+  for (const o of mlOrdersPrioritized) {
     if (!o.shipping_id) continue;
     try {
       shipChecked++;
       // Verifica se já está em cache antes de gastar delay
-      const wasCached = ml.isShipmentCached(o.shipping_id);
+      const wasCached = shipmentCacheFlags.get(o.shipping_id) || false;
       if (wasCached) cacheHits++;
       else await sleep(3000); // 3s entre chamadas reais — ML está extremamente agressivo com 429
       const ship = await ml.getShipment(o.shipping_id);
