@@ -335,9 +335,9 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
 
   let mlOrders: ml.MLOrderSummary[];
   try {
-    // 30 dias: pedidos Full podem ficar aguardando NF por semanas no galpão do ML
-    mlOrders = await ml.searchRecentPaidOrders(30);
-    console.log(`[BOT-ML] ${mlOrders.length} pedidos pendentes (ready_to_ship últimos 30 dias)`);
+    // 7 dias: pedidos Full com pay_before amanhã foram criados no máximo ~7 dias atrás
+    mlOrders = await ml.searchRecentPaidOrders(7);
+    console.log(`[BOT-ML] ${mlOrders.length} pedidos pendentes (paid últimos 7 dias)`);
   } catch (err) {
     console.error('[BOT-ML] Falha ao buscar pedidos no ML:', err);
     return stats;
@@ -371,8 +371,8 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
       // Fail-fast em 429 persistente: ML excedeu cota — não adianta continuar
       if (msg.includes('429') || msg.includes('máximo de tentativas')) {
         consecutive429++;
-        if (consecutive429 >= 3) {
-          console.error('[BOT-ML] Cota da API ML excedida (3x 429 seguidos). Interrompendo. Aguarde 30-60min e tente novamente — o cache preservará o progresso já feito.');
+        if (consecutive429 >= 1) {
+          console.error('[BOT-ML] Cota da API ML excedida (429 persistente). Interrompendo. Aguarde 30-60min e tente novamente — o cache preservará o progresso já feito.');
           ml.flushShipmentCache();
           stats.errors++;
           return stats;
