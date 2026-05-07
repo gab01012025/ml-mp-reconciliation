@@ -39,6 +39,9 @@ export const config = {
 
   // Mercado Livre: desconto aplicado sobre o valor dos produtos (ex: 30 = 30% off → NF emitida com 70% do valor)
   mlDiscountPercent: parseFloat(process.env.ML_DISCOUNT_PERCENT || '30'),
+
+  // Shopee: desconto aplicado sobre o valor dos produtos (ex: 95 = 95% off → NF emitida com 5% do valor)
+  shopeeDiscountPercent: parseFloat(process.env.SHOPEE_DISCOUNT_PERCENT || '95'),
 };
 
 /**

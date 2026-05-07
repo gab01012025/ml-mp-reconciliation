@@ -177,11 +177,12 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
           continue;
         }
 
-        // Cria NF com valores das faixas e emite na SEFAZ
-        console.log(`[BOT] Criando NF para pedido ${order.id} (${detail.numero}) - total original: R$${detail.total_pedido}`);
+        // Cria NF Shopee com desconto percentual sobre o valor original e emite na SEFAZ
+        const shopeeDiscount = config.shopeeDiscountPercent;
+        console.log(`[BOT] Criando NF para pedido ${order.id} (${detail.numero}) - total original: R$${detail.total_pedido} - desconto ${shopeeDiscount}%`);
         await sleep(1100);
 
-        const nf = await createAndEmitNF(detail);
+        const nf = await createAndEmitNFDiscounted(detail, shopeeDiscount);
         if (nf.success) {
           stats.altered++;
           stats.nfGenerated++;
