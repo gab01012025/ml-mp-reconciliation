@@ -621,7 +621,7 @@ function getDashboardHtml(): string {
     <nav>
       <a href="#" class="active"><span class="icon">📊</span> Dashboard</a>
       <a href="#integracoes"><span class="icon">🔗</span> Integrações</a>
-      <a href="#sync"><span class="icon">⚡</span> Sincronização</a>
+      <a href="#sync"><span class="icon">🛒</span> Shopee</a>
       <a href="#ml-sync"><span class="icon">🏪</span> Mercado Livre</a>
       <a href="#nfs"><span class="icon">📋</span> Notas Fiscais</a>
       <div class="section-label">Sistema</div>
@@ -796,7 +796,7 @@ function getDashboardHtml(): string {
 
       <!-- Sync Actions -->
       <div class="card" id="sync">
-        <div class="card-header">⚡ Sincronização de Pedidos</div>
+        <div class="card-header">🛒 Shopee — NF com ${config.shopeeDiscountPercent}% de Desconto</div>
         <div class="card-body">
           <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; padding:12px 16px; background:${automationPaused ? '#fffbeb' : '#f0fdf4'}; border-radius:8px; border:1px solid ${automationPaused ? '#fde68a' : '#bbf7d0'};">
             <div>
@@ -815,12 +815,12 @@ function getDashboardHtml(): string {
           <div id="msgToggle" class="msg msg-ok"></div>
           <div id="msgRun" class="msg msg-ok"></div>
           <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin: 16px 0;">
-            <button class="btn btn-primary" id="btnSync" onclick="syncNow()">▶ Sincronizar Agora</button>
-            <span style="font-size:13px; color:#999;">Busca pedidos de ontem e hoje em todos os canais</span>
+            <button class="btn btn-primary" id="btnSync" onclick="syncNow()">▶ Sincronizar Shopee Agora</button>
+            <span style="font-size:13px; color:#999;">Busca pedidos Shopee de ontem e hoje e emite NF com ${config.shopeeDiscountPercent}% de desconto</span>
           </div>
 
           <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
-          <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Reprocessar Período Específico</p>
+          <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Reprocessar Período Específico (Shopee)</p>
           <div id="msgReprocess" class="msg msg-ok"></div>
           <div class="inline-form">
             <div class="form-sm">
@@ -831,7 +831,7 @@ function getDashboardHtml(): string {
               <label>Data Final</label>
               <input type="text" id="ate" placeholder="dd/mm/aaaa" maxlength="10">
             </div>
-            <button class="btn btn-secondary btn-sm" id="btnReprocess" onclick="reprocessar()">🔄 Reprocessar</button>
+            <button class="btn btn-secondary btn-sm" id="btnReprocess" onclick="reprocessar()">🔄 Reprocessar Shopee</button>
           </div>
         </div>
       </div>
