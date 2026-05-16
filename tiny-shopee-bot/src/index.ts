@@ -140,6 +140,70 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Public: Shopee OAuth callback — captura code e shop_id
+  if (url.pathname === '/shopee/callback' && req.method === 'GET') {
+    const code = url.searchParams.get('code');
+    const shopId = url.searchParams.get('shop_id');
+
+    if (!code || !shopId) {
+      res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;text-align:center;"><h2>❌ Parâmetros ausentes</h2><p>code ou shop_id não recebidos.</p><p>Query: ${url.search}</p><a href="/">Voltar</a></body></html>`);
+      return;
+    }
+
+    console.log(`[SHOPEE] Callback recebido — code=${code.slice(0, 10)}... shop_id=${shopId}`);
+
+    // Tenta trocar o code por access_token
+    try {
+      const timestamp = Math.floor(Date.now() / 1000);
+      const partnerId = 2034504;
+      const partnerKey = 'shpk4f5070634b41444467755a7a62745977614d4851525754524d7868526941';
+      const path = '/api/v2/auth/token/get';
+      const baseString = `${partnerId}${path}${timestamp}`;
+      const sign = crypto.createHmac('sha256', partnerKey).update(baseString).digest('hex');
+
+      const tokenUrl = `https://partner.shopeemobile.com${path}?partner_id=${partnerId}&timestamp=${timestamp}&sign=${sign}`;
+      const body = JSON.stringify({ code, shop_id: Number(shopId), partner_id: partnerId });
+
+      const tokenRes = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+      const tokenData = await tokenRes.json() as any;
+
+      if (tokenData.error) {
+        console.error('[SHOPEE] Token exchange error:', tokenData);
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Shopee - Code Recebido</title></head><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:40px;text-align:center;background:#f0f2f5;"><div style="max-width:580px;margin:60px auto;background:white;padding:40px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.08);"><h1 style="color:#f59e0b;font-size:48px;margin-bottom:10px;">⚠️</h1><h2 style="color:#1a1a2e;margin-bottom:16px;">Code recebido, token falhou</h2><p style="color:#666;font-size:14px;">Dados capturados com sucesso:</p><div style="text-align:left;background:#f8fafc;padding:16px;border-radius:8px;margin:16px 0;font-family:monospace;font-size:13px;word-break:break-all;"><strong>shop_id:</strong> ${shopId}<br><strong>code:</strong> ${code}<br><br><strong>Erro token:</strong> ${JSON.stringify(tokenData)}</div><a href="/" style="display:inline-block;padding:12px 28px;background:#0f3460;color:white;text-decoration:none;border-radius:8px;font-weight:600;">Voltar ao painel</a></div></body></html>`);
+      } else {
+        const { access_token, refresh_token, expire_in } = tokenData;
+        console.log(`[SHOPEE] Token obtido! shop_id=${shopId} access_token=${access_token?.slice(0, 15)}... refresh_token=${refresh_token?.slice(0, 15)}... expires_in=${expire_in}`);
+
+        // Salva em arquivo para persistência
+        const tokenInfo = { shop_id: shopId, access_token, refresh_token, expire_in, obtained_at: new Date().toISOString() };
+        const fs = await import('fs');
+        fs.writeFileSync('/tmp/shopee_tokens.json', JSON.stringify(tokenInfo, null, 2));
+
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Shopee Conectada!</title></head><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:40px;text-align:center;background:#f0f2f5;"><div style="max-width:580px;margin:60px auto;background:white;padding:40px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.08);"><h1 style="color:#16a34a;font-size:48px;margin-bottom:10px;">✅</h1><h2 style="color:#1a1a2e;margin-bottom:16px;">Shopee conectada com sucesso!</h2><p style="color:#666;font-size:14px;">Loja autorizada no SyncHub.</p><div style="text-align:left;background:#f8fafc;padding:16px;border-radius:8px;margin:16px 0;font-family:monospace;font-size:13px;word-break:break-all;"><strong>shop_id:</strong> ${shopId}<br><strong>access_token:</strong> ${access_token?.slice(0, 20)}...<br><strong>refresh_token:</strong> ${refresh_token?.slice(0, 20)}...<br><strong>expira em:</strong> ${expire_in}s</div><a href="/" style="display:inline-block;padding:12px 28px;background:#0f3460;color:white;text-decoration:none;border-radius:8px;font-weight:600;">Voltar ao painel</a></div></body></html>`);
+      }
+    } catch (err: any) {
+      console.error('[SHOPEE] Callback error:', err);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Shopee - Code Recebido</title></head><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:40px;text-align:center;background:#f0f2f5;"><div style="max-width:580px;margin:60px auto;background:white;padding:40px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.08);"><h1 style="color:#f59e0b;font-size:48px;margin-bottom:10px;">⚠️</h1><h2 style="color:#1a1a2e;margin-bottom:16px;">Code recebido!</h2><p style="color:#666;font-size:14px;">Capturamos os dados, mas erro ao trocar por token:</p><div style="text-align:left;background:#f8fafc;padding:16px;border-radius:8px;margin:16px 0;font-family:monospace;font-size:13px;word-break:break-all;"><strong>shop_id:</strong> ${shopId}<br><strong>code:</strong> ${code}<br><br><strong>Erro:</strong> ${String(err.message || err)}</div><a href="/" style="display:inline-block;padding:12px 28px;background:#0f3460;color:white;text-decoration:none;border-radius:8px;font-weight:600;">Voltar ao painel</a></div></body></html>`);
+    }
+    return;
+  }
+
+  // Public: Shopee OAuth callback fallback — captura na raiz se vier com code
+  if (url.pathname === '/' && req.method === 'GET' && url.searchParams.has('code') && url.searchParams.has('shop_id')) {
+    // Redireciona para /shopee/callback com os mesmos params
+    res.writeHead(302, { Location: `/shopee/callback${url.search}` });
+    res.end();
+    return;
+  }
+
   // Public: ML OAuth start — redireciona usuário para ML authorize
   if (url.pathname === '/ml/connect' && req.method === 'GET') {
     const state = crypto.randomUUID();
