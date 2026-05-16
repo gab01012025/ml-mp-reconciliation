@@ -13,6 +13,7 @@ import {
 } from './tiny-client';
 import { config } from './config';
 import * as ml from './ml-client';
+import * as shopee from './shopee-client';
 
 // Rastreia pedidos já processados para evitar reprocessamento
 const processedOrders = new Set<string>();
@@ -196,6 +197,28 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
               valorNota: nf.valorNota || 0,
               dataProcessamento: new Date().toLocaleString('pt-BR'),
             });
+
+            // Envia NF para a Shopee via API
+            if (shopee.isConnected() && detail.numero_ecommerce && nf.chaveAcesso) {
+              try {
+                await sleep(1100);
+                const serie = nf.numero?.includes('-') ? nf.numero.split('-')[0] : '1';
+                const numero = nf.numero?.includes('-') ? nf.numero.split('-')[1] : (nf.numero || '');
+                const result = await shopee.setInvoiceInfo(
+                  detail.numero_ecommerce,
+                  numero,
+                  serie,
+                  nf.chaveAcesso
+                );
+                if (result.success) {
+                  console.log(`[BOT] NF enviada para Shopee com sucesso — pedido ${detail.numero_ecommerce}`);
+                } else {
+                  console.warn(`[BOT] Falha ao enviar NF para Shopee: ${result.error}`);
+                }
+              } catch (err) {
+                console.warn(`[BOT] Erro ao enviar NF para Shopee:`, err);
+              }
+            }
           }
         } else {
           stats.errors++;

@@ -42,6 +42,12 @@ export const config = {
 
   // Shopee: desconto aplicado sobre o valor dos produtos (ex: 95 = 95% off → NF emitida com 5% do valor)
   shopeeDiscountPercent: parseFloat(process.env.SHOPEE_DISCOUNT_PERCENT || '95'),
+
+  // Shopee Open Platform API
+  shopeePartnerId: process.env.SHOPEE_PARTNER_ID || '2034504',
+  shopeePartnerKey: process.env.SHOPEE_PARTNER_KEY || 'shpk4f5070634b41444467755a7a62745977614d4851525754524d7868526941',
+  shopeeShopId: process.env.SHOPEE_SHOP_ID || '985573664',
+  shopeeTokenStorePath: process.env.SHOPEE_TOKEN_STORE || '/tmp/shopee_tokens.json',
 };
 
 /**
