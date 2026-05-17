@@ -143,7 +143,8 @@ const server = http.createServer(async (req, res) => {
   }
 
   // Public: Shopee OAuth callback — captura code e shop_id
-  if (url.pathname === '/shopee/callback' && req.method === 'GET') {
+  // Aceita /shopee/callback e paths truncados como /shopee/callb, /shopee/call etc.
+  if (url.pathname.startsWith('/shopee/call') && req.method === 'GET') {
     const code = url.searchParams.get('code');
     const shopId = url.searchParams.get('shop_id');
 
@@ -197,9 +198,16 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Public: Shopee OAuth callback fallback — captura na raiz se vier com code
+  // Public: Shopee OAuth callback fallback — captura na raiz se vier com code+shop_id
   if (url.pathname === '/' && req.method === 'GET' && url.searchParams.has('code') && url.searchParams.has('shop_id')) {
     // Redireciona para /shopee/callback com os mesmos params
+    res.writeHead(302, { Location: `/shopee/callback${url.search}` });
+    res.end();
+    return;
+  }
+
+  // Fallback: qualquer path /shopee/* com code e shop_id que não foi pego acima
+  if (url.pathname.startsWith('/shopee/') && req.method === 'GET' && url.searchParams.has('code') && url.searchParams.has('shop_id')) {
     res.writeHead(302, { Location: `/shopee/callback${url.search}` });
     res.end();
     return;
