@@ -33,8 +33,8 @@ export const config = {
   mlClientId: process.env.ML_CLIENT_ID || '7462399727089965',
   mlClientSecret: process.env.ML_CLIENT_SECRET || 'hkDcv4NWZOeyLSAm293dL5rJ0gNi6FYJ',
   mlRedirectUri: process.env.ML_REDIRECT_URI || 'https://synchub.webmedula.com.br/ml/callback',
-  mlTokenStorePath: process.env.ML_TOKEN_STORE || '/tmp/ml-tokens.json',
-  mlShipmentCachePath: process.env.ML_SHIPMENT_CACHE || '/tmp/ml-shipments-cache.json',
+  mlTokenStorePath: process.env.ML_TOKEN_STORE || '/app/data/ml-tokens.json',
+  mlShipmentCachePath: process.env.ML_SHIPMENT_CACHE || '/app/data/ml-shipments-cache.json',
   mlShipmentCacheTtlMs: parseInt(process.env.ML_SHIPMENT_CACHE_TTL_MS || String(24 * 60 * 60 * 1000), 10),
 
   // Mercado Livre: desconto aplicado sobre o valor dos produtos (ex: 30 = 30% off → NF emitida com 70% do valor)
@@ -47,7 +47,7 @@ export const config = {
   shopeePartnerId: process.env.SHOPEE_PARTNER_ID || '2034504',
   shopeePartnerKey: process.env.SHOPEE_PARTNER_KEY || 'shpk4f5070634b41444467755a7a62745977614d4851525754524d7868526941',
   shopeeShopId: process.env.SHOPEE_SHOP_ID || '985573664',
-  shopeeTokenStorePath: process.env.SHOPEE_TOKEN_STORE || '/tmp/shopee_tokens.json',
+  shopeeTokenStorePath: process.env.SHOPEE_TOKEN_STORE || '/app/data/shopee_tokens.json',
 };
 
 /**

@@ -10,6 +10,10 @@ COPY src/ ./src/
 
 RUN npm run build
 
+# Diretório persistente para tokens e cache (montar volume aqui)
+RUN mkdir -p /app/data
+VOLUME /app/data
+
 ENV NODE_ENV=production
 EXPOSE 3001
 
