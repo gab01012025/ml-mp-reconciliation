@@ -8,6 +8,7 @@ import {
   hasClientAddress,
   createAndEmitNF,
   createAndEmitNFDiscounted,
+  getNFDetails,
   hasMaskedClientData,
   NFResult,
 } from './tiny-client';
@@ -500,6 +501,110 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
 
   console.log(`[BOT-ML] Resultado coleta=${dataColeta}: ${stats.found} pedidos, ${stats.nfGenerated} NFs com ${discount}%, ${stats.skippedNF} pulados, ${stats.errors} erros`);
   return stats;
+}
+
+/**
+ * Envia NFs já existentes para a Shopee (retroativo).
+ * Busca pedidos Shopee que já têm NF no Tiny, obtém chave de acesso e envia via API Shopee.
+ */
+export async function sendPendingNFsToShopee(customDataInicial?: string, customDataFinal?: string): Promise<{ sent: number; skipped: number; errors: number; details: string[] }> {
+  const result = { sent: 0, skipped: 0, errors: 0, details: [] as string[] };
+
+  if (!shopee.isConnected()) {
+    result.details.push('Shopee não conectada — impossível enviar NFs.');
+    return result;
+  }
+
+  let dataInicial: string;
+  let dataFinal: string;
+
+  if (customDataInicial && customDataFinal) {
+    dataInicial = customDataInicial;
+    dataFinal = customDataFinal;
+  } else {
+    const today = new Date();
+    const twoDaysAgo = new Date(today);
+    twoDaysAgo.setDate(twoDaysAgo.getDate() - 2);
+    dataInicial = formatDate(twoDaysAgo);
+    dataFinal = formatDate(today);
+  }
+
+  console.log(`\n[SHOPEE-NF] Buscando pedidos Shopee de ${dataInicial} a ${dataFinal} para envio retroativo de NFs...`);
+
+  try {
+    let page = 1;
+    let totalPages = 1;
+    const allOrders: Array<{ id: string; numero: string; numero_ecommerce: string; valor: string; situacao: string }> = [];
+
+    while (page <= totalPages) {
+      const searchResult = await searchOrders({ dataInicial, dataFinal, pagina: page });
+      totalPages = searchResult.totalPages;
+      allOrders.push(...searchResult.orders);
+      page++;
+      await sleep(1100);
+    }
+
+    console.log(`[SHOPEE-NF] ${allOrders.length} pedidos encontrados no período`);
+
+    for (const order of allOrders) {
+      try {
+        await sleep(1100);
+        const detail = await getOrder(order.id);
+
+        if (!isShopeeOrder(detail)) continue;
+
+        if (!detail.id_nota_fiscal) {
+          console.log(`[SHOPEE-NF] Pedido ${detail.numero} (${detail.numero_ecommerce}) sem NF — pulando`);
+          result.skipped++;
+          continue;
+        }
+
+        if (!detail.numero_ecommerce) {
+          console.log(`[SHOPEE-NF] Pedido ${detail.numero} sem numero_ecommerce — pulando`);
+          result.skipped++;
+          continue;
+        }
+
+        // Busca dados da NF
+        await sleep(1100);
+        const nfData = await getNFDetails(detail.id_nota_fiscal);
+
+        if (!nfData.chaveAcesso) {
+          console.log(`[SHOPEE-NF] NF ${detail.id_nota_fiscal} do pedido ${detail.numero} sem chave de acesso — pulando`);
+          result.skipped++;
+          continue;
+        }
+
+        const serie = nfData.serie || (nfData.numero?.includes('-') ? nfData.numero.split('-')[0] : '1');
+        const numero = nfData.numero?.includes('-') ? nfData.numero.split('-')[1] : (nfData.numero || '');
+
+        console.log(`[SHOPEE-NF] Enviando NF para pedido ${detail.numero_ecommerce}: numero=${numero} serie=${serie} chave=${nfData.chaveAcesso.slice(0, 10)}...`);
+
+        await sleep(1100);
+        const sendResult = await shopee.setInvoiceInfo(detail.numero_ecommerce, numero, serie, nfData.chaveAcesso);
+
+        if (sendResult.success) {
+          console.log(`[SHOPEE-NF] ✓ NF enviada com sucesso para pedido ${detail.numero_ecommerce}`);
+          result.sent++;
+          result.details.push(`✓ ${detail.numero_ecommerce}: NF ${numero} enviada`);
+        } else {
+          console.warn(`[SHOPEE-NF] ✗ Falha ao enviar NF para ${detail.numero_ecommerce}: ${sendResult.error}`);
+          result.errors++;
+          result.details.push(`✗ ${detail.numero_ecommerce}: ${sendResult.error}`);
+        }
+      } catch (err: any) {
+        console.error(`[SHOPEE-NF] Erro ao processar pedido ${order.id}:`, err);
+        result.errors++;
+        result.details.push(`✗ Pedido ${order.numero}: ${err.message || String(err)}`);
+      }
+    }
+  } catch (err: any) {
+    console.error('[SHOPEE-NF] Falha na busca:', err);
+    result.details.push(`Erro geral: ${err.message || String(err)}`);
+  }
+
+  console.log(`[SHOPEE-NF] Resultado: ${result.sent} enviadas, ${result.skipped} puladas, ${result.errors} erros`);
+  return result;
 }
 
 function ddmmyyyyToIsoDate(d: string): string {

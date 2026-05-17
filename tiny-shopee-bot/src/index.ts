@@ -3,7 +3,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as cron from 'node-cron';
 import { config } from './config';
-import { processNewShopeeOrders, processMercadoLivreOrdersForDate, processMercadoLivreByCollectionDate, clearProcessedOrders, ProcessedNF } from './bot.service';
+import { processNewShopeeOrders, processMercadoLivreOrdersForDate, processMercadoLivreByCollectionDate, clearProcessedOrders, sendPendingNFsToShopee, ProcessedNF } from './bot.service';
 import { getLogs } from './log-buffer';
 import * as ml from './ml-client';
 import * as shopeeClient from './shopee-client';
@@ -368,6 +368,34 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ message: `Processamento ML iniciado para ${date} (${mode})`, date, mode }));
     runMLBot(date, mode as 'coleta' | 'pedido');
+  } else if (url.pathname === '/shopee/send-nfs' && req.method === 'POST') {
+    const de = url.searchParams.get('de') || undefined;
+    const ate = url.searchParams.get('ate') || undefined;
+    const dateRegex = /^\d{2}\/\d{2}\/\d{4}$/;
+    if (de && !dateRegex.test(de)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Data "de" inválida. Use dd/mm/aaaa' }));
+      return;
+    }
+    if (ate && !dateRegex.test(ate)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Data "ate" inválida. Use dd/mm/aaaa' }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ message: 'Envio retroativo de NFs para Shopee iniciado', de: de || 'últimos 2 dias', ate: ate || 'hoje' }));
+    sendPendingNFsToShopee(de, ate).then(result => {
+      console.log(`[SHOPEE-NF] Envio retroativo concluído:`, result);
+    });
+  } else if (url.pathname === '/shopee/status' && req.method === 'GET') {
+    const info = shopeeClient.getConnectionInfo();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      connected: info.connected,
+      shopId: info.shopId,
+      expiresAt: info.expiresAt,
+      discountPercent: config.shopeeDiscountPercent,
+    }));
   } else {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not found' }));
@@ -906,6 +934,23 @@ function getDashboardHtml(): string {
             </div>
             <button class="btn btn-secondary btn-sm" id="btnReprocess" onclick="reprocessar()">🔄 Reprocessar Shopee</button>
           </div>
+
+          <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
+          <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Enviar NFs já existentes para a Shopee (retroativo)</p>
+          <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Busca pedidos Shopee que já possuem NF emitida no Tiny e envia a chave de acesso para a API da Shopee. Útil para NFs geradas antes da integração direta.</p>
+          <div id="msgShopeeNF" class="msg msg-ok"></div>
+          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end;">
+            <button class="btn btn-primary btn-sm" id="btnShopeeNF" onclick="sendNFsToShopee()">📤 Enviar NFs para Shopee</button>
+            <div class="form-sm">
+              <label>De (opcional)</label>
+              <input type="text" id="shopeeNfDe" placeholder="dd/mm/aaaa" maxlength="10">
+            </div>
+            <div class="form-sm">
+              <label>Até (opcional)</label>
+              <input type="text" id="shopeeNfAte" placeholder="dd/mm/aaaa" maxlength="10">
+            </div>
+          </div>
+          <div id="shopeeConnStatus" style="margin-top:12px; font-size:12px; color:#888;"></div>
         </div>
       </div>
 
@@ -1104,6 +1149,41 @@ function getDashboardHtml(): string {
       } catch(e) { showMsg('msgToggle', 'Erro: ' + e.message, false); }
       btn.disabled = false;
     }
+
+    async function sendNFsToShopee() {
+      var de = document.getElementById('shopeeNfDe').value.trim();
+      var ate = document.getElementById('shopeeNfAte').value.trim();
+      var qs = '';
+      if (de) qs += '?de=' + encodeURIComponent(de);
+      if (ate) qs += (qs ? '&' : '?') + 'ate=' + encodeURIComponent(ate);
+      var btn = document.getElementById('btnShopeeNF');
+      btn.disabled = true; btn.textContent = '⏳ Enviando NFs...';
+      try {
+        var r = await fetch('/shopee/send-nfs' + qs, { method: 'POST', headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
+        showMsg('msgShopeeNF', d.message || d.error, r.ok);
+      } catch(e) { showMsg('msgShopeeNF', 'Erro: ' + e.message, false); }
+      btn.disabled = false; btn.textContent = '📤 Enviar NFs para Shopee';
+    }
+
+    async function refreshShopeeStatus() {
+      try {
+        var r = await fetch('/shopee/status', { headers: authHeaders });
+        if (r.status === 401) return;
+        var d = await r.json();
+        var el = document.getElementById('shopeeConnStatus');
+        if (d.connected) {
+          el.innerHTML = '✓ Shopee conectada (shop_id: ' + d.shopId + ', expira: ' + (d.expiresAt || 'N/A') + ')';
+          el.style.color = '#16a34a';
+        } else {
+          el.innerHTML = '⚠ Shopee não conectada — NFs não serão enviadas';
+          el.style.color = '#ea580c';
+        }
+      } catch(e) {}
+    }
+    refreshShopeeStatus();
+    setInterval(refreshShopeeStatus, 10000);
 
     async function reprocessar() {
       var de = document.getElementById('de').value.trim();

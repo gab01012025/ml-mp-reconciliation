@@ -502,6 +502,21 @@ export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discount
 }
 
 /**
+ * Obtém detalhes de uma NF já existente pelo ID (numero, chave_acesso, serie, situacao)
+ */
+export async function getNFDetails(nfId: string): Promise<{ numero?: string; serie?: string; chaveAcesso?: string; situacao?: string }> {
+  const result = await tinyPost('nota.fiscal.obter.php', { id: nfId });
+  const nfData = result.retorno?.nota_fiscal;
+  if (!nfData) return {};
+  return {
+    numero: nfData.numero || undefined,
+    serie: nfData.serie || undefined,
+    chaveAcesso: nfData.chave_acesso || undefined,
+    situacao: nfData.situacao || undefined,
+  };
+}
+
+/**
  * Gera nota fiscal a partir do pedido (usa valores originais do pedido)
  * Fallback para quando não há endereço completo do cliente
  */
