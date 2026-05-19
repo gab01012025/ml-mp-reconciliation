@@ -201,6 +201,15 @@ export function isConnected(): boolean {
   return !!(tokens?.access_token && tokens?.refresh_token);
 }
 
+// === Public API: Reload tokens from disk (call after callback writes new tokens) ===
+export function reloadTokens(): void {
+  currentTokens = null;
+  const loaded = loadTokens();
+  if (loaded) {
+    console.log(`[SHOPEE] Tokens recarregados — shop_id=${loaded.shop_id}`);
+  }
+}
+
 // === Public API: Manual refresh ===
 export async function forceRefresh(): Promise<boolean> {
   return refreshAccessToken();
