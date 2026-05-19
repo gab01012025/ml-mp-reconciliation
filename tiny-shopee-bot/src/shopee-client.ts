@@ -162,17 +162,35 @@ async function shopeeApiCall(path: string, body: Record<string, any>): Promise<S
   }
 }
 
-// === Public API: Set Invoice Info ===
-export async function setInvoiceInfo(orderSn: string, invoiceNumber: string, invoiceSerialNumber: string, invoiceAccessKey: string): Promise<{ success: boolean; error?: string }> {
+// === Public API: Add Invoice Data (BR local seller) ===
+export async function setInvoiceInfo(
+  orderSn: string,
+  invoiceNumber: string,
+  invoiceSerialNumber: string,
+  invoiceAccessKey: string,
+  extraFields?: {
+    issueDate?: number;      // Unix timestamp
+    totalValue?: number;
+    productsTotalValue?: number;
+    taxCode?: string;
+  }
+): Promise<{ success: boolean; error?: string }> {
   console.log(`[SHOPEE] Enviando NF para pedido ${orderSn}: numero=${invoiceNumber} serie=${invoiceSerialNumber} chave=${invoiceAccessKey.slice(0, 10)}...`);
 
-  const result = await shopeeApiCall('/api/v2/order/set_invoice_data', {
+  const invoiceData: Record<string, any> = {
+    number: invoiceNumber,
+    series_number: invoiceSerialNumber,
+    access_key: invoiceAccessKey,
+  };
+
+  if (extraFields?.issueDate) invoiceData.issue_date = extraFields.issueDate;
+  if (extraFields?.totalValue != null) invoiceData.total_value = extraFields.totalValue;
+  if (extraFields?.productsTotalValue != null) invoiceData.products_total_value = extraFields.productsTotalValue;
+  if (extraFields?.taxCode) invoiceData.tax_code = extraFields.taxCode;
+
+  const result = await shopeeApiCall('/api/v2/order/add_invoice_data', {
     order_sn: orderSn,
-    invoice_data: {
-      number: invoiceNumber,
-      series_number: invoiceSerialNumber,
-      access_key: invoiceAccessKey,
-    },
+    invoice_data: invoiceData,
   });
 
   if (result.error) {

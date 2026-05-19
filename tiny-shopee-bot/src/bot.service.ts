@@ -205,11 +205,19 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
                 await sleep(1100);
                 const serie = nf.numero?.includes('-') ? nf.numero.split('-')[0] : '1';
                 const numero = nf.numero?.includes('-') ? nf.numero.split('-')[1] : (nf.numero || '');
+                const extraFields: { issueDate?: number; totalValue?: number; productsTotalValue?: number } = {
+                  issueDate: Math.floor(Date.now() / 1000),
+                };
+                if (nf.valorNota != null) {
+                  extraFields.totalValue = nf.valorNota;
+                  extraFields.productsTotalValue = nf.valorNota;
+                }
                 const result = await shopee.setInvoiceInfo(
                   detail.numero_ecommerce,
                   numero,
                   serie,
-                  nf.chaveAcesso
+                  nf.chaveAcesso,
+                  extraFields
                 );
                 if (result.success) {
                   console.log(`[BOT] NF enviada para Shopee com sucesso — pedido ${detail.numero_ecommerce}`);
@@ -578,10 +586,23 @@ export async function sendPendingNFsToShopee(customDataInicial?: string, customD
         const serie = nfData.serie || (nfData.numero?.includes('-') ? nfData.numero.split('-')[0] : '1');
         const numero = nfData.numero?.includes('-') ? nfData.numero.split('-')[1] : (nfData.numero || '');
 
+        // Campos extras para a API Shopee add_invoice_data
+        const extraFields: { issueDate?: number; totalValue?: number; productsTotalValue?: number } = {};
+        if (nfData.dataEmissao) {
+          // dataEmissao vem como "dd/mm/yyyy" do Tiny
+          const parts = nfData.dataEmissao.split('/');
+          if (parts.length === 3) {
+            const d = new Date(`${parts[2]}-${parts[1]}-${parts[0]}T12:00:00-03:00`);
+            if (!isNaN(d.getTime())) extraFields.issueDate = Math.floor(d.getTime() / 1000);
+          }
+        }
+        if (nfData.valorNota != null) extraFields.totalValue = nfData.valorNota;
+        if (nfData.valorProdutos != null) extraFields.productsTotalValue = nfData.valorProdutos;
+
         console.log(`[SHOPEE-NF] Enviando NF para pedido ${detail.numero_ecommerce}: numero=${numero} serie=${serie} chave=${nfData.chaveAcesso.slice(0, 10)}...`);
 
         await sleep(1100);
-        const sendResult = await shopee.setInvoiceInfo(detail.numero_ecommerce, numero, serie, nfData.chaveAcesso);
+        const sendResult = await shopee.setInvoiceInfo(detail.numero_ecommerce, numero, serie, nfData.chaveAcesso, extraFields);
 
         if (sendResult.success) {
           console.log(`[SHOPEE-NF] ✓ NF enviada com sucesso para pedido ${detail.numero_ecommerce}`);
