@@ -44,8 +44,8 @@ export const config = {
   shopeeDiscountPercent: parseFloat(process.env.SHOPEE_DISCOUNT_PERCENT || '95'),
 
   // Shopee Open Platform API
-  shopeePartnerId: process.env.SHOPEE_PARTNER_ID || '2034504',
-  shopeePartnerKey: process.env.SHOPEE_PARTNER_KEY || 'shpk4f5070634b41444467755a7a62745977614d4851525754524d7868526941',
+  shopeePartnerId: process.env.SHOPEE_PARTNER_ID || '2034866',
+  shopeePartnerKey: process.env.SHOPEE_PARTNER_KEY || 'shpk48715946546f67476d52765447477268684246654f4b6650794c724e4343',
   shopeeShopId: process.env.SHOPEE_SHOP_ID || '985573664',
   shopeeTokenStorePath: process.env.SHOPEE_TOKEN_STORE || '/app/data/shopee_tokens.json',
 };

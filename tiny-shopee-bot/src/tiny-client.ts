@@ -520,6 +520,76 @@ export async function getNFDetails(nfId: string): Promise<{ numero?: string; ser
 }
 
 /**
+ * Decodifica entidades HTML/XML (&lt; &gt; &amp; &quot; &apos;)
+ */
+function decodeXmlEntities(str: string): string {
+  return str
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'");
+}
+
+/**
+ * Obtém o XML da NF-e emitida pelo ID da nota fiscal.
+ * NOTA: Este endpoint do Tiny retorna XML puro (não JSON), mesmo com formato=json.
+ * Por isso fazemos a chamada diretamente sem usar tinyPost (que faz JSON.parse).
+ */
+export async function getNFXml(nfId: string): Promise<string | null> {
+  try {
+    const body = new URLSearchParams({
+      token: config.tinyToken,
+      id: nfId,
+    });
+
+    const response = await fetch(`${config.tinyApiUrl}/nota.fiscal.obter.xml.php`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+
+    const text = await response.text();
+
+    // A resposta é XML. Precisamos extrair o conteúdo de <xml_nfe> que contém o XML da NF-e.
+    // O XML da NF-e fica dentro de CDATA: <xml_nfe><![CDATA[...XML real...]]></xml_nfe>
+    const cdataMatch = text.match(/<xml_nfe><!\[CDATA\[([\s\S]*?)\]\]><\/xml_nfe>/);
+    if (cdataMatch && cdataMatch[1]) {
+      const xml = cdataMatch[1].trim();
+      console.log(`[TINY] XML da NF ${nfId} obtido (${xml.length} bytes)`);
+      return xml;
+    }
+
+    // Fallback: tenta extrair sem CDATA (conteúdo pode estar entity-encoded)
+    const tagMatch = text.match(/<xml_nfe>([\s\S]*?)<\/xml_nfe>/);
+    if (tagMatch && tagMatch[1]) {
+      let xml = tagMatch[1].trim();
+      // Só decodifica entidades se o conteúdo INTEIRO está entity-encoded
+      // (ou seja, começa com &lt; em vez de <). NÃO decodificar se o XML já tem tags normais,
+      // pois &amp; dentro de XML válido (ex: "LTDA &amp; CIA") é legítimo e decodificar corrompe o XML.
+      if (xml.startsWith('&lt;')) {
+        xml = decodeXmlEntities(xml);
+      }
+      console.log(`[TINY] XML da NF ${nfId} obtido (${xml.length} bytes)`);
+      return xml;
+    }
+
+    // Verifica se houve erro na resposta
+    const erroMatch = text.match(/<erros>[\s\S]*?<erro>([\s\S]*?)<\/erro>[\s\S]*?<\/erros>/);
+    if (erroMatch) {
+      console.warn(`[TINY] Erro ao obter XML da NF ${nfId}: ${erroMatch[1]}`);
+      return null;
+    }
+
+    console.warn(`[TINY] XML da NF ${nfId} não encontrado na resposta`);
+    return null;
+  } catch (err) {
+    console.error(`[TINY] Erro ao obter XML da NF ${nfId}:`, err);
+    return null;
+  }
+}
+
+/**
  * Gera nota fiscal a partir do pedido (usa valores originais do pedido)
  * Fallback para quando não há endereço completo do cliente
  */

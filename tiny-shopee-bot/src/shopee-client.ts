@@ -156,50 +156,208 @@ async function shopeeApiCall(path: string, body: Record<string, any>): Promise<S
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    return await res.json() as ShopeeApiResponse;
+    const rawText = await res.text();
+    try {
+      return JSON.parse(rawText) as ShopeeApiResponse;
+    } catch {
+      return { error: 'parse_error', message: `Status ${res.status}: ${rawText.slice(0, 200)}` };
+    }
   } catch (err: any) {
     return { error: 'fetch_error', message: err.message || String(err) };
   }
 }
 
-// === Public API: Add Invoice Data (BR local seller) ===
-export async function setInvoiceInfo(
-  orderSn: string,
-  invoiceNumber: string,
-  invoiceSerialNumber: string,
-  invoiceAccessKey: string,
-  extraFields?: {
-    issueDate?: number;      // Unix timestamp
-    totalValue?: number;
-    productsTotalValue?: number;
-    taxCode?: string;
+// === Shopee API GET helper (para endpoints que usam GET, como get_order_detail) ===
+async function shopeeApiGet(path: string, params: Record<string, string>): Promise<ShopeeApiResponse> {
+  const accessToken = await ensureValidToken();
+  if (!accessToken) {
+    return { error: 'no_token', message: 'Token não disponível. Re-autorize a loja.' };
   }
-): Promise<{ success: boolean; error?: string }> {
-  console.log(`[SHOPEE] Enviando NF para pedido ${orderSn}: numero=${invoiceNumber} serie=${invoiceSerialNumber} chave=${invoiceAccessKey.slice(0, 10)}...`);
 
-  const invoiceData: Record<string, any> = {
-    number: invoiceNumber,
-    series_number: invoiceSerialNumber,
-    access_key: invoiceAccessKey,
-  };
+  const shopId = currentTokens?.shop_id || String(SHOP_ID);
+  const timestamp = Math.floor(Date.now() / 1000);
+  const sign = generateSign(path, timestamp, accessToken, shopId);
 
-  if (extraFields?.issueDate) invoiceData.issue_date = extraFields.issueDate;
-  if (extraFields?.totalValue != null) invoiceData.total_value = extraFields.totalValue;
-  if (extraFields?.productsTotalValue != null) invoiceData.products_total_value = extraFields.productsTotalValue;
-  if (extraFields?.taxCode) invoiceData.tax_code = extraFields.taxCode;
-
-  const result = await shopeeApiCall('/api/v2/order/add_invoice_data', {
-    order_sn: orderSn,
-    invoice_data: invoiceData,
+  const queryParams = new URLSearchParams({
+    partner_id: String(PARTNER_ID),
+    timestamp: String(timestamp),
+    sign,
+    access_token: accessToken,
+    shop_id: shopId,
+    ...params,
   });
 
-  if (result.error) {
-    console.error(`[SHOPEE] Falha ao enviar NF para ${orderSn}:`, result);
-    return { success: false, error: `${result.error}: ${result.message || ''}` };
+  const url = `${BASE_URL}${path}?${queryParams.toString()}`;
+
+  try {
+    const res = await fetch(url, { method: 'GET' });
+    const rawText = await res.text();
+    try {
+      return JSON.parse(rawText) as ShopeeApiResponse;
+    } catch {
+      return { error: 'parse_error', message: `Status ${res.status}: ${rawText.slice(0, 200)}` };
+    }
+  } catch (err: any) {
+    return { error: 'fetch_error', message: err.message || String(err) };
+  }
+}
+
+// === Public API: Check if order already has invoice on Shopee ===
+export async function checkOrderInvoice(orderSn: string): Promise<{ hasInvoice: boolean; orderStatus?: string; error?: string }> {
+  try {
+    const result = await shopeeApiGet('/api/v2/order/get_order_detail', {
+      order_sn_list: orderSn,
+      response_optional_fields: 'order_status,invoice_data',
+    });
+
+    const orderInfo = result.response?.order_list?.[0];
+    if (!orderInfo) {
+      console.log(`[SHOPEE] Pedido ${orderSn}: sem dados (${result.error || 'N/A'})`);
+      return { hasInvoice: false, error: result.error || undefined };
+    }
+
+    const status = orderInfo.order_status || 'UNKNOWN';
+    const invoiceData = orderInfo.invoice_data;
+    const hasInvoice = !!(invoiceData && (invoiceData.number || invoiceData.invoice_number || invoiceData.access_key));
+
+    if (hasInvoice) {
+      console.log(`[SHOPEE] Pedido ${orderSn}: status=${status} já tem invoice (NF ${invoiceData.number || 'N/A'})`);
+    }
+    return { hasInvoice, orderStatus: status };
+  } catch (err: any) {
+    console.warn(`[SHOPEE] Falha ao verificar pedido ${orderSn}:`, err);
+    return { hasInvoice: false, error: err.message };
+  }
+}
+
+// === Public API: Download Invoice Doc (verifica se existe) ===
+export async function downloadInvoiceDoc(orderSn: string): Promise<{ exists: boolean }> {
+  try {
+    const result = await shopeeApiGet('/api/v2/order/download_invoice_doc', {
+      order_sn: orderSn,
+    });
+    // Se retornou sem erro, a invoice existe
+    if (!result.error) {
+      return { exists: true };
+    }
+    return { exists: false };
+  } catch {
+    return { exists: false };
+  }
+}
+
+// === Public API: Upload Invoice Doc (BR seller — multipart file upload) ===
+export async function uploadInvoiceDoc(
+  orderSn: string,
+  xmlContent: string,
+): Promise<{ success: boolean; error?: string }> {
+  // Garante que o XML tem declaração <?xml?> no início (Shopee pode exigir)
+  let xml = xmlContent;
+  if (!xml.startsWith('<?xml')) {
+    xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml;
   }
 
-  console.log(`[SHOPEE] NF enviada com sucesso para pedido ${orderSn}`);
-  return { success: true };
+  // Verifica se o pedido já tem invoice na Shopee (para evitar "File error" em duplicatas)
+  const invoiceCheck = await checkOrderInvoice(orderSn);
+  if (invoiceCheck.hasInvoice) {
+    console.log(`[SHOPEE] Pedido ${orderSn} já tem invoice na Shopee — pulando upload`);
+    return { success: true }; // Considera sucesso (já foi enviada antes)
+  }
+
+  console.log(`[SHOPEE] Enviando XML NF para pedido ${orderSn} (${xml.length} bytes) status=${invoiceCheck.orderStatus || 'N/A'}`);
+
+  const accessToken = await ensureValidToken();
+  if (!accessToken) {
+    return { success: false, error: 'no_token: Token não disponível. Re-autorize a loja.' };
+  }
+
+  const shopId = currentTokens?.shop_id || String(SHOP_ID);
+  const path = '/api/v2/order/upload_invoice_doc';
+  const timestamp = Math.floor(Date.now() / 1000);
+  const sign = generateSign(path, timestamp, accessToken, shopId);
+
+  const url = `${BASE_URL}${path}?partner_id=${PARTNER_ID}&timestamp=${timestamp}&sign=${sign}&access_token=${accessToken}&shop_id=${shopId}`;
+
+  // Constrói multipart/form-data com Buffer
+  const boundary = '----ShopeeUpload' + Date.now();
+  const CRLF = '\r\n';
+  const xmlBuffer = Buffer.from(xml, 'utf-8');
+
+  const parts: Buffer[] = [];
+
+  // order_sn
+  parts.push(Buffer.from(
+    `--${boundary}${CRLF}` +
+    `Content-Disposition: form-data; name="order_sn"${CRLF}${CRLF}` +
+    `${orderSn}${CRLF}`
+  ));
+
+  // file_type (1 = XML)
+  parts.push(Buffer.from(
+    `--${boundary}${CRLF}` +
+    `Content-Disposition: form-data; name="file_type"${CRLF}${CRLF}` +
+    `1${CRLF}`
+  ));
+
+  // file (XML content)
+  parts.push(Buffer.from(
+    `--${boundary}${CRLF}` +
+    `Content-Disposition: form-data; name="file"; filename="nfe_${orderSn}.xml"${CRLF}` +
+    `Content-Type: text/xml${CRLF}${CRLF}`
+  ));
+  parts.push(xmlBuffer);
+  parts.push(Buffer.from(`${CRLF}`));
+
+  // Closing boundary
+  parts.push(Buffer.from(`--${boundary}--${CRLF}`));
+
+  const body = Buffer.concat(parts);
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': String(body.length),
+      },
+      body,
+    });
+    const rawText = await res.text();
+
+    let result: ShopeeApiResponse;
+    try {
+      result = JSON.parse(rawText) as ShopeeApiResponse;
+    } catch {
+      return { success: false, error: `parse_error: Status ${res.status}: ${rawText.slice(0, 200)}` };
+    }
+
+    if (result.error) {
+      console.error(`[SHOPEE] Falha ao enviar NF para ${orderSn}: ${result.error} — ${result.message || ''}`);
+      return { success: false, error: `${result.error}: ${result.message || ''}` };
+    }
+
+    console.log(`[SHOPEE] NF XML enviada com sucesso para pedido ${orderSn}`);
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: `fetch_error: ${err.message || String(err)}` };
+  }
+}
+
+// === Compat wrapper: setInvoiceInfo now uses uploadInvoiceDoc when XML is provided ===
+export async function setInvoiceInfo(
+  orderSn: string,
+  _invoiceNumber: string,
+  _invoiceSerialNumber: string,
+  _invoiceAccessKey: string,
+  _extraFields?: any,
+  xmlContent?: string,
+): Promise<{ success: boolean; error?: string }> {
+  if (xmlContent) {
+    return uploadInvoiceDoc(orderSn, xmlContent);
+  }
+  // Fallback: try JSON endpoint (for backwards compat, though it returns 403 on BR)
+  console.warn(`[SHOPEE] Sem XML para pedido ${orderSn}, tentando upload sem XML...`);
+  return { success: false, error: 'no_xml: XML da NF-e é obrigatório para upload_invoice_doc' };
 }
 
 // === Public API: Get connection info ===

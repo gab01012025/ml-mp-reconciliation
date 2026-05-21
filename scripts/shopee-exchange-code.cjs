@@ -5,8 +5,8 @@
  */
 const crypto = require('crypto');
 
-const PARTNER_ID = '2034504';
-const PARTNER_KEY = 'shpk4f5070634b41444467755a7a62745977614d4851525754524d7868526941';
+const PARTNER_ID = '2034866';
+const PARTNER_KEY = 'shpk48715946546f67476d52765447477268684246654f4b6650794c724e4343';
 
 const code = process.argv[2];
 const shopId = process.argv[3] || '985573664';

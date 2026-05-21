@@ -9,6 +9,7 @@ import {
   createAndEmitNF,
   createAndEmitNFDiscounted,
   getNFDetails,
+  getNFXml,
   hasMaskedClientData,
   NFResult,
 } from './tiny-client';
@@ -199,30 +200,21 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
               dataProcessamento: new Date().toLocaleString('pt-BR'),
             });
 
-            // Envia NF para a Shopee via API
-            if (shopee.isConnected() && detail.numero_ecommerce && nf.chaveAcesso) {
+            // Envia NF XML para a Shopee via API
+            if (shopee.isConnected() && detail.numero_ecommerce && nf.nfId) {
               try {
                 await sleep(1100);
-                const serie = nf.numero?.includes('-') ? nf.numero.split('-')[0] : '1';
-                const numero = nf.numero?.includes('-') ? nf.numero.split('-')[1] : (nf.numero || '');
-                const extraFields: { issueDate?: number; totalValue?: number; productsTotalValue?: number } = {
-                  issueDate: Math.floor(Date.now() / 1000),
-                };
-                if (nf.valorNota != null) {
-                  extraFields.totalValue = nf.valorNota;
-                  extraFields.productsTotalValue = nf.valorNota;
-                }
-                const result = await shopee.setInvoiceInfo(
-                  detail.numero_ecommerce,
-                  numero,
-                  serie,
-                  nf.chaveAcesso,
-                  extraFields
-                );
-                if (result.success) {
-                  console.log(`[BOT] NF enviada para Shopee com sucesso — pedido ${detail.numero_ecommerce}`);
+                const xml = await getNFXml(nf.nfId);
+                if (xml) {
+                  await sleep(1100);
+                  const result = await shopee.uploadInvoiceDoc(detail.numero_ecommerce, xml);
+                  if (result.success) {
+                    console.log(`[BOT] NF XML enviada para Shopee com sucesso — pedido ${detail.numero_ecommerce}`);
+                  } else {
+                    console.warn(`[BOT] Falha ao enviar NF XML para Shopee: ${result.error}`);
+                  }
                 } else {
-                  console.warn(`[BOT] Falha ao enviar NF para Shopee: ${result.error}`);
+                  console.warn(`[BOT] XML da NF ${nf.nfId} não disponível — pulando envio para Shopee`);
                 }
               } catch (err) {
                 console.warn(`[BOT] Erro ao enviar NF para Shopee:`, err);
@@ -583,31 +575,24 @@ export async function sendPendingNFsToShopee(customDataInicial?: string, customD
           continue;
         }
 
-        const serie = nfData.serie || (nfData.numero?.includes('-') ? nfData.numero.split('-')[0] : '1');
-        const numero = nfData.numero?.includes('-') ? nfData.numero.split('-')[1] : (nfData.numero || '');
-
-        // Campos extras para a API Shopee add_invoice_data
-        const extraFields: { issueDate?: number; totalValue?: number; productsTotalValue?: number } = {};
-        if (nfData.dataEmissao) {
-          // dataEmissao vem como "dd/mm/yyyy" do Tiny
-          const parts = nfData.dataEmissao.split('/');
-          if (parts.length === 3) {
-            const d = new Date(`${parts[2]}-${parts[1]}-${parts[0]}T12:00:00-03:00`);
-            if (!isNaN(d.getTime())) extraFields.issueDate = Math.floor(d.getTime() / 1000);
-          }
+        // Busca XML da NF para upload
+        await sleep(1100);
+        const xml = await getNFXml(detail.id_nota_fiscal);
+        if (!xml) {
+          console.log(`[SHOPEE-NF] XML da NF ${detail.id_nota_fiscal} não disponível — pulando`);
+          result.skipped++;
+          continue;
         }
-        if (nfData.valorNota != null) extraFields.totalValue = nfData.valorNota;
-        if (nfData.valorProdutos != null) extraFields.productsTotalValue = nfData.valorProdutos;
 
-        console.log(`[SHOPEE-NF] Enviando NF para pedido ${detail.numero_ecommerce}: numero=${numero} serie=${serie} chave=${nfData.chaveAcesso.slice(0, 10)}...`);
+        console.log(`[SHOPEE-NF] Enviando XML NF para pedido ${detail.numero_ecommerce} (${xml.length} bytes)...`);
 
         await sleep(1100);
-        const sendResult = await shopee.setInvoiceInfo(detail.numero_ecommerce, numero, serie, nfData.chaveAcesso, extraFields);
+        const sendResult = await shopee.uploadInvoiceDoc(detail.numero_ecommerce, xml);
 
         if (sendResult.success) {
           console.log(`[SHOPEE-NF] ✓ NF enviada com sucesso para pedido ${detail.numero_ecommerce}`);
           result.sent++;
-          result.details.push(`✓ ${detail.numero_ecommerce}: NF ${numero} enviada`);
+          result.details.push(`✓ ${detail.numero_ecommerce}: NF XML enviada`);
         } else {
           console.warn(`[SHOPEE-NF] ✗ Falha ao enviar NF para ${detail.numero_ecommerce}: ${sendResult.error}`);
           result.errors++;
