@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as cron from 'node-cron';
 import * as XLSX from 'xlsx';
 import { config } from './config';
-import { processNewShopeeOrders, processMercadoLivreOrdersForDate, processMercadoLivreByCollectionDate, clearProcessedOrders, sendPendingNFsToShopee, ProcessedNF, processSingleShopeeOrder, SingleOrderResult } from './bot.service';
+import { processNewShopeeOrders, processMercadoLivreOrdersForDate, processMercadoLivreByCollectionDate, clearProcessedOrders, sendPendingNFsToShopee, ProcessedNF, processSingleShopeeOrder } from './bot.service';
 import { getLogs } from './log-buffer';
 import * as ml from './ml-client';
 import * as shopeeClient from './shopee-client';
@@ -682,10 +682,12 @@ const server = http.createServer(async (req, res) => {
       discountPercent: config.shopeeDiscountPercent,
     }));
 
-  // === Shopee: batch download all labels ===
+  // === Shopee: batch download all labels (PDF único) ===
   } else if (url.pathname === '/shopee/labels-batch' && req.method === 'GET') {
     try {
       console.log('[SHOPEE] Download em lote de etiquetas (PDF único) iniciado...');
+
+      // 1) Lista todos os pedidos READY_TO_SHIP + PROCESSED
       const allOrders: Array<{ order_sn: string; status: string }> = [];
       for (const status of ['READY_TO_SHIP', 'PROCESSED']) {
         const listResult = await shopeeClient.getOrderList({ orderStatus: status });
@@ -702,13 +704,36 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Filtra apenas pedidos com NF (os sem NF não podem gerar etiqueta)
+      // 2) Pré-filtra: verifica NF antes de preparar (em batches de 5 em paralelo)
+      console.log(`[SHOPEE] Batch: verificando NF de ${allOrders.length} pedidos...`);
+      const withNF: Array<{ order_sn: string; status: string }> = [];
+      for (let i = 0; i < allOrders.length; i += 5) {
+        const batch = allOrders.slice(i, i + 5);
+        const checks = await Promise.all(
+          batch.map(async (o) => {
+            const inv = await shopeeClient.checkOrderInvoice(o.order_sn);
+            return { ...o, hasNF: inv.hasInvoice, orderStatus: inv.orderStatus || o.status };
+          })
+        );
+        for (const c of checks) {
+          if (c.hasNF) withNF.push({ order_sn: c.order_sn, status: c.orderStatus });
+        }
+      }
+      console.log(`[SHOPEE] Batch: ${withNF.length}/${allOrders.length} pedidos com NF`);
+
+      if (withNF.length === 0) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Nenhum pedido com NF encontrado' }));
+        return;
+      }
+
+      // 3) Prepara apenas pedidos com NF (ship_order + create_shipping_document)
       const prepareResults: shopeeClient.PrepareResult[] = [];
-      for (const order of allOrders) {
+      for (const order of withNF) {
         const prepResult = await shopeeClient.prepareShippingLabel(order.order_sn);
         prepareResults.push(prepResult);
         if (prepResult.success) {
-          await new Promise(r => setTimeout(r, 1500)); // Delay entre preparações
+          await new Promise(r => setTimeout(r, 1500));
         }
       }
 
@@ -722,34 +747,46 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Aguarda documentos ficarem prontos
+      // 4) Aguarda documentos ficarem prontos
       console.log(`[SHOPEE] Batch: aguardando documentos ficarem prontos...`);
       await new Promise(r => setTimeout(r, 5000));
 
-      // Download único de todos os pedidos preparados → PDF combinado
-      const batchResult = await shopeeClient.downloadShippingDocumentBatch(
-        prepared.map(p => ({ order_sn: p.order_sn, docType: p.docType }))
-      );
+      // 5) Download único de todos os pedidos preparados → PDF combinado
+      //    Shopee aceita até 50 por chamada; se tiver mais, faz em chunks
+      const BATCH_DL_SIZE = 50;
+      const allPdfs: Buffer[] = [];
+      for (let i = 0; i < prepared.length; i += BATCH_DL_SIZE) {
+        const chunk = prepared.slice(i, i + BATCH_DL_SIZE);
+        const batchResult = await shopeeClient.downloadShippingDocumentBatch(
+          chunk.map(p => ({ order_sn: p.order_sn, docType: p.docType }))
+        );
+        if (batchResult.success && batchResult.pdf) {
+          allPdfs.push(batchResult.pdf);
+        } else {
+          console.log(`[SHOPEE] Batch chunk ${i}..${i + chunk.length} falhou: ${batchResult.error}`);
+        }
+      }
 
-      if (batchResult.success && batchResult.pdf) {
+      if (allPdfs.length > 0) {
+        // Se só tem um chunk, retorna direto; se múltiplos, concatena os buffers
+        const finalPdf = allPdfs.length === 1 ? allPdfs[0] : Buffer.concat(allPdfs);
         const filename = `etiquetas_shopee_${new Date().toISOString().slice(0, 10)}.pdf`;
         res.writeHead(200, {
           'Content-Type': 'application/pdf',
           'Content-Disposition': `attachment; filename="${filename}"`,
-          'Content-Length': String(batchResult.pdf.length),
+          'Content-Length': String(finalPdf.length),
         });
-        res.end(batchResult.pdf);
-        console.log(`[SHOPEE] Batch: PDF único ${batchResult.pdf.length} bytes (${prepared.length} etiquetas)`);
+        res.end(finalPdf);
+        console.log(`[SHOPEE] Batch: PDF único ${finalPdf.length} bytes (${prepared.length} etiquetas)`);
       } else {
-        // Fallback: se batch falhou, tenta download individual
-        console.log(`[SHOPEE] Batch download falhou (${batchResult.error}), tentando individual...`);
+        // Fallback: tenta download individual e retorna o primeiro
+        console.log(`[SHOPEE] Batch download falhou, tentando individual...`);
         const pdfs: Buffer[] = [];
         for (const p of prepared) {
           const dlResult = await shopeeClient.downloadShippingDocument(p.order_sn, p.docType);
           if (dlResult.success && dlResult.pdf) pdfs.push(dlResult.pdf);
         }
         if (pdfs.length > 0) {
-          // Retorna o primeiro como PDF (infelizmente sem combinar sem lib externa)
           res.writeHead(200, {
             'Content-Type': 'application/pdf',
             'Content-Disposition': `attachment; filename="etiqueta_shopee_${prepared[0].order_sn}.pdf"`,
@@ -760,7 +797,7 @@ const server = http.createServer(async (req, res) => {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
             ok: false,
-            error: `Batch falhou: ${batchResult.error}. Individual também falhou.`,
+            error: `Batch e individual falharam.`,
             prepared: prepared.length,
             failed: failed.length,
             details: prepareResults,
@@ -1047,109 +1084,84 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: err.message || String(err) }));
     }
 
-  // === Relatório de separação: busca detalhes dos pedidos do CSV (ou checklist como fallback) ===
+  // === Relatório de separação: busca pedidos READY_TO_SHIP + PROCESSED da Shopee API ===
   } else if (url.pathname === '/shopee/picking-list' && req.method === 'GET') {
     try {
-      let csv = '';
-      try { csv = fs.readFileSync(SHOPEE_CSV_PATH, 'utf-8'); } catch {}
+      // Parâmetro opcional: ?status=all (padrão) ou ?status=processed
+      const statusFilter = url.searchParams.get('status') || 'all';
+      console.log(`[PICKING] Buscando pedidos na Shopee API (filtro: ${statusFilter})...`);
 
-      // Fallback: se CSV vazio, tenta montar a partir do checklist
-      if (!csv.trim()) {
-        let checklist: ChecklistItem[] = [];
-        try { checklist = JSON.parse(fs.readFileSync(CHECKLIST_PATH, 'utf-8')); } catch {}
-        const shopeeItems = checklist.filter(c => c.nfId && c.numeroPedido);
-        if (shopeeItems.length > 0) {
-          const fallbackLines = ['ID do pedido,Chave de Acesso,NF ID'];
-          for (const item of shopeeItems) {
-            fallbackLines.push(`${item.numeroPedido},${item.chaveAcesso || ''},${item.nfId}`);
-          }
-          csv = fallbackLines.join('\n');
-          console.log(`[PICKING] CSV vazio — usando ${shopeeItems.length} itens do checklist como fallback`);
+      const allOrderSns: string[] = [];
+
+      // Busca READY_TO_SHIP (pedidos aguardando envio)
+      if (statusFilter === 'all' || statusFilter === 'ready') {
+        const rtsResult = await shopeeClient.getAllOrdersByStatus('READY_TO_SHIP', 15);
+        if (rtsResult.success && rtsResult.orderSns.length > 0) {
+          allOrderSns.push(...rtsResult.orderSns);
         }
       }
 
-      if (!csv.trim()) {
+      // Busca PROCESSED (pedidos com envio já agendado)
+      if (statusFilter === 'all' || statusFilter === 'processed') {
+        const procResult = await shopeeClient.getAllOrdersByStatus('PROCESSED', 15);
+        if (procResult.success && procResult.orderSns.length > 0) {
+          const existing = new Set(allOrderSns);
+          for (const sn of procResult.orderSns) {
+            if (!existing.has(sn)) allOrderSns.push(sn);
+          }
+        }
+      }
+
+      if (allOrderSns.length === 0) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'Nenhuma NF encontrada — processe pedidos Shopee primeiro' }));
+        res.end(JSON.stringify({
+          ok: false,
+          error: 'Nenhum pedido READY_TO_SHIP ou PROCESSED encontrado na Shopee nos últimos 15 dias',
+        }));
         return;
       }
 
-      const lines = csv.trim().split('\n');
-      const firstLine = lines[0].toLowerCase();
-      const hasHeader = firstLine.includes('pedido') || firstLine.includes('chave') || firstLine.includes('numero');
-      const startIdx = hasHeader ? 1 : 0;
+      console.log(`[PICKING] Total de pedidos encontrados: ${allOrderSns.length}`);
 
-      const pickingOrders: Array<{ order_sn: string; chaveAcesso: string; nfId: string }> = [];
-      for (let i = startIdx; i < lines.length; i++) {
-        const parts = lines[i].split(/[,;]/);
-        if (parts.length >= 2 && parts[0].trim()) {
-          const orderSn = parts[0].trim();
-          const chaveAcesso = (parts[1] || '').trim();
-          const nfId = (parts[2] || '').trim();
-          pickingOrders.push({ order_sn: orderSn, chaveAcesso, nfId });
-        }
-      }
+      // 2) Busca detalhes (itens + invoice_data) em batches de 50
+      const allDetails = await shopeeClient.getOrdersDetail(allOrderSns);
+      const withInvoice = allDetails.filter(d => d.has_invoice).length;
+      const withoutInvoice = allDetails.length - withInvoice;
+      console.log(`[PICKING] ${allDetails.length} pedidos: ${withInvoice} com NF, ${withoutInvoice} sem NF`);
 
-      if (pickingOrders.length === 0) {
+      if (allDetails.length === 0) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'Nenhum pedido no CSV' }));
+        res.end(JSON.stringify({ ok: false, error: 'Nenhum detalhe retornado pela Shopee API' }));
         return;
       }
 
-      // Recupera nfIds faltantes do checklist (CSV antigo sem terceira coluna)
-      const missing = pickingOrders.filter(o => !o.nfId);
-      if (missing.length > 0) {
-        let checklist: ChecklistItem[] = [];
-        try { checklist = JSON.parse(fs.readFileSync(CHECKLIST_PATH, 'utf-8')); } catch {}
-        if (checklist.length > 0) {
-          // Mapa 1: numeroPedido -> nfId
-          const byPedido = new Map<string, string>();
-          // Mapa 2: chaveAcesso -> nfId (fallback mais confiável)
-          const byChave = new Map<string, string>();
-          for (const item of checklist) {
-            if (item.nfId) {
-              if (item.numeroPedido) byPedido.set(item.numeroPedido, item.nfId);
-              if (item.chaveAcesso) byChave.set(item.chaveAcesso, item.nfId);
-            }
-          }
-          for (const o of missing) {
-            // Tenta por numeroPedido primeiro, depois por chaveAcesso
-            const found = byPedido.get(o.order_sn) || byChave.get(o.chaveAcesso);
-            if (found) o.nfId = found;
-          }
-          const recovered = missing.filter(o => o.nfId).length;
-          console.log(`[PICKING] Recuperados ${recovered}/${missing.length} nfIds do checklist (${checklist.length} itens no checklist)`);
-        } else {
-          console.log(`[PICKING] Checklist vazio — não foi possível recuperar nfIds`);
-        }
-      }
-
-      console.log(`[PICKING] Buscando detalhes de ${pickingOrders.length} NFs direto no Tiny (por nfId)...`);
-      const tinyResults = await tinyClient.getPickingItemsByNfIds(pickingOrders);
-
-      // Monta linhas do relatório com dados do Tiny (kits desmembrados, SKUs corretos)
+      // 3) Monta linhas do relatório — TODOS os pedidos (sem filtro has_invoice)
       interface PickingRow {
         order_sn: string;
         sku: string;
         product: string;
         quantity: number;
+        hasNF: boolean;
+        orderStatus: string;
       }
       const rows: PickingRow[] = [];
       const returnedSns = new Set<string>();
-      for (const r of tinyResults) {
-        if (r.items.length > 0) {
-          returnedSns.add(r.order_sn);
-          for (const item of r.items) {
+      for (const order of allDetails) {
+        if (order.items.length > 0) {
+          returnedSns.add(order.order_sn);
+          for (const item of order.items) {
+            const sku = item.model_sku || item.item_sku || '-';
             rows.push({
-              order_sn: r.order_sn,
-              sku: item.sku || '-',
-              product: item.descricao || '-',
-              quantity: item.quantidade,
+              order_sn: order.order_sn,
+              sku,
+              product: item.item_name + (item.model_name ? ` (${item.model_name})` : ''),
+              quantity: item.quantity,
+              hasNF: order.has_invoice,
+              orderStatus: order.order_status,
             });
           }
         } else {
-          // Pedido não encontrado no Tiny ou sem itens
-          rows.push({ order_sn: r.order_sn, sku: '⚠', product: 'Erro ao buscar — tente gerar novamente', quantity: 0 });
+          rows.push({ order_sn: order.order_sn, sku: '⚠', product: 'Sem itens retornados pela Shopee', quantity: 0, hasNF: order.has_invoice, orderStatus: order.order_status });
         }
       }
 
@@ -1175,12 +1187,16 @@ const server = http.createServer(async (req, res) => {
       for (const r of rows) {
         seq++;
         const notAvailable = !returnedSns.has(r.order_sn);
-        tableRows += '<tr data-sku="' + (r.sku + '||' + r.product).replace(/"/g, '&quot;') + '" data-qty="' + r.quantity + '"' + (notAvailable ? ' style="color:#999;"' : '') + '>' +
+        const nfIcon = r.hasNF ? '✓' : '—';
+        const nfColor = r.hasNF ? 'color:#16a34a;' : 'color:#999;';
+        const statusLabel = r.orderStatus === 'PROCESSED' ? 'ENV' : 'RTS';
+        tableRows += '<tr data-sku="' + (r.sku + '||' + r.product).replace(/"/g, '&quot;') + '" data-qty="' + r.quantity + '" data-nf="' + (r.hasNF ? '1' : '0') + '" data-status="' + r.orderStatus + '"' + (notAvailable ? ' style="color:#999;"' : '') + '>' +
           '<td style="text-align:center;">' + seq + '</td>' +
           '<td>' + r.order_sn + '</td>' +
           '<td>' + r.sku + '</td>' +
           '<td>' + r.product + '</td>' +
           '<td style="text-align:center;">' + r.quantity + '</td>' +
+          '<td style="text-align:center;' + nfColor + '" title="' + r.orderStatus + '">' + nfIcon + '</td>' +
           '<td style="text-align:center;">☐</td>' +
           '</tr>';
       }
@@ -1215,7 +1231,7 @@ const server = http.createServer(async (req, res) => {
   @media print { .toolbar, .msg-box { display: none !important; } body { padding: 0; } }
 </style></head><body>
 <h1>Relatório de Separação</h1>
-<div class="subtitle">Data: ${now} — <span id="visibleCount">${seq}</span> itens de <span id="visibleOrders">${pickingOrders.length}</span> pedidos</div>
+<div class="subtitle">Data: ${now} — <span id="visibleCount">${seq}</span> itens de <span id="visibleOrders">${allDetails.length}</span> pedidos (Shopee API: ${allDetails.length} total, ${withInvoice} com NF, ${withoutInvoice} sem NF)</div>
 
 <div class="toolbar">
   <label>Filtrar produto:</label>
@@ -1227,6 +1243,12 @@ const server = http.createServer(async (req, res) => {
   <input type="number" id="filterQtyMin" min="0" value="" placeholder="0" style="width:60px;" onchange="applyFilters()">
   <label>Qtd máxima:</label>
   <input type="number" id="filterQtyMax" min="0" value="" placeholder="∞" style="width:60px;" onchange="applyFilters()">
+  <label>NF:</label>
+  <select id="filterNF" onchange="applyFilters()">
+    <option value="">— Todos —</option>
+    <option value="1">Com NF</option>
+    <option value="0">Sem NF</option>
+  </select>
   <button class="btn-reset" onclick="resetFilters()">Limpar filtros</button>
   <span style="flex:1;"></span>
   <button class="btn-label" onclick="downloadAllLabels()">🏷️ Gerar Etiquetas dos Pedidos</button>
@@ -1241,6 +1263,7 @@ const server = http.createServer(async (req, res) => {
     <th>SKU</th>
     <th>Produto</th>
     <th style="width:40px;">Qtd</th>
+    <th style="width:35px;">NF</th>
     <th style="width:40px;">✓</th>
   </tr></thead>
   <tbody id="pickingBody">${tableRows}</tbody>
@@ -1255,6 +1278,7 @@ const server = http.createServer(async (req, res) => {
     var skuFilter = document.getElementById('filterSku').value;
     var qtyMin = parseInt(document.getElementById('filterQtyMin').value) || 0;
     var qtyMax = parseInt(document.getElementById('filterQtyMax').value) || 999999;
+    var nfFilter = document.getElementById('filterNF').value;
     var rows = document.querySelectorAll('#pickingBody tr');
     var visible = 0;
     var visibleOrders = new Set();
@@ -1262,9 +1286,11 @@ const server = http.createServer(async (req, res) => {
     rows.forEach(function(row) {
       var sku = row.getAttribute('data-sku') || '';
       var qty = parseInt(row.getAttribute('data-qty')) || 0;
+      var nf = row.getAttribute('data-nf') || '';
       var show = true;
       if (skuFilter && sku !== skuFilter) show = false;
       if (qty < qtyMin || qty > qtyMax) show = false;
+      if (nfFilter && nf !== nfFilter) show = false;
       if (show) {
         row.classList.remove('hidden-row');
         visible++;
@@ -1283,6 +1309,7 @@ const server = http.createServer(async (req, res) => {
     document.getElementById('filterSku').value = '';
     document.getElementById('filterQtyMin').value = '';
     document.getElementById('filterQtyMax').value = '';
+    document.getElementById('filterNF').value = '';
     applyFilters();
   }
 
@@ -1324,7 +1351,7 @@ const server = http.createServer(async (req, res) => {
         'Content-Disposition': `inline; filename="relatorio_separacao_${new Date().toISOString().slice(0, 10)}.html"`,
       });
       res.end(html);
-      console.log(`[PICKING] Relatório gerado: ${seq} itens de ${tinyResults.length} pedidos`);
+      console.log(`[PICKING] Relatório gerado: ${seq} itens de ${allDetails.length} pedidos (via Shopee API)`);
     } catch (err: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message || String(err) }));
@@ -1353,9 +1380,9 @@ const server = http.createServer(async (req, res) => {
       try {
         const result = await processSingleShopeeOrder(sn);
 
-        // Se gerou NF (com ou sem chaveAcesso), adiciona ao histórico/CSV/checklist.
-        // A chaveAcesso pode demorar a chegar do SEFAZ — não devemos bloquear o CSV por isso.
-        // O nfId é suficiente para o relatório de separação funcionar.
+        // Sempre adiciona ao CSV/checklist quando NF existe (nova ou pré-existente)
+        let csvAdded = false;
+        let checklistAdded = false;
         if (result.nf && (result.nf.chaveAcesso || result.nf.nfId)) {
           const processedNF: ProcessedNF = {
             numero: result.nf.numero,
@@ -1368,13 +1395,45 @@ const server = http.createServer(async (req, res) => {
           };
           nfHistory.unshift(processedNF);
           if (nfHistory.length > MAX_NF_HISTORY) nfHistory.splice(MAX_NF_HISTORY);
-          appendToShopeeCSV([processedNF]);
-          addToChecklist([processedNF], 'Shopee');
           totalNFsEmitted++;
+
+          // CSV — com logging detalhado
+          try {
+            const csvBefore = (() => { try { return fs.readFileSync(SHOPEE_CSV_PATH, 'utf-8'); } catch { return ''; } })();
+            const linesBefore = csvBefore.trim().split('\n').filter(l => l.trim()).length;
+            appendToShopeeCSV([processedNF]);
+            const csvAfter = (() => { try { return fs.readFileSync(SHOPEE_CSV_PATH, 'utf-8'); } catch { return ''; } })();
+            const linesAfter = csvAfter.trim().split('\n').filter(l => l.trim()).length;
+            csvAdded = linesAfter > linesBefore;
+            console.log(`[SINGLE] CSV: antes=${linesBefore} linhas, depois=${linesAfter} linhas, adicionado=${csvAdded}`);
+            if (!csvAdded) {
+              // Pode ser duplicata — verifica se já existe
+              const alreadyInCSV = csvAfter.includes(sn);
+              console.log(`[SINGLE] CSV: pedido ${sn} ${alreadyInCSV ? 'JÁ ESTAVA no CSV' : 'NÃO está no CSV (possível erro de escrita)'}`);
+              if (alreadyInCSV) csvAdded = true; // já existia = OK
+            }
+          } catch (csvErr: any) {
+            console.error(`[SINGLE] ERRO ao escrever CSV: ${csvErr.message}`);
+          }
+
+          // Checklist
+          try {
+            addToChecklist([processedNF], 'Shopee');
+            checklistAdded = true;
+          } catch (clErr: any) {
+            console.error(`[SINGLE] ERRO ao escrever checklist: ${clErr.message}`);
+          }
         }
 
+        // Adiciona flags ao resultado para a UI mostrar
+        const responseData = {
+          ...result,
+          csvAdded,
+          checklistAdded,
+        };
+
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(result));
+        res.end(JSON.stringify(responseData));
       } finally {
         if (!wasAutoPaused) automationPaused = false;
       }
@@ -1921,8 +1980,14 @@ async function processarAuto() {
     }
 
     var h = '';
+    // Verifica se a NF foi gerada mas o envio para Shopee falhou
+    var nfGerada = d.nf && (d.nf.chaveAcesso || d.nf.nfId);
+    var envioFalhou = !d.nfSent && nfGerada;
+
     if (d.success) {
       h += '<div class="msg msg-ok" style="display:block;margin-bottom:14px;">Pedido ' + orderSn + ' processado com sucesso!</div>';
+    } else if (nfGerada && envioFalhou) {
+      h += '<div class="msg msg-info" style="display:block;margin-bottom:14px;">NF gerada com sucesso, mas o envio autom\u00e1tico para a Shopee falhou. Use a planilha XLSX no dashboard para enviar em lote.</div>';
     } else {
       h += '<div class="msg msg-err" style="display:block;margin-bottom:14px;">Processamento parou com erro. Veja os detalhes abaixo.</div>';
     }
@@ -1948,10 +2013,28 @@ async function processarAuto() {
     h += '</div>';
 
     // NF info
-    if (d.nf && d.nf.chaveAcesso) {
+    if (nfGerada) {
       h += '<div style="margin-top:14px;padding:12px;background:#f0fdf4;border-radius:8px;border:1px solid #bbf7d0;font-size:13px;">';
       h += '<strong>NF:</strong> ' + (d.nf.numero || d.nf.nfId) + ' &mdash; R$ ' + (d.nf.valorNota || 0).toFixed(2);
-      h += '<br><strong>Chave:</strong> <span style="font-family:monospace;font-size:11px;word-break:break-all;">' + d.nf.chaveAcesso + '</span>';
+      if (d.nf.chaveAcesso) {
+        h += '<br><strong>Chave:</strong> <span style="font-family:monospace;font-size:11px;word-break:break-all;">' + d.nf.chaveAcesso + '</span>';
+      }
+      h += '</div>';
+    }
+
+    // Status do CSV/checklist
+    if (nfGerada) {
+      h += '<div style="margin-top:10px;padding:10px 12px;background:#eff6ff;border-radius:8px;border:1px solid #bfdbfe;font-size:12px;color:#1e40af;">';
+      h += '<strong>Integra\u00e7\u00e3o:</strong> ';
+      if (d.csvAdded) {
+        h += 'Planilha CSV/XLSX atualizada &mdash; ';
+      } else {
+        h += '<span style="color:#dc2626;">CSV N\u00c3O atualizado (verifique logs)</span> &mdash; ';
+      }
+      if (d.checklistAdded) {
+        h += 'Checklist atualizado &mdash; ';
+      }
+      h += 'Relat\u00f3rio de separa\u00e7\u00e3o dispon\u00edvel';
       h += '</div>';
     }
 
@@ -2780,7 +2863,7 @@ function getDashboardHtml(): string {
 
           <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
           <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Relatório de Separação (Picking List)</p>
-          <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Gera um relatório A4 imprimível com os pedidos do CSV atual: ID do pedido, destinatário, produto, quantidade e SKU. Use para conferência na separação dos pedidos.</p>
+          <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Puxa direto da Shopee API todos os pedidos prontos para envio (A Enviar + Processados). Mostra SKU, produto e quantidade para separação no estoque. Filtro por NF disponível.</p>
           <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:16px;">
             <button class="btn btn-primary btn-sm" onclick="openPickingList()" style="background:#7c3aed;">📋 Gerar Relatório de Separação</button>
             <span style="font-size:12px; color:#888;">Abre em nova aba para impressão</span>
@@ -2824,7 +2907,7 @@ function getDashboardHtml(): string {
 
           <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:12px; padding:12px 16px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0;">
             <button class="btn btn-primary btn-sm" id="btnListLabels" onclick="listAvailableLabels()">📋 Listar Pedidos Disponíveis</button>
-            <button class="btn btn-primary btn-sm" id="btnBatchShopee" onclick="batchDownloadShopee()" style="background:#16a34a;">📥 Baixar Todas Etiquetas</button>
+            <button class="btn btn-primary btn-sm" id="btnBatchShopee" onclick="batchDownloadShopee()" style="background:#16a34a;">📥 Baixar Todas Etiquetas (PDF único)</button>
             <span id="labelsAvailableInfo" style="font-size:12px; color:#888;"></span>
           </div>
 
@@ -3414,50 +3497,31 @@ function getDashboardHtml(): string {
       btn.disabled = false; btn.textContent = '📋 Listar Pedidos Disponíveis';
     }
 
-    // === Shopee batch download ===
+    // === Shopee batch download (PDF único) ===
     async function batchDownloadShopee() {
       var btn = document.getElementById('btnBatchShopee');
-      btn.disabled = true; btn.textContent = '⏳ Baixando todas...';
+      btn.disabled = true; btn.textContent = '⏳ Preparando etiquetas...';
+      showMsg('msgLabel', 'Gerando PDF único com todas as etiquetas... isso pode levar alguns minutos.', true);
       try {
-        // List available orders first
-        var lr = await fetch('/shopee/labels-available', { headers: authHeaders });
-        if (lr.status === 401) { handleAuthError(); return; }
-        var listData = await lr.json();
-        if (!listData.orders || listData.orders.length === 0) {
-          showMsg('msgLabel', 'Nenhum pedido disponível para etiqueta', false);
-          btn.disabled = false; btn.textContent = '📥 Baixar Todas Etiquetas';
-          return;
+        var r = await fetch('/shopee/labels-batch', { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var ct = r.headers.get('content-type') || '';
+        if (ct.includes('application/pdf')) {
+          var blob = await r.blob();
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement('a');
+          a.href = url;
+          a.download = 'etiquetas_shopee_' + new Date().toISOString().slice(0, 10) + '.pdf';
+          a.click();
+          URL.revokeObjectURL(url);
+          var sizeKB = Math.round(blob.size / 1024);
+          showMsg('msgLabel', 'PDF único baixado com sucesso (' + sizeKB + ' KB)', true);
+        } else {
+          var d = await r.json();
+          showMsg('msgLabel', 'Erro: ' + (d.error || 'Não foi possível gerar o PDF'), false);
         }
-
-        var total = listData.orders.length;
-        var downloaded = 0;
-        var failed = 0;
-        showMsg('msgLabel', 'Baixando ' + total + ' etiquetas...', true);
-
-        for (var i = 0; i < listData.orders.length; i++) {
-          var o = listData.orders[i];
-          btn.textContent = '⏳ ' + (i+1) + '/' + total + '...';
-          try {
-            var r = await fetch('/shopee/shipping-label?order_sn=' + encodeURIComponent(o.order_sn), { headers: authHeaders });
-            if (r.status === 401) { handleAuthError(); return; }
-            var ct = r.headers.get('content-type') || '';
-            if (ct.includes('application/pdf')) {
-              var blob = await r.blob();
-              var url = URL.createObjectURL(blob);
-              var a = document.createElement('a');
-              a.href = url; a.download = 'etiqueta_' + o.order_sn + '.pdf'; a.click();
-              URL.revokeObjectURL(url);
-              downloaded++;
-            } else {
-              failed++;
-            }
-          } catch(e) { failed++; }
-          // Small delay to not overwhelm API
-          await new Promise(function(r) { setTimeout(r, 500); });
-        }
-        showMsg('msgLabel', downloaded + ' etiquetas baixadas' + (failed > 0 ? ', ' + failed + ' falharam' : ''), downloaded > 0);
       } catch(e) { showMsg('msgLabel', 'Erro: ' + e.message, false); }
-      btn.disabled = false; btn.textContent = '📥 Baixar Todas Etiquetas';
+      btn.disabled = false; btn.textContent = '📥 Baixar Todas Etiquetas (PDF único)';
     }
 
     // === ML Labels ===

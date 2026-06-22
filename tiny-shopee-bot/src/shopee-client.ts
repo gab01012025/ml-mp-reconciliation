@@ -270,6 +270,7 @@ export interface OrderDetailInfo {
   recipient_phone: string;
   total_amount: number;
   items: OrderItemInfo[];
+  has_invoice: boolean;
 }
 
 /**
@@ -287,7 +288,7 @@ export async function getOrdersDetail(orderSns: string[]): Promise<OrderDetailIn
     try {
       const result = await shopeeApiGet('/api/v2/order/get_order_detail', {
         order_sn_list: batch.join(','),
-        response_optional_fields: 'order_status,item_list,buyer_username,recipient_address,total_amount',
+        response_optional_fields: 'order_status,item_list,buyer_username,recipient_address,total_amount,invoice_data',
       });
 
       const orders = result.response?.order_list || [];
@@ -302,6 +303,10 @@ export async function getOrdersDetail(orderSns: string[]): Promise<OrderDetailIn
           price: it.model_discounted_price || it.model_original_price || 0,
         }));
 
+        // Verifica se o pedido já tem NF enviada (invoice_data preenchido)
+        const inv = o.invoice_data;
+        const hasInvoice = !!(inv && (inv.number || inv.access_key));
+
         results.push({
           order_sn: o.order_sn,
           order_status: o.order_status || '',
@@ -310,6 +315,7 @@ export async function getOrdersDetail(orderSns: string[]): Promise<OrderDetailIn
           recipient_phone: o.recipient_address?.phone || '',
           total_amount: o.total_amount || 0,
           items,
+          has_invoice: hasInvoice,
         });
       }
     } catch (err: any) {
@@ -1085,6 +1091,60 @@ export async function getOrderList(options: {
   } catch (err: any) {
     return { success: false, error: err.message || String(err) };
   }
+}
+
+// === Public API: Get ALL orders by status with cursor pagination ===
+export async function getAllOrdersByStatus(
+  orderStatus: string,
+  lookbackDays: number = 15,
+): Promise<{ success: boolean; orderSns: string[]; error?: string }> {
+  const timeTo = Math.floor(Date.now() / 1000);
+  const timeFrom = timeTo - lookbackDays * 24 * 60 * 60;
+  const allOrders: string[] = [];
+  let cursor = '';
+  let hasMore = true;
+  let page = 0;
+
+  console.log(`[SHOPEE] getAllOrdersByStatus(${orderStatus}) — últimos ${lookbackDays} dias`);
+
+  while (hasMore) {
+    page++;
+    try {
+      const params: Record<string, string> = {
+        time_range_field: 'update_time',
+        time_from: String(timeFrom),
+        time_to: String(timeTo),
+        page_size: '100',
+        order_status: orderStatus,
+      };
+      if (cursor) params.cursor = cursor;
+
+      const result = await shopeeApiGet('/api/v2/order/get_order_list', params);
+
+      if (result.error) {
+        console.warn(`[SHOPEE] getAllOrdersByStatus página ${page} erro: ${result.error} ${result.message || ''}`);
+        if (allOrders.length > 0) break; // Retorna o que já tem
+        return { success: false, orderSns: [], error: `${result.error}: ${result.message || ''}` };
+      }
+
+      const response = result.response || {};
+      const orderList = response.order_list || [];
+      for (const o of orderList) {
+        allOrders.push(o.order_sn);
+      }
+
+      hasMore = response.more === true;
+      cursor = response.next_cursor || '';
+      console.log(`[SHOPEE] Página ${page}: ${orderList.length} pedidos (total: ${allOrders.length}, more: ${hasMore})`);
+    } catch (err: any) {
+      console.warn(`[SHOPEE] getAllOrdersByStatus página ${page} exceção:`, err.message || err);
+      if (allOrders.length > 0) break;
+      return { success: false, orderSns: [], error: err.message || String(err) };
+    }
+  }
+
+  console.log(`[SHOPEE] getAllOrdersByStatus(${orderStatus}) — total: ${allOrders.length} pedidos`);
+  return { success: true, orderSns: allOrders };
 }
 
 // === Initialize: load tokens on startup ===
