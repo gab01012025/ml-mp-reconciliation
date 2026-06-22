@@ -6,6 +6,11 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import { config } from './config';
 
+// Node.js 20+ globals (disponíveis em runtime mas não no @types/node antigo)
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const _FormData = (globalThis as any).FormData;
+const _File = (globalThis as any).File;
+
 // === Types ===
 interface ShopeeTokens {
   shop_id: string;
@@ -246,24 +251,146 @@ export async function downloadInvoiceDoc(orderSn: string): Promise<{ exists: boo
   }
 }
 
+// === Public API: Get order details with items and recipient ===
+export interface OrderItemInfo {
+  item_id: number;
+  item_name: string;
+  item_sku: string;
+  model_name: string;
+  model_sku: string;
+  quantity: number;
+  price: number;
+}
+
+export interface OrderDetailInfo {
+  order_sn: string;
+  order_status: string;
+  buyer_username: string;
+  recipient_name: string;
+  recipient_phone: string;
+  total_amount: number;
+  items: OrderItemInfo[];
+}
+
+/**
+ * Busca detalhes dos pedidos Shopee (itens, destinatário, etc.)
+ * Aceita até 50 order_sn por chamada.
+ */
+export async function getOrdersDetail(orderSns: string[]): Promise<OrderDetailInfo[]> {
+  if (!orderSns || orderSns.length === 0) return [];
+
+  const results: OrderDetailInfo[] = [];
+  // API aceita até 50 por vez
+  const BATCH = 50;
+  for (let i = 0; i < orderSns.length; i += BATCH) {
+    const batch = orderSns.slice(i, i + BATCH);
+    try {
+      const result = await shopeeApiGet('/api/v2/order/get_order_detail', {
+        order_sn_list: batch.join(','),
+        response_optional_fields: 'order_status,item_list,buyer_username,recipient_address,total_amount',
+      });
+
+      const orders = result.response?.order_list || [];
+      for (const o of orders) {
+        const items: OrderItemInfo[] = (o.item_list || []).map((it: any) => ({
+          item_id: it.item_id,
+          item_name: it.item_name || '',
+          item_sku: it.item_sku || '',
+          model_name: it.model_name || '',
+          model_sku: it.model_sku || '',
+          quantity: it.model_quantity_purchased || 1,
+          price: it.model_discounted_price || it.model_original_price || 0,
+        }));
+
+        results.push({
+          order_sn: o.order_sn,
+          order_status: o.order_status || '',
+          buyer_username: o.buyer_username || '',
+          recipient_name: o.recipient_address?.name || '',
+          recipient_phone: o.recipient_address?.phone || '',
+          total_amount: o.total_amount || 0,
+          items,
+        });
+      }
+    } catch (err: any) {
+      console.warn(`[SHOPEE] getOrdersDetail batch falhou:`, err.message || err);
+    }
+  }
+  return results;
+}
+
+// === Helper: extract NF-e metadata from XML ===
+function extractNFeData(xml: string): { chaveAcesso?: string; numero?: string; serie?: string } {
+  const chMatch = xml.match(/<chNFe>(\d{44})<\/chNFe>/);
+  const numMatch = xml.match(/<nNF>(\d+)<\/nNF>/);
+  const serMatch = xml.match(/<serie>(\d+)<\/serie>/);
+  return {
+    chaveAcesso: chMatch?.[1],
+    numero: numMatch?.[1],
+    serie: serMatch?.[1],
+  };
+}
+
+// === Helper: tenta uma variação de upload_invoice_doc ===
+async function tryUpload(
+  url: string,
+  orderSn: string,
+  xmlBuffer: Buffer,
+  mimeType: string,
+  filename: string,
+  label: string,
+): Promise<ShopeeApiResponse> {
+  const formData = new _FormData();
+  formData.append('order_sn', orderSn);
+  formData.append('file_type', '1');
+  const file = new _File([xmlBuffer], filename, { type: mimeType });
+  formData.append('file', file);
+
+  const res = await fetch(url, { method: 'POST', body: formData as any });
+  const rawText = await res.text();
+  console.log(`[SHOPEE] ${label} response (${res.status}): ${rawText.slice(0, 300)}`);
+  try {
+    return JSON.parse(rawText) as ShopeeApiResponse;
+  } catch {
+    return { error: 'parse_error', message: `Status ${res.status}: ${rawText.slice(0, 200)}` };
+  }
+}
+
 // === Public API: Upload Invoice Doc (BR seller — multipart file upload) ===
 export async function uploadInvoiceDoc(
   orderSn: string,
   xmlContent: string,
 ): Promise<{ success: boolean; error?: string }> {
-  // Garante que o XML tem declaração <?xml?> no início (Shopee pode exigir)
+  // Remove BOM (UTF-8 Byte Order Mark) se presente
   let xml = xmlContent;
-  if (!xml.startsWith('<?xml')) {
-    xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml;
+  if (xml.charCodeAt(0) === 0xFEFF) {
+    xml = xml.slice(1);
   }
+  xml = xml.trimStart();
 
   // Verifica se o pedido já tem invoice na Shopee (para evitar "File error" em duplicatas)
   const invoiceCheck = await checkOrderInvoice(orderSn);
   if (invoiceCheck.hasInvoice) {
     console.log(`[SHOPEE] Pedido ${orderSn} já tem invoice na Shopee — pulando upload`);
-    return { success: true }; // Considera sucesso (já foi enviada antes)
+    return { success: true };
   }
 
+  // Verifica status do pedido — Shopee só aceita NF em status específicos
+  const orderStatus = invoiceCheck.orderStatus;
+  const UPLOAD_ALLOWED_STATUSES = ['READY_TO_SHIP', 'PROCESSED', 'RETRY'];
+  if (orderStatus && !UPLOAD_ALLOWED_STATUSES.includes(orderStatus)) {
+    const msg = `Pedido "${orderSn}" está no status "${orderStatus}" na Shopee. ` +
+      `Upload de NF só é aceito nos status: ${UPLOAD_ALLOWED_STATUSES.join(', ')}. ` +
+      `Aguarde o pedido mudar para "Ready to Ship" ou verifique na Shopee.`;
+    console.warn(`[SHOPEE] ${msg}`);
+    return { success: false, error: `status_invalido: ${msg}` };
+  }
+
+  // Diagnóstico: mostra preview do XML e dados extraídos
+  const nfeData = extractNFeData(xml);
+  const xmlPreview = xml.slice(0, 150).replace(/\n/g, '\\n');
+  console.log(`[SHOPEE] XML preview: ${xmlPreview}...`);
+  console.log(`[SHOPEE] NF-e dados: chave=${nfeData.chaveAcesso || 'N/A'} num=${nfeData.numero || 'N/A'} serie=${nfeData.serie || 'N/A'}`);
   console.log(`[SHOPEE] Enviando XML NF para pedido ${orderSn} (${xml.length} bytes) status=${invoiceCheck.orderStatus || 'N/A'}`);
 
   const accessToken = await ensureValidToken();
@@ -272,92 +399,104 @@ export async function uploadInvoiceDoc(
   }
 
   const shopId = currentTokens?.shop_id || String(SHOP_ID);
-  const path = '/api/v2/order/upload_invoice_doc';
-  const timestamp = Math.floor(Date.now() / 1000);
-  const sign = generateSign(path, timestamp, accessToken, shopId);
 
-  const url = `${BASE_URL}${path}?partner_id=${PARTNER_ID}&timestamp=${timestamp}&sign=${sign}&access_token=${accessToken}&shop_id=${shopId}`;
-
-  // Constrói multipart/form-data com Buffer
-  const boundary = '----ShopeeUpload' + Date.now();
-  const CRLF = '\r\n';
-  const xmlBuffer = Buffer.from(xml, 'utf-8');
-
-  const parts: Buffer[] = [];
-
-  // order_sn
-  parts.push(Buffer.from(
-    `--${boundary}${CRLF}` +
-    `Content-Disposition: form-data; name="order_sn"${CRLF}${CRLF}` +
-    `${orderSn}${CRLF}`
-  ));
-
-  // file_type (1 = XML)
-  parts.push(Buffer.from(
-    `--${boundary}${CRLF}` +
-    `Content-Disposition: form-data; name="file_type"${CRLF}${CRLF}` +
-    `1${CRLF}`
-  ));
-
-  // file (XML content)
-  parts.push(Buffer.from(
-    `--${boundary}${CRLF}` +
-    `Content-Disposition: form-data; name="file"; filename="nfe_${orderSn}.xml"${CRLF}` +
-    `Content-Type: text/xml${CRLF}${CRLF}`
-  ));
-  parts.push(xmlBuffer);
-  parts.push(Buffer.from(`${CRLF}`));
-
-  // Closing boundary
-  parts.push(Buffer.from(`--${boundary}--${CRLF}`));
-
-  const body = Buffer.concat(parts);
-
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': `multipart/form-data; boundary=${boundary}`,
-        'Content-Length': String(body.length),
-      },
-      body,
-    });
-    const rawText = await res.text();
-
-    let result: ShopeeApiResponse;
-    try {
-      result = JSON.parse(rawText) as ShopeeApiResponse;
-    } catch {
-      return { success: false, error: `parse_error: Status ${res.status}: ${rawText.slice(0, 200)}` };
-    }
-
-    if (result.error) {
-      console.error(`[SHOPEE] Falha ao enviar NF para ${orderSn}: ${result.error} — ${result.message || ''}`);
-      return { success: false, error: `${result.error}: ${result.message || ''}` };
-    }
-
-    console.log(`[SHOPEE] NF XML enviada com sucesso para pedido ${orderSn}`);
-    return { success: true };
-  } catch (err: any) {
-    return { success: false, error: `fetch_error: ${err.message || String(err)}` };
+  // Monta URL base (gera novo timestamp/sign para cada tentativa)
+  function buildUrl(): string {
+    const ts = Math.floor(Date.now() / 1000);
+    const path = '/api/v2/order/upload_invoice_doc';
+    const sign = generateSign(path, ts, accessToken!, shopId);
+    return `${BASE_URL}${path}?partner_id=${PARTNER_ID}&timestamp=${ts}&sign=${sign}&access_token=${accessToken}&shop_id=${shopId}`;
   }
+
+  // XML com declaração
+  let xmlWithDecl = xml;
+  if (!xml.startsWith('<?xml')) {
+    xmlWithDecl = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml;
+  }
+
+  // Tentativa 1: File + text/xml + XML cru (sem declaração adicionada)
+  const rawBuf = Buffer.from(xml, 'utf-8');
+  console.log(`[SHOPEE] Tentativa 1: File + text/xml + XML cru (${rawBuf.length} bytes)`);
+  let result = await tryUpload(buildUrl(), orderSn, rawBuf, 'text/xml', `${orderSn}.xml`, 'tentativa1');
+  if (!result.error) {
+    console.log(`[SHOPEE] NF enviada com sucesso via tentativa 1 (File+text/xml+raw)`);
+    return { success: true };
+  }
+  console.warn(`[SHOPEE] Tentativa 1 falhou: ${result.error} — ${result.message || ''}`);
+
+  // Tentativa 2: File + application/xml + XML com declaração
+  const declBuf = Buffer.from(xmlWithDecl, 'utf-8');
+  console.log(`[SHOPEE] Tentativa 2: File + application/xml + XML com declaração (${declBuf.length} bytes)`);
+  result = await tryUpload(buildUrl(), orderSn, declBuf, 'application/xml', `nfe_${orderSn}.xml`, 'tentativa2');
+  if (!result.error) {
+    console.log(`[SHOPEE] NF enviada com sucesso via tentativa 2 (File+application/xml+decl)`);
+    return { success: true };
+  }
+  console.warn(`[SHOPEE] Tentativa 2 falhou: ${result.error} — ${result.message || ''}`);
+
+  // Tentativa 3: File + application/octet-stream (binary genérico)
+  console.log(`[SHOPEE] Tentativa 3: File + application/octet-stream`);
+  result = await tryUpload(buildUrl(), orderSn, declBuf, 'application/octet-stream', `nfe_${orderSn}.xml`, 'tentativa3');
+  if (!result.error) {
+    console.log(`[SHOPEE] NF enviada com sucesso via tentativa 3 (octet-stream)`);
+    return { success: true };
+  }
+  console.warn(`[SHOPEE] Tentativa 3 falhou: ${result.error} — ${result.message || ''}`);
+
+  // Fallback: add_invoice_data com dados estruturados
+  if (nfeData.chaveAcesso && nfeData.numero && nfeData.serie) {
+    console.log(`[SHOPEE] Tentativa 4 (fallback): add_invoice_data para ${orderSn}...`);
+    const fallbackResult = await addInvoiceData(orderSn, nfeData.numero, nfeData.serie, nfeData.chaveAcesso);
+    if (fallbackResult.success) {
+      return fallbackResult;
+    }
+    console.warn(`[SHOPEE] add_invoice_data também falhou: ${fallbackResult.error}`);
+  }
+
+  return { success: false, error: `${result.error}: ${result.message || ''}` };
 }
 
-// === Compat wrapper: setInvoiceInfo now uses uploadInvoiceDoc when XML is provided ===
+// === Fallback: Add Invoice Data via JSON endpoint ===
+async function addInvoiceData(
+  orderSn: string,
+  invoiceNumber: string,
+  invoiceSerialNumber: string,
+  invoiceAccessKey: string,
+): Promise<{ success: boolean; error?: string }> {
+  const result = await shopeeApiCall('/api/v2/order/add_invoice_data', {
+    order_sn: orderSn,
+    invoice_number: invoiceNumber,
+    invoice_serial_number: invoiceSerialNumber,
+    invoice_access_key: invoiceAccessKey,
+  });
+
+  console.log(`[SHOPEE] add_invoice_data response: ${JSON.stringify(result).slice(0, 300)}`);
+
+  if (result.error) {
+    return { success: false, error: `add_invoice_data: ${result.error} — ${result.message || ''}` };
+  }
+
+  console.log(`[SHOPEE] NF dados enviados com sucesso para pedido ${orderSn} via add_invoice_data`);
+  return { success: true };
+}
+
+// === Compat wrapper: setInvoiceInfo ===
 export async function setInvoiceInfo(
   orderSn: string,
-  _invoiceNumber: string,
-  _invoiceSerialNumber: string,
-  _invoiceAccessKey: string,
+  invoiceNumber: string,
+  invoiceSerialNumber: string,
+  invoiceAccessKey: string,
   _extraFields?: any,
   xmlContent?: string,
 ): Promise<{ success: boolean; error?: string }> {
   if (xmlContent) {
     return uploadInvoiceDoc(orderSn, xmlContent);
   }
-  // Fallback: try JSON endpoint (for backwards compat, though it returns 403 on BR)
-  console.warn(`[SHOPEE] Sem XML para pedido ${orderSn}, tentando upload sem XML...`);
-  return { success: false, error: 'no_xml: XML da NF-e é obrigatório para upload_invoice_doc' };
+  // Sem XML: tenta add_invoice_data com dados estruturados
+  if (invoiceNumber && invoiceAccessKey) {
+    return addInvoiceData(orderSn, invoiceNumber, invoiceSerialNumber || '1', invoiceAccessKey);
+  }
+  return { success: false, error: 'no_data: Nem XML nem dados da NF disponíveis' };
 }
 
 // === Public API: Get connection info ===
@@ -389,6 +528,563 @@ export function reloadTokens(): void {
 // === Public API: Manual refresh ===
 export async function forceRefresh(): Promise<boolean> {
   return refreshAccessToken();
+}
+
+// === Public API: Get shipping parameter (tests logistics API access) ===
+export async function getShippingParameter(orderSn: string): Promise<{ success: boolean; data?: any; error?: string }> {
+  try {
+    const result = await shopeeApiGet('/api/v2/logistics/get_shipping_parameter', {
+      order_sn: orderSn,
+    });
+    if (result.error) {
+      return { success: false, error: `${result.error}: ${result.message || ''}` };
+    }
+    return { success: true, data: result.response };
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) };
+  }
+}
+
+// === Public API: Ship order (arranges pickup — required before creating label) ===
+export async function shipOrder(orderSn: string, addressId?: number, pickupTimeId?: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    // If no address/time provided, get shipping parameter and pick default/recommended
+    if (!addressId || !pickupTimeId) {
+      console.log(`[SHOPEE] ship_order: buscando parâmetros de envio para ${orderSn}...`);
+      const params = await getShippingParameter(orderSn);
+      if (!params.success || !params.data) {
+        return { success: false, error: `Falha ao obter parâmetros: ${params.error || 'sem dados'}` };
+      }
+
+      const pickup = params.data.pickup || params.data.info_needed?.pickup;
+      const addressList = params.data.pickup?.address_list;
+      if (!addressList || addressList.length === 0) {
+        return { success: false, error: 'Nenhum endereço de coleta disponível' };
+      }
+
+      // Pick default_address or first available
+      const defaultAddr = addressList.find((a: any) =>
+        a.address_flag?.includes('default_address') || a.address_flag?.includes('pickup_address')
+      ) || addressList[0];
+
+      addressId = defaultAddr.address_id;
+
+      // Pick recommended time slot or first available
+      const timeSlots = defaultAddr.time_slot_list || [];
+      const recommended = timeSlots.find((t: any) => t.flags?.includes('recommended')) || timeSlots[0];
+      pickupTimeId = recommended?.pickup_time_id;
+
+      if (!pickupTimeId) {
+        return { success: false, error: 'Nenhum horário de coleta disponível' };
+      }
+
+      console.log(`[SHOPEE] ship_order: usando address_id=${addressId} pickup_time_id=${pickupTimeId}`);
+    }
+
+    const result = await shopeeApiCall('/api/v2/logistics/ship_order', {
+      order_sn: orderSn,
+      pickup: {
+        address_id: addressId,
+        pickup_time_id: pickupTimeId,
+      },
+    });
+
+    if (result.error) {
+      return { success: false, error: `${result.error}: ${result.message || ''}` };
+    }
+    console.log(`[SHOPEE] ship_order: pedido ${orderSn} enviado com sucesso`);
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) };
+  }
+}
+
+// Todos os tipos de documento de envio suportados pela Shopee
+const ALL_SHIPPING_DOC_TYPES = ['THERMAL_AIR_WAYBILL', 'NORMAL_AIR_WAYBILL', 'THERMAL_JOB_AIR_WAYBILL', 'NORMAL_JOB_AIR_WAYBILL'];
+
+// === Public API: Get shipping document parameter (descobre o tipo correto de documento) ===
+export async function getShippingDocumentParameter(orderSn: string): Promise<{ success: boolean; suggestedType?: string; selectableTypes?: string[]; error?: string }> {
+  try {
+    const result = await shopeeApiCall('/api/v2/logistics/get_shipping_document_parameter', {
+      order_list: [{ order_sn: orderSn }],
+    });
+    console.log(`[SHOPEE] get_shipping_document_parameter response: ${JSON.stringify(result).slice(0, 500)}`);
+    if (result.error) {
+      return { success: false, error: `${result.error}: ${result.message || ''}` };
+    }
+    const item = result.response?.result_list?.[0];
+    if (item?.fail_error) {
+      return { success: false, error: `${item.fail_error}: ${item.fail_message || ''}` };
+    }
+    const suggested = item?.suggest_shipping_document_type;
+    const selectable = item?.selectable_shipping_document_type || [];
+    console.log(`[SHOPEE] Doc type sugerido: ${suggested}, selecionáveis: ${JSON.stringify(selectable)}`);
+    return { success: true, suggestedType: suggested, selectableTypes: selectable };
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) };
+  }
+}
+
+// === Public API: Create shipping document (step 1 of label download) ===
+// Usa o tipo sugerido pela API ou tenta múltiplos tipos como fallback
+export async function createShippingDocument(orderSn: string, preferredDocType?: string): Promise<{ success: boolean; docType?: string; error?: string }> {
+  // Monta lista de tipos: preferred primeiro, depois fallbacks (sem duplicar)
+  const fallback = ALL_SHIPPING_DOC_TYPES.filter(t => t !== preferredDocType);
+  const typesToTry = preferredDocType ? [preferredDocType, ...fallback] : ALL_SHIPPING_DOC_TYPES;
+
+  let lastError = '';
+  for (const docType of typesToTry) {
+    try {
+      const result = await shopeeApiCall('/api/v2/logistics/create_shipping_document', {
+        order_list: [{
+          order_sn: orderSn,
+          shipping_document_type: docType,
+        }],
+      });
+      console.log(`[SHOPEE] create_shipping_document (${docType}) response: ${JSON.stringify(result).slice(0, 400)}`);
+
+      // Extrai erro detalhado (pode vir no nível global ou por pedido)
+      let failError = '';
+      let failMessage = '';
+      if (result.error) {
+        failError = result.error;
+        failMessage = result.message || '';
+        if (result.error === 'common.batch_api_all_failed') {
+          const item = result.response?.result_list?.[0];
+          if (item?.fail_error) { failError = item.fail_error; failMessage = item.fail_message || ''; }
+        }
+      } else {
+        const item = result.response?.result_list?.[0];
+        if (item?.fail_error) { failError = item.fail_error; failMessage = item.fail_message || ''; }
+      }
+
+      if (!failError) {
+        console.log(`[SHOPEE] create_shipping_document (${docType}): sucesso`);
+        return { success: true, docType };
+      }
+
+      lastError = `${failError}: ${failMessage}`;
+      const errLower = lastError.toLowerCase();
+
+      // Documento já existe — sucesso
+      if (errLower.includes('repeated') || errLower.includes('already') || errLower.includes('created')
+          || errLower.includes('should_print_first') || errLower.includes('should print first')
+          || errLower.includes('print_first')) {
+        console.log(`[SHOPEE] create_shipping_document (${docType}): documento já existe (${failError}) — OK`);
+        return { success: true, docType };
+      }
+
+      console.log(`[SHOPEE] create_shipping_document (${docType}) falhou: ${lastError} — tentando próximo tipo...`);
+    } catch (err: any) {
+      lastError = err.message || String(err);
+    }
+  }
+  return { success: false, error: lastError };
+}
+
+// === Public API: Get shipping document result (step 2 — check if ready) ===
+export async function getShippingDocumentResult(orderSn: string): Promise<{ success: boolean; status?: string; error?: string }> {
+  try {
+    const result = await shopeeApiCall('/api/v2/logistics/get_shipping_document_result', {
+      order_list: [{ order_sn: orderSn }],
+    });
+    if (result.error) {
+      return { success: false, error: `${result.error}: ${result.message || ''}` };
+    }
+    const resultList = result.response?.result_list;
+    if (resultList && resultList.length > 0) {
+      const item = resultList[0];
+      if (item.fail_error) {
+        return { success: false, status: item.status, error: `${item.fail_error}: ${item.fail_message || ''}` };
+      }
+      return { success: true, status: item.status };
+    }
+    return { success: true, status: 'UNKNOWN' };
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) };
+  }
+}
+
+// === Public API: Download shipping document (step 3 — returns PDF buffer) ===
+// Tenta múltiplos tipos de documento (usa docTypeHint se disponível do create)
+export async function downloadShippingDocument(orderSn: string, docTypeHint?: string): Promise<{ success: boolean; pdf?: Buffer; error?: string }> {
+  const accessToken = await ensureValidToken();
+  if (!accessToken) {
+    return { success: false, error: 'Token não disponível' };
+  }
+
+  // Se temos hint do create, tenta ele primeiro; senão tenta todos
+  const typesToTry = docTypeHint
+    ? [docTypeHint, ...ALL_SHIPPING_DOC_TYPES.filter(t => t !== docTypeHint)]
+    : ALL_SHIPPING_DOC_TYPES;
+
+  let lastError = '';
+  for (const docType of typesToTry) {
+    const shopId = currentTokens?.shop_id || String(SHOP_ID);
+    const timestamp = Math.floor(Date.now() / 1000);
+    const path = '/api/v2/logistics/download_shipping_document';
+    const sign = generateSign(path, timestamp, accessToken, shopId);
+
+    const url = `${BASE_URL}${path}?partner_id=${PARTNER_ID}&timestamp=${timestamp}&sign=${sign}&access_token=${accessToken}&shop_id=${shopId}`;
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          order_list: [{
+            order_sn: orderSn,
+            shipping_document_type: docType,
+          }],
+        }),
+      });
+
+      const contentType = res.headers.get('content-type') || '';
+      console.log(`[SHOPEE] download_shipping_document (${docType}): status=${res.status} content-type=${contentType}`);
+
+      // If response is PDF/binary, return the buffer
+      if (contentType.includes('application/pdf') || contentType.includes('application/octet-stream')) {
+        const arrayBuffer = await res.arrayBuffer();
+        console.log(`[SHOPEE] download_shipping_document (${docType}): PDF OK`);
+        return { success: true, pdf: Buffer.from(arrayBuffer) };
+      }
+
+      // Otherwise it's a JSON error
+      const rawText = await res.text();
+      try {
+        const json = JSON.parse(rawText);
+        lastError = `${json.error || 'unknown'}: ${json.message || rawText.slice(0, 200)}`;
+      } catch {
+        lastError = `Status ${res.status}: ${rawText.slice(0, 200)}`;
+      }
+      console.log(`[SHOPEE] download_shipping_document (${docType}) falhou: ${lastError}`);
+    } catch (err: any) {
+      lastError = err.message || String(err);
+    }
+  }
+  return { success: false, error: lastError };
+}
+
+// === Public API: Diagnose shipping label (shows step-by-step what happens) ===
+export interface LabelDiagnostic {
+  orderSn: string;
+  steps: { step: string; success: boolean; detail: string }[];
+  finalSuccess: boolean;
+  pdfSize?: number;
+}
+
+export async function diagnoseShippingLabel(orderSn: string): Promise<LabelDiagnostic> {
+  const diag: LabelDiagnostic = { orderSn, steps: [], finalSuccess: false };
+
+  // Step 0: check invoice
+  const invoiceCheck = await checkOrderInvoice(orderSn);
+  diag.steps.push({
+    step: 'check_invoice',
+    success: invoiceCheck.hasInvoice,
+    detail: invoiceCheck.hasInvoice
+      ? `NF presente (status: ${invoiceCheck.orderStatus})`
+      : `SEM NF na Shopee (status: ${invoiceCheck.orderStatus || 'N/A'}). Envie a NF primeiro!`,
+  });
+
+  // Step 1: get_shipping_parameter
+  const params = await getShippingParameter(orderSn);
+  diag.steps.push({
+    step: 'get_shipping_parameter',
+    success: params.success,
+    detail: params.success ? JSON.stringify(params.data?.info_needed || {}).slice(0, 200) : (params.error || 'erro'),
+  });
+
+  // Step 2: ship_order
+  const shipResult = await shipOrder(orderSn);
+  diag.steps.push({
+    step: 'ship_order',
+    success: shipResult.success,
+    detail: shipResult.success ? 'Pedido enviado' : (shipResult.error || 'erro'),
+  });
+
+  if (shipResult.success) {
+    await new Promise(r => setTimeout(r, 3000));
+  }
+
+  // Step 3: create_shipping_document
+  const createResult = await createShippingDocument(orderSn);
+  diag.steps.push({
+    step: 'create_shipping_document',
+    success: createResult.success,
+    detail: createResult.success ? 'Documento criado' : (createResult.error || 'erro'),
+  });
+
+  // Step 4: get_shipping_document_result (poll up to 3x)
+  for (let i = 0; i < 3; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    const statusResult = await getShippingDocumentResult(orderSn);
+    if (statusResult.success && statusResult.status === 'READY') {
+      diag.steps.push({ step: 'get_shipping_document_result', success: true, detail: `READY (tentativa ${i + 1})` });
+      break;
+    }
+    if (i === 2) {
+      diag.steps.push({
+        step: 'get_shipping_document_result',
+        success: false,
+        detail: `${statusResult.status || 'N/A'}: ${statusResult.error || 'não ficou READY após 3 tentativas'}`,
+      });
+    }
+  }
+
+  // Step 5: download_shipping_document
+  const downloadResult = await downloadShippingDocument(orderSn);
+  if (downloadResult.success && downloadResult.pdf) {
+    diag.steps.push({ step: 'download_shipping_document', success: true, detail: `PDF ${downloadResult.pdf.length} bytes` });
+    diag.finalSuccess = true;
+    diag.pdfSize = downloadResult.pdf.length;
+  } else {
+    diag.steps.push({ step: 'download_shipping_document', success: false, detail: downloadResult.error || 'erro' });
+  }
+
+  return diag;
+}
+
+// === Public API: Full shipping label flow (ship → create → poll → download) ===
+// Returns step-by-step info so we can always see what happened
+export interface LabelResult {
+  success: boolean;
+  pdf?: Buffer;
+  error?: string;
+  steps: { step: string; ok: boolean; detail: string }[];
+}
+
+export async function getShippingLabel(orderSn: string): Promise<LabelResult> {
+  const steps: { step: string; ok: boolean; detail: string }[] = [];
+  console.log(`[SHOPEE] Etiqueta: iniciando para pedido ${orderSn}...`);
+
+  // Step 0: Check if order has invoice (NF) — required for ship_order in Brazil
+  const invoiceCheck = await checkOrderInvoice(orderSn);
+  if (!invoiceCheck.hasInvoice) {
+    steps.push({ step: 'check_invoice', ok: false, detail: `Pedido sem NF na Shopee (status: ${invoiceCheck.orderStatus || 'N/A'}). Envie a NF primeiro via CSV/upload.` });
+    return {
+      success: false,
+      error: `Pedido ${orderSn} não tem NF na Shopee. A Shopee BR exige NF antes de gerar etiqueta. Faça o upload da NF primeiro.`,
+      steps,
+    };
+  }
+  const orderStatus = invoiceCheck.orderStatus || '';
+  steps.push({ step: 'check_invoice', ok: true, detail: `NF presente (status: ${orderStatus})` });
+
+  // Pedidos que já foram despachados fisicamente — NÃO podem mais gerar etiqueta
+  const tooLateStatuses = ['SHIPPED', 'IN_TRANSIT', 'COMPLETED', 'TO_CONFIRM_RECEIVE'];
+  if (tooLateStatuses.includes(orderStatus)) {
+    const msg = `Pedido já foi despachado (status: ${orderStatus}). Etiqueta só pode ser impressa antes do envio físico.`;
+    steps.push({ step: 'status_check', ok: false, detail: msg });
+    return { success: false, error: msg, steps };
+  }
+
+  // Step 1: ship_order — only needed for READY_TO_SHIP orders
+  // Orders in PROCESSED already passed this stage but can still print labels
+  const alreadyProcessed = orderStatus === 'PROCESSED';
+  if (alreadyProcessed) {
+    steps.push({ step: 'ship_order', ok: true, detail: `Pulado — pedido já em ${orderStatus}` });
+  } else {
+    const shipResult = await shipOrder(orderSn);
+    if (shipResult.success) {
+      steps.push({ step: 'ship_order', ok: true, detail: 'Envio agendado' });
+      await new Promise(r => setTimeout(r, 3000));
+    } else {
+      const shipErr = (shipResult.error || '').toLowerCase();
+      if (shipErr.includes('already') || shipErr.includes('shipped') || shipErr.includes('processed') || shipErr.includes('order_status') || shipErr.includes('not eligible')) {
+        steps.push({ step: 'ship_order', ok: true, detail: `Já enviado (${shipResult.error})` });
+      } else {
+        steps.push({ step: 'ship_order', ok: false, detail: shipResult.error || 'erro' });
+        return { success: false, error: `ship_order falhou: ${shipResult.error}`, steps };
+      }
+    }
+  }
+
+  // Step 2a: get_shipping_document_parameter — descobre tipo correto de documento
+  let suggestedDocType: string | undefined;
+  const docParam = await getShippingDocumentParameter(orderSn);
+  if (docParam.success && docParam.suggestedType) {
+    suggestedDocType = docParam.suggestedType;
+    steps.push({ step: 'get_shipping_document_parameter', ok: true, detail: `Tipo sugerido: ${suggestedDocType} (disponíveis: ${docParam.selectableTypes?.join(', ') || 'N/A'})` });
+  } else {
+    steps.push({ step: 'get_shipping_document_parameter', ok: false, detail: `Fallback — ${docParam.error || 'sem sugestão'}` });
+  }
+
+  // Step 2b: create_shipping_document (usa tipo sugerido; fallback para todos os tipos)
+  const createResult = await createShippingDocument(orderSn, suggestedDocType);
+  let usedDocType = createResult.docType; // tipo que deu certo (para passar ao download)
+  if (createResult.success) {
+    steps.push({ step: 'create_shipping_document', ok: true, detail: `Documento criado/existente (${usedDocType || 'auto'})` });
+  } else {
+    steps.push({ step: 'create_shipping_document', ok: false, detail: createResult.error || 'erro' });
+    // Don't return — still try download in case it's already created
+  }
+
+  // Step 3: Poll for result (max 5 attempts, 2s apart)
+  let ready = false;
+  let pollDetail = '';
+  for (let i = 0; i < 5; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    const statusResult = await getShippingDocumentResult(orderSn);
+    pollDetail = `${statusResult.status || 'N/A'} (tentativa ${i + 1})`;
+    console.log(`[SHOPEE] Etiqueta: status ${i + 1}/5 — ${statusResult.status || statusResult.error}`);
+    if (statusResult.status === 'READY') {
+      ready = true;
+      break;
+    }
+  }
+  steps.push({ step: 'get_shipping_document_result', ok: ready, detail: ready ? 'READY' : pollDetail });
+
+  // Step 4: Download (tenta ambos os tipos automaticamente, prioriza o que foi usado no create)
+  const downloadResult = await downloadShippingDocument(orderSn, usedDocType);
+  if (downloadResult.success && downloadResult.pdf) {
+    steps.push({ step: 'download_shipping_document', ok: true, detail: `PDF ${downloadResult.pdf.length} bytes` });
+    console.log(`[SHOPEE] Etiqueta: PDF baixado com sucesso (${downloadResult.pdf.length} bytes)`);
+    return { success: true, pdf: downloadResult.pdf, steps };
+  }
+
+  steps.push({ step: 'download_shipping_document', ok: false, detail: downloadResult.error || 'erro' });
+  return { success: false, error: downloadResult.error || 'Falha ao baixar etiqueta', steps };
+}
+
+// === Public API: Prepare shipping label (ship + create doc, SEM download) ===
+// Usado no fluxo batch: prepara todos os pedidos e depois baixa em PDF único
+export interface PrepareResult {
+  order_sn: string;
+  success: boolean;
+  docType?: string;
+  error?: string;
+}
+
+export async function prepareShippingLabel(orderSn: string): Promise<PrepareResult> {
+  console.log(`[SHOPEE] Batch: preparando pedido ${orderSn}...`);
+
+  // Verifica NF
+  const invoiceCheck = await checkOrderInvoice(orderSn);
+  if (!invoiceCheck.hasInvoice) {
+    return { order_sn: orderSn, success: false, error: `Sem NF na Shopee (status: ${invoiceCheck.orderStatus || 'N/A'})` };
+  }
+
+  const orderStatus = invoiceCheck.orderStatus || '';
+
+  // Pedidos já despachados — não dá pra gerar etiqueta
+  if (['SHIPPED', 'IN_TRANSIT', 'COMPLETED', 'TO_CONFIRM_RECEIVE'].includes(orderStatus)) {
+    return { order_sn: orderSn, success: false, error: `Já despachado (status: ${orderStatus})` };
+  }
+
+  // ship_order se necessário
+  if (orderStatus !== 'PROCESSED') {
+    const shipResult = await shipOrder(orderSn);
+    if (!shipResult.success) {
+      const shipErr = (shipResult.error || '').toLowerCase();
+      if (!(shipErr.includes('already') || shipErr.includes('shipped') || shipErr.includes('processed') || shipErr.includes('order_status') || shipErr.includes('not eligible'))) {
+        return { order_sn: orderSn, success: false, error: `ship_order: ${shipResult.error}` };
+      }
+    }
+    await new Promise(r => setTimeout(r, 2000));
+  }
+
+  // Descobre tipo correto de documento
+  let suggestedDocType: string | undefined;
+  const docParam = await getShippingDocumentParameter(orderSn);
+  if (docParam.success && docParam.suggestedType) {
+    suggestedDocType = docParam.suggestedType;
+  }
+
+  // Cria documento
+  const createResult = await createShippingDocument(orderSn, suggestedDocType);
+  if (!createResult.success) {
+    return { order_sn: orderSn, success: false, error: `create: ${createResult.error}` };
+  }
+
+  console.log(`[SHOPEE] Batch: pedido ${orderSn} preparado (tipo: ${createResult.docType || 'auto'})`);
+  return { order_sn: orderSn, success: true, docType: createResult.docType };
+}
+
+// === Public API: Download múltiplas etiquetas em PDF único ===
+export async function downloadShippingDocumentBatch(
+  orders: Array<{ order_sn: string; docType?: string }>
+): Promise<{ success: boolean; pdf?: Buffer; error?: string }> {
+  const accessToken = await ensureValidToken();
+  if (!accessToken) {
+    return { success: false, error: 'Token não disponível' };
+  }
+
+  if (orders.length === 0) {
+    return { success: false, error: 'Nenhum pedido fornecido' };
+  }
+
+  const shopId = currentTokens?.shop_id || String(SHOP_ID);
+  const timestamp = Math.floor(Date.now() / 1000);
+  const path = '/api/v2/logistics/download_shipping_document';
+  const sign = generateSign(path, timestamp, accessToken, shopId);
+  const url = `${BASE_URL}${path}?partner_id=${PARTNER_ID}&timestamp=${timestamp}&sign=${sign}&access_token=${accessToken}&shop_id=${shopId}`;
+
+  // Monta order_list com o tipo correto de cada pedido
+  const orderList = orders.map(o => ({
+    order_sn: o.order_sn,
+    shipping_document_type: o.docType || 'THERMAL_AIR_WAYBILL',
+  }));
+
+  console.log(`[SHOPEE] download_shipping_document batch: ${orderList.length} pedidos`);
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order_list: orderList }),
+    });
+
+    const contentType = res.headers.get('content-type') || '';
+    console.log(`[SHOPEE] download batch: status=${res.status} content-type=${contentType}`);
+
+    if (contentType.includes('application/pdf') || contentType.includes('application/octet-stream')) {
+      const arrayBuffer = await res.arrayBuffer();
+      console.log(`[SHOPEE] download batch: PDF ${arrayBuffer.byteLength} bytes`);
+      return { success: true, pdf: Buffer.from(arrayBuffer) };
+    }
+
+    const rawText = await res.text();
+    try {
+      const json = JSON.parse(rawText);
+      return { success: false, error: `${json.error || 'unknown'}: ${json.message || rawText.slice(0, 200)}` };
+    } catch {
+      return { success: false, error: `Status ${res.status}: ${rawText.slice(0, 200)}` };
+    }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) };
+  }
+}
+
+// === Public API: Get Shopee order list (for batch operations) ===
+export async function getOrderList(options: {
+  timeRangeField?: string;
+  timeFrom?: number;
+  timeTo?: number;
+  pageSize?: number;
+  orderStatus?: string;
+}): Promise<{ success: boolean; orders?: string[]; error?: string }> {
+  const timeFrom = options.timeFrom || Math.floor((Date.now() - 7 * 24 * 60 * 60 * 1000) / 1000);
+  const timeTo = options.timeTo || Math.floor(Date.now() / 1000);
+
+  try {
+    const result = await shopeeApiGet('/api/v2/order/get_order_list', {
+      time_range_field: options.timeRangeField || 'create_time',
+      time_from: String(timeFrom),
+      time_to: String(timeTo),
+      page_size: String(options.pageSize || 50),
+      order_status: options.orderStatus || 'READY_TO_SHIP',
+    });
+
+    if (result.error) {
+      return { success: false, error: `${result.error}: ${result.message || ''}` };
+    }
+
+    const orderList = result.response?.order_list || [];
+    const orderSns = orderList.map((o: any) => o.order_sn);
+    return { success: true, orders: orderSns };
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) };
+  }
 }
 
 // === Initialize: load tokens on startup ===

@@ -17,14 +17,23 @@ import { config } from './config';
 import * as ml from './ml-client';
 import * as shopee from './shopee-client';
 
+// Formato do Order SN da Shopee: 6 dígitos (YYMMDD) + 8-10 alfanuméricos maiúsculos
+// com pelo menos 1 letra (diferencia de IDs puramente numéricos de outros canais)
+// Ex: 260519S0A4X2H9, 260518PG7CJ1TR
+const SHOPEE_ORDER_SN_REGEX = /^\d{6}(?=[A-Z0-9]*[A-Z])[A-Z0-9]{8,10}$/;
+
 // Rastreia pedidos já processados para evitar reprocessamento
 const processedOrders = new Set<string>();
+
+// Rastreia pedidos ML já verificados (com ou sem NF) para não chamar getOrder de novo
+const checkedMLOrders = new Set<string>();
 
 /**
  * Limpa o cache de pedidos processados (para forçar reprocessamento)
  */
 export function clearProcessedOrders(): void {
   processedOrders.clear();
+  checkedMLOrders.clear();
 }
 
 /**
@@ -112,14 +121,12 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
       await sleep(1100);
     }
 
-    // Filtra pedidos que parecem ser da Shopee (ID alfanumerico, nao comeca com 2000)
+    // Filtra pedidos que parecem ser da Shopee pelo formato do Order SN (YYMMDD + alfanum)
     // Status ignorados: Cancelado, Enviado (ja foram processados completamente)
     const statusIgnorados = new Set(['Cancelado', 'Enviado']);
     const potentialShopee = allOrders.filter(o => {
       const ne = o.numero_ecommerce;
-      const isShopeeFormat = ne && ne.length > 0 && !ne.startsWith('2000') && ne !== '';
-      const notIgnored = !statusIgnorados.has(o.situacao);
-      return isShopeeFormat && notIgnored;
+      return SHOPEE_ORDER_SN_REGEX.test(ne) && !statusIgnorados.has(o.situacao);
     });
 
     console.log(`[BOT] ${allOrders.length} pedidos totais, ${potentialShopee.length} possiveis Shopee pendentes`);
@@ -180,15 +187,17 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
           continue;
         }
 
-        // Cria NF Shopee com desconto percentual sobre o valor original e emite na SEFAZ
+        // Cria NF com desconto e campos de vinculação ao ecommerce
+        // (numero_pedido_ecommerce + ecommerce="Shopee" para o Tiny auto-enviar)
         const shopeeDiscount = config.shopeeDiscountPercent;
-        console.log(`[BOT] Criando NF para pedido ${order.id} (${detail.numero}) - total original: R$${detail.total_pedido} - desconto ${shopeeDiscount}%`);
+        console.log(`[BOT] Criando NF Shopee para pedido ${order.id} (${detail.numero}) - total original: R$${detail.total_pedido} - desconto ${shopeeDiscount}%`);
         await sleep(1100);
 
-        const nf = await createAndEmitNFDiscounted(detail, shopeeDiscount);
+        const nf = await createAndEmitNFDiscounted(detail, shopeeDiscount, 'Shopee');
         if (nf.success) {
           stats.altered++;
           stats.nfGenerated++;
+          console.log(`[OK] NF ${nf.numero || nf.nfId} emitida para pedido ${detail.numero_ecommerce} — chave: ${nf.chaveAcesso || 'N/A'} — aguardando Tiny auto-enviar para Shopee`);
           if (nf.chaveAcesso) {
             stats.nfs.push({
               numero: nf.numero || '',
@@ -199,27 +208,6 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
               valorNota: nf.valorNota || 0,
               dataProcessamento: new Date().toLocaleString('pt-BR'),
             });
-
-            // Envia NF XML para a Shopee via API
-            if (shopee.isConnected() && detail.numero_ecommerce && nf.nfId) {
-              try {
-                await sleep(1100);
-                const xml = await getNFXml(nf.nfId);
-                if (xml) {
-                  await sleep(1100);
-                  const result = await shopee.uploadInvoiceDoc(detail.numero_ecommerce, xml);
-                  if (result.success) {
-                    console.log(`[BOT] NF XML enviada para Shopee com sucesso — pedido ${detail.numero_ecommerce}`);
-                  } else {
-                    console.warn(`[BOT] Falha ao enviar NF XML para Shopee: ${result.error}`);
-                  }
-                } else {
-                  console.warn(`[BOT] XML da NF ${nf.nfId} não disponível — pulando envio para Shopee`);
-                }
-              } catch (err) {
-                console.warn(`[BOT] Erro ao enviar NF para Shopee:`, err);
-              }
-            }
           }
         } else {
           stats.errors++;
@@ -261,16 +249,38 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
       await sleep(1100);
     }
 
+    // Filtra pedidos cancelados e já faturados/atendidos (já possuem NF, sem necessidade de getOrder)
     const statusIgnorados = new Set(['Cancelado']);
+    const statusJaFaturados = new Set(['Faturado', 'Atendido', 'Entregue', 'Pronto para envio']);
     const candidates = allOrders.filter(o => !statusIgnorados.has(o.situacao));
-    console.log(`[BOT-ML] ${allOrders.length} pedidos no dia, ${candidates.length} não-cancelados para análise`);
 
-    for (const order of candidates) {
+    // Filtra: pula pedidos já verificados (cache em memória) e já faturados (não precisam de getOrder)
+    const needsCheck: typeof candidates = [];
+    let skippedCache = 0;
+    let skippedFaturado = 0;
+    for (const o of candidates) {
+      if (checkedMLOrders.has(o.id)) {
+        skippedCache++;
+        continue;
+      }
+      if (statusJaFaturados.has(o.situacao)) {
+        skippedFaturado++;
+        checkedMLOrders.add(o.id);
+        continue;
+      }
+      needsCheck.push(o);
+    }
+    console.log(`[BOT-ML] ${allOrders.length} pedidos no dia, ${candidates.length} não-cancelados, ${skippedFaturado} já faturados, ${skippedCache} já verificados antes → ${needsCheck.length} para analisar`);
+
+    for (const order of needsCheck) {
       try {
         await sleep(1100);
         const detail = await getOrder(order.id);
 
-        if (!isMercadoLivreOrder(detail)) continue;
+        if (!isMercadoLivreOrder(detail)) {
+          checkedMLOrders.add(order.id);
+          continue;
+        }
 
         stats.found++;
 
@@ -278,29 +288,34 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
         if (!isPessoaFisica(detail)) {
           console.log(`[BOT-ML] Pedido ${detail.numero} NÃO é CPF (tipo=${detail.cliente.tipo_pessoa}, doc=${detail.cliente.cpf_cnpj}) - PULANDO`);
           stats.skippedNF++;
+          checkedMLOrders.add(order.id);
           continue;
         }
 
         if (hasMaskedClientData(detail)) {
           console.log(`[BOT-ML] Pedido ${detail.numero} dados mascarados - PULANDO`);
           stats.skippedNF++;
+          checkedMLOrders.add(order.id);
           continue;
         }
 
         if (detail.id_nota_fiscal) {
           console.log(`[BOT-ML] Pedido ${detail.numero} já tem NF (${detail.id_nota_fiscal}), pulando`);
+          checkedMLOrders.add(order.id);
           continue;
         }
 
         if (!hasClientAddress(detail)) {
           console.log(`[BOT-ML] Pedido ${detail.numero} sem endereço completo - PULANDO`);
           stats.skippedNF++;
+          checkedMLOrders.add(order.id);
           continue;
         }
 
         if (!detail.numero_ecommerce) {
           console.log(`[BOT-ML] Pedido ${detail.numero} sem numero_ecommerce - PULANDO`);
           stats.skippedNF++;
+          checkedMLOrders.add(order.id);
           continue;
         }
 
@@ -311,6 +326,7 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
         if (nf.success) {
           stats.altered++;
           stats.nfGenerated++;
+          checkedMLOrders.add(order.id); // NF criada com sucesso, não precisa mais verificar
           if (nf.chaveAcesso) {
             stats.nfs.push({
               numero: nf.numero || '',
@@ -324,6 +340,7 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
           }
         } else {
           stats.errors++;
+          // NÃO adiciona ao cache em caso de erro — tenta de novo na próxima execução
         }
       } catch (err) {
         console.error(`[BOT-ML] Falha ao processar pedido ${order.id}:`, err);
@@ -426,22 +443,33 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
   ml.flushShipmentCache();
   console.log(`[BOT-ML] ${shipChecked} shipments verificados (${cacheHits} via cache, ${shipChecked - cacheHits} via API), ${matchingOrderIds.length} com pay_before <= ${dataColeta} 23:59`);
 
-  for (const mlOrderId of matchingOrderIds) {
+  // Filtra pedidos ML já verificados anteriormente
+  const mlToCheck = matchingOrderIds.filter(id => !checkedMLOrders.has(String(id)));
+  const mlSkippedCache = matchingOrderIds.length - mlToCheck.length;
+  if (mlSkippedCache > 0) {
+    console.log(`[BOT-ML] ${mlSkippedCache} pedidos ML já verificados antes, ${mlToCheck.length} para analisar`);
+  }
+
+  for (const mlOrderId of mlToCheck) {
     try {
       await sleep(1100);
       const tinyMatches = await searchByNumeroEcommerce(String(mlOrderId));
       if (tinyMatches.length === 0) {
         console.log(`[BOT-ML] Pedido ML ${mlOrderId} não encontrado no Tiny — PULANDO`);
         stats.skippedNF++;
+        checkedMLOrders.add(String(mlOrderId));
         continue;
       }
 
       for (const summary of tinyMatches) {
+        if (checkedMLOrders.has(summary.id)) continue;
+
         await sleep(1100);
         const detail = await getOrder(summary.id);
 
         if (!isMercadoLivreOrder(detail)) {
           console.log(`[BOT-ML] Pedido Tiny ${summary.numero} não é ML — PULANDO`);
+          checkedMLOrders.add(summary.id);
           continue;
         }
 
@@ -450,25 +478,30 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
         if (!isPessoaFisica(detail)) {
           console.log(`[BOT-ML] Pedido ${detail.numero} NÃO é CPF (tipo=${detail.cliente.tipo_pessoa}) - PULANDO`);
           stats.skippedNF++;
+          checkedMLOrders.add(summary.id);
           continue;
         }
         if (hasMaskedClientData(detail)) {
           console.log(`[BOT-ML] Pedido ${detail.numero} dados mascarados - PULANDO`);
           stats.skippedNF++;
+          checkedMLOrders.add(summary.id);
           continue;
         }
         if (detail.id_nota_fiscal) {
           console.log(`[BOT-ML] Pedido ${detail.numero} já tem NF (${detail.id_nota_fiscal}), pulando`);
+          checkedMLOrders.add(summary.id);
           continue;
         }
         if (!hasClientAddress(detail)) {
           console.log(`[BOT-ML] Pedido ${detail.numero} sem endereço - PULANDO`);
           stats.skippedNF++;
+          checkedMLOrders.add(summary.id);
           continue;
         }
         if (!detail.numero_ecommerce) {
           console.log(`[BOT-ML] Pedido ${detail.numero} sem numero_ecommerce - PULANDO`);
           stats.skippedNF++;
+          checkedMLOrders.add(summary.id);
           continue;
         }
 
@@ -478,6 +511,7 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
         if (nf.success) {
           stats.altered++;
           stats.nfGenerated++;
+          checkedMLOrders.add(summary.id);
           if (nf.chaveAcesso) {
             stats.nfs.push({
               numero: nf.numero || '',
@@ -544,28 +578,44 @@ export async function sendPendingNFsToShopee(customDataInicial?: string, customD
       await sleep(1100);
     }
 
-    console.log(`[SHOPEE-NF] ${allOrders.length} pedidos encontrados no período`);
+    // Pré-filtra pedidos pelo formato do Order SN da Shopee (YYMMDD + alfanum)
+    const potentialShopee = allOrders.filter(o => SHOPEE_ORDER_SN_REGEX.test(o.numero_ecommerce));
 
-    for (const order of allOrders) {
+    console.log(`[SHOPEE-NF] ${allOrders.length} pedidos no período, ${potentialShopee.length} possíveis Shopee`);
+
+    let shopeeCount = 0;
+    let withNF = 0;
+
+    for (const order of potentialShopee) {
       try {
         await sleep(1100);
         const detail = await getOrder(order.id);
 
         if (!isShopeeOrder(detail)) continue;
+        shopeeCount++;
 
         if (!detail.id_nota_fiscal) {
-          console.log(`[SHOPEE-NF] Pedido ${detail.numero} (${detail.numero_ecommerce}) sem NF — pulando`);
           result.skipped++;
           continue;
         }
 
         if (!detail.numero_ecommerce) {
-          console.log(`[SHOPEE-NF] Pedido ${detail.numero} sem numero_ecommerce — pulando`);
           result.skipped++;
           continue;
         }
 
-        // Busca dados da NF
+        withNF++;
+
+        // Verifica na Shopee ANTES de buscar XML — evita chamadas desnecessárias ao Tiny
+        await sleep(1100);
+        const invoiceCheck = await shopee.checkOrderInvoice(detail.numero_ecommerce);
+        if (invoiceCheck.hasInvoice) {
+          console.log(`[SHOPEE-NF] Pedido ${detail.numero_ecommerce} já tem invoice na Shopee — pulando`);
+          result.skipped++;
+          continue;
+        }
+
+        // Busca dados da NF (chave de acesso)
         await sleep(1100);
         const nfData = await getNFDetails(detail.id_nota_fiscal);
 
@@ -590,7 +640,7 @@ export async function sendPendingNFsToShopee(customDataInicial?: string, customD
         const sendResult = await shopee.uploadInvoiceDoc(detail.numero_ecommerce, xml);
 
         if (sendResult.success) {
-          console.log(`[SHOPEE-NF] ✓ NF enviada com sucesso para pedido ${detail.numero_ecommerce}`);
+          console.log(`[SHOPEE-NF] ✓ NF enviada para pedido ${detail.numero_ecommerce}`);
           result.sent++;
           result.details.push(`✓ ${detail.numero_ecommerce}: NF XML enviada`);
         } else {
@@ -604,12 +654,233 @@ export async function sendPendingNFsToShopee(customDataInicial?: string, customD
         result.details.push(`✗ Pedido ${order.numero}: ${err.message || String(err)}`);
       }
     }
+
+    console.log(`[SHOPEE-NF] Resumo: ${shopeeCount} pedidos Shopee confirmados, ${withNF} com NF no Tiny`);
   } catch (err: any) {
     console.error('[SHOPEE-NF] Falha na busca:', err);
     result.details.push(`Erro geral: ${err.message || String(err)}`);
   }
 
   console.log(`[SHOPEE-NF] Resultado: ${result.sent} enviadas, ${result.skipped} puladas, ${result.errors} erros`);
+  return result;
+}
+
+// === Processamento de pedido único ===
+
+export interface SingleOrderStep {
+  step: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface SingleOrderResult {
+  steps: SingleOrderStep[];
+  success: boolean;
+  orderSn: string;
+  tinyId?: string;
+  tinyNumero?: string;
+  clienteNome?: string;
+  nf?: {
+    numero: string;
+    nfId: string;
+    chaveAcesso: string;
+    valorNota: number;
+  };
+  nfSent?: boolean;
+}
+
+/**
+ * Processa um único pedido Shopee pelo Order SN — pipeline completo.
+ * 1. Extrai a data do SN (YYMMDD) e busca no Tiny por faixa de data (confiável)
+ * 2. Filtra localmente pelo numero_ecommerce exato
+ * 3. Valida dados do cliente
+ * 4. Gera NF com desconto (se não existir)
+ * 5. Envia NF (XML) para a Shopee
+ */
+export async function processSingleShopeeOrder(orderSn: string): Promise<SingleOrderResult> {
+  const result: SingleOrderResult = { steps: [], success: false, orderSn };
+
+  console.log(`\n[SINGLE] ========== Processando pedido Shopee: ${orderSn} ==========`);
+
+  // --- Step 1: Validar formato e extrair data ---
+  if (!SHOPEE_ORDER_SN_REGEX.test(orderSn)) {
+    result.steps.push({ step: 'Validar formato', ok: false, detail: `"${orderSn}" não parece ser um Order SN da Shopee (formato: YYMMDD + alfanumérico)` });
+    return result;
+  }
+
+  const yy = parseInt(orderSn.slice(0, 2), 10);
+  const mm = parseInt(orderSn.slice(2, 4), 10);
+  const dd = parseInt(orderSn.slice(4, 6), 10);
+  const baseDate = new Date(2000 + yy, mm - 1, dd);
+
+  // Busca ±1 dia para cobrir diferenças de fuso horário
+  const dayBefore = new Date(baseDate);
+  dayBefore.setDate(dayBefore.getDate() - 1);
+  const dayAfter = new Date(baseDate);
+  dayAfter.setDate(dayAfter.getDate() + 1);
+
+  const dataInicial = formatDate(dayBefore);
+  const dataFinal = formatDate(dayAfter);
+  const dataBase = formatDate(baseDate);
+
+  result.steps.push({ step: 'Extrair data do SN', ok: true, detail: `Data base: ${dataBase} — buscando de ${dataInicial} a ${dataFinal}` });
+
+  // --- Step 2: Buscar no Tiny por data e filtrar pelo numero_ecommerce exato ---
+  console.log(`[SINGLE] Buscando pedidos no Tiny de ${dataInicial} a ${dataFinal}...`);
+  let tinyOrder: { id: string; numero: string; numero_ecommerce: string; situacao: string } | null = null;
+
+  try {
+    let page = 1;
+    let totalPages = 1;
+    let totalScanned = 0;
+
+    while (page <= totalPages) {
+      const searchResult = await searchOrders({ dataInicial, dataFinal, pagina: page });
+      totalPages = searchResult.totalPages;
+      totalScanned += searchResult.orders.length;
+
+      // Filtro local: match exato no numero_ecommerce
+      const match = searchResult.orders.find(o => o.numero_ecommerce === orderSn);
+      if (match) {
+        tinyOrder = match;
+        break;
+      }
+
+      page++;
+      if (page <= totalPages) await sleep(1100);
+    }
+
+    if (!tinyOrder) {
+      result.steps.push({ step: 'Buscar no Tiny', ok: false, detail: `Pedido ${orderSn} não encontrado entre ${totalScanned} pedidos de ${dataInicial} a ${dataFinal}. Verifique se o pedido foi importado no Tiny.` });
+      return result;
+    }
+  } catch (err: any) {
+    result.steps.push({ step: 'Buscar no Tiny', ok: false, detail: `Erro na busca: ${err.message}` });
+    return result;
+  }
+
+  result.tinyId = tinyOrder.id;
+  result.tinyNumero = tinyOrder.numero;
+  result.steps.push({ step: 'Buscar no Tiny', ok: true, detail: `Encontrado: Pedido Tiny #${tinyOrder.numero} (ID ${tinyOrder.id}) — Status: ${tinyOrder.situacao}` });
+
+  // --- Step 3: Obter detalhes completos e validar ---
+  await sleep(1100);
+  let detail: Awaited<ReturnType<typeof getOrder>>;
+  try {
+    detail = await getOrder(tinyOrder.id);
+  } catch (err: any) {
+    result.steps.push({ step: 'Validar pedido', ok: false, detail: `Erro ao obter detalhes: ${err.message}` });
+    return result;
+  }
+
+  result.clienteNome = detail.cliente.nome;
+
+  if (!isShopeeOrder(detail)) {
+    result.steps.push({ step: 'Validar pedido', ok: false, detail: `Pedido não é da Shopee (ecommerce: ${detail.ecommerce?.nomeEcommerce || 'N/A'})` });
+    return result;
+  }
+  if (hasMaskedClientData(detail)) {
+    result.steps.push({ step: 'Validar pedido', ok: false, detail: 'Dados do cliente mascarados (***). Atualize no Tiny primeiro.' });
+    return result;
+  }
+  if (!hasClientAddress(detail)) {
+    result.steps.push({ step: 'Validar pedido', ok: false, detail: 'Pedido sem endereço completo do cliente no Tiny.' });
+    return result;
+  }
+  if (!detail.numero_ecommerce) {
+    result.steps.push({ step: 'Validar pedido', ok: false, detail: 'Pedido sem numero_ecommerce — NF não linkaria com a Shopee.' });
+    return result;
+  }
+
+  result.steps.push({ step: 'Validar pedido', ok: true, detail: `${detail.cliente.nome} — ${detail.cliente.cidade}/${detail.cliente.uf} — R$ ${detail.total_pedido}` });
+
+  // --- Step 4: Gerar NF (se não existir) ---
+  let nfId = detail.id_nota_fiscal;
+
+  if (nfId) {
+    // NF já existe — busca detalhes
+    await sleep(1100);
+    try {
+      const nfData = await getNFDetails(nfId);
+      result.nf = {
+        numero: nfData.numero || '',
+        nfId,
+        chaveAcesso: nfData.chaveAcesso || '',
+        valorNota: nfData.valorNota || 0,
+      };
+      result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF ${nfData.numero || nfId} já existia — Chave: ...${(nfData.chaveAcesso || '').slice(-8)}` });
+    } catch {
+      result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF já vinculada (ID: ${nfId}) — detalhes indisponíveis` });
+    }
+  } else {
+    // Gerar NF com desconto
+    const discount = config.shopeeDiscountPercent;
+    console.log(`[SINGLE] Gerando NF com ${discount}% desconto para ${orderSn}...`);
+    await sleep(1100);
+
+    try {
+      const nf = await createAndEmitNFDiscounted(detail, discount, 'Shopee');
+      if (nf.success && nf.chaveAcesso) {
+        nfId = nf.nfId;
+        result.nf = {
+          numero: nf.numero || '',
+          nfId: nf.nfId || '',
+          chaveAcesso: nf.chaveAcesso || '',
+          valorNota: nf.valorNota || 0,
+        };
+        result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF ${nf.numero} emitida — R$ ${(nf.valorNota || 0).toFixed(2)} — Chave: ...${nf.chaveAcesso.slice(-8)}` });
+      } else {
+        result.steps.push({ step: 'Nota Fiscal', ok: false, detail: 'Falha ao gerar/emitir NF. Verifique os logs do servidor.' });
+        return result;
+      }
+    } catch (err: any) {
+      result.steps.push({ step: 'Nota Fiscal', ok: false, detail: `Erro: ${err.message}` });
+      return result;
+    }
+  }
+
+  // --- Step 5: Enviar NF (XML) para a Shopee ---
+  if (!nfId) {
+    result.steps.push({ step: 'Enviar NF para Shopee', ok: false, detail: 'Sem ID da NF — impossível enviar.' });
+    return result;
+  }
+
+  // Verifica se já foi enviada
+  let alreadySent = false;
+  try {
+    await sleep(1100);
+    const check = await shopee.checkOrderInvoice(orderSn);
+    alreadySent = check.hasInvoice;
+  } catch {}
+
+  if (alreadySent) {
+    result.steps.push({ step: 'Enviar NF para Shopee', ok: true, detail: 'NF já registrada na Shopee — nada a fazer.' });
+    result.nfSent = true;
+  } else {
+    // Busca XML e envia
+    try {
+      await sleep(1100);
+      const xml = await getNFXml(nfId);
+      if (!xml) {
+        result.steps.push({ step: 'Enviar NF para Shopee', ok: false, detail: 'XML da NF não disponível no Tiny ainda. Tente novamente em alguns segundos.' });
+        return result;
+      }
+
+      await sleep(1100);
+      const upload = await shopee.uploadInvoiceDoc(orderSn, xml);
+      if (upload.success) {
+        result.steps.push({ step: 'Enviar NF para Shopee', ok: true, detail: 'XML da NF enviado com sucesso para a Shopee.' });
+        result.nfSent = true;
+      } else {
+        result.steps.push({ step: 'Enviar NF para Shopee', ok: false, detail: `Falha no upload: ${upload.error}` });
+      }
+    } catch (err: any) {
+      result.steps.push({ step: 'Enviar NF para Shopee', ok: false, detail: `Erro: ${err.message}` });
+    }
+  }
+
+  result.success = result.steps.every(s => s.ok);
+  console.log(`[SINGLE] ========== Resultado: ${result.success ? 'SUCESSO' : 'COM ERROS'} — ${result.steps.length} etapas ==========`);
   return result;
 }
 

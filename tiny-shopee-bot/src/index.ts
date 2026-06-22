@@ -2,11 +2,13 @@ import * as http from 'http';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as cron from 'node-cron';
+import * as XLSX from 'xlsx';
 import { config } from './config';
-import { processNewShopeeOrders, processMercadoLivreOrdersForDate, processMercadoLivreByCollectionDate, clearProcessedOrders, sendPendingNFsToShopee, ProcessedNF } from './bot.service';
+import { processNewShopeeOrders, processMercadoLivreOrdersForDate, processMercadoLivreByCollectionDate, clearProcessedOrders, sendPendingNFsToShopee, ProcessedNF, processSingleShopeeOrder, SingleOrderResult } from './bot.service';
 import { getLogs } from './log-buffer';
 import * as ml from './ml-client';
 import * as shopeeClient from './shopee-client';
+import * as tinyClient from './tiny-client';
 
 console.log('===========================================');
 console.log('  Tiny Shopee Bot - Alteracao de Valores');
@@ -27,6 +29,158 @@ let totalOrdersSynced = 0;
 let totalNFsEmitted = 0;
 const startTime = new Date();
 let automationPaused = config.automationPausedDefault;
+
+// CSV path for Shopee bulk NF upload
+const SHOPEE_CSV_PATH = '/app/data/shopee_nfs.csv';
+
+// Checklist de pedidos — persistido em disco
+const CHECKLIST_PATH = '/app/data/checklist.json';
+
+interface ChecklistItem {
+  nfNumero: string;
+  nfId: string;
+  chaveAcesso: string;
+  clienteNome: string;
+  numeroPedido: string;
+  valor: number;
+  canal: string; // 'Shopee' | 'Mercado Livre'
+  dataEmissao: string;
+  checked: boolean;
+  checkedAt?: string;
+}
+
+function loadChecklist(): ChecklistItem[] {
+  try {
+    if (fs.existsSync(CHECKLIST_PATH)) {
+      return JSON.parse(fs.readFileSync(CHECKLIST_PATH, 'utf-8'));
+    }
+  } catch (err) {
+    console.warn('[CHECKLIST] Falha ao carregar:', err);
+  }
+  return [];
+}
+
+function saveChecklist(items: ChecklistItem[]): void {
+  try {
+    fs.writeFileSync(CHECKLIST_PATH, JSON.stringify(items, null, 2), 'utf-8');
+  } catch (err) {
+    console.warn('[CHECKLIST] Falha ao salvar:', err);
+  }
+}
+
+function addToChecklist(nfs: ProcessedNF[], canal: string): void {
+  if (!nfs || nfs.length === 0) return;
+  const items = loadChecklist();
+  const existingKeys = new Set(items.map(i => i.nfId || i.nfNumero));
+
+  let added = 0;
+  for (const nf of nfs) {
+    const key = nf.nfId || nf.numero;
+    if (existingKeys.has(key)) continue;
+    items.push({
+      nfNumero: nf.numero,
+      nfId: nf.nfId,
+      chaveAcesso: nf.chaveAcesso,
+      clienteNome: nf.clienteNome,
+      numeroPedido: nf.numeroEcommerce,
+      valor: nf.valorNota,
+      canal,
+      dataEmissao: nf.dataProcessamento,
+      checked: false,
+    });
+    added++;
+  }
+
+  if (added > 0) {
+    saveChecklist(items);
+    console.log(`[CHECKLIST] ${added} pedidos adicionados (${canal})`);
+  }
+}
+
+/**
+ * Salva/atualiza CSV com dados de NFs para upload em massa na Shopee.
+ * Formato interno: "ID do pedido","Chave de Acesso","NF ID"
+ * (terceira coluna = nfId do Tiny, usada para relatório de separação)
+ */
+function appendToShopeeCSV(nfs: ProcessedNF[]) {
+  if (!nfs || nfs.length === 0) return;
+  const newRows = nfs
+    .filter(n => n.chaveAcesso && n.numeroEcommerce)
+    .map(n => `${n.numeroEcommerce},${n.chaveAcesso},${n.nfId || ''}`);
+  if (newRows.length === 0) return;
+
+  let existing = '';
+  try { existing = fs.readFileSync(SHOPEE_CSV_PATH, 'utf-8'); } catch {}
+
+  // Se arquivo vazio, escreve o cabeçalho no arquivo
+  if (!existing.trim()) {
+    existing = 'ID do pedido,Chave de Acesso,NF ID\n';
+    try { fs.writeFileSync(SHOPEE_CSV_PATH, existing); } catch {}
+  }
+
+  // Migra header antigo (sem coluna NF ID) para novo formato
+  const headerLine = existing.split('\n')[0].toLowerCase();
+  if ((headerLine.includes('pedido') || headerLine.includes('chave')) && !headerLine.includes('nf id')) {
+    const lines = existing.split('\n').filter(l => l.trim());
+    lines[0] = 'ID do pedido,Chave de Acesso,NF ID';
+    existing = lines.join('\n') + '\n';
+    try { fs.writeFileSync(SHOPEE_CSV_PATH, existing); } catch {}
+  }
+
+  // Migra header antigo com ;
+  if (existing.startsWith('numero_pedido;') || existing.startsWith('numero_pedido,')) {
+    const lines = existing.split('\n').filter(l => l.trim());
+    lines[0] = 'ID do pedido,Chave de Acesso,NF ID';
+    existing = lines.map(l => l.replace(/;/g, ',')).join('\n') + '\n';
+    try { fs.writeFileSync(SHOPEE_CSV_PATH, existing); } catch {}
+  }
+
+  // Evita duplicatas (por numero_pedido)
+  const existingOrders = new Set(existing.split('\n').map(l => l.split(',')[0]));
+  const uniqueRows = newRows.filter(r => !existingOrders.has(r.split(',')[0]));
+
+  if (uniqueRows.length > 0) {
+    fs.appendFileSync(SHOPEE_CSV_PATH, uniqueRows.join('\n') + '\n');
+    console.log(`[CSV] ${uniqueRows.length} NFs adicionadas ao CSV (${SHOPEE_CSV_PATH})`);
+  }
+}
+
+/**
+ * Gera arquivo XLSX no formato exato do template Shopee para upload em massa.
+ * Colunas: "ID do pedido" | "Chave de Acesso"
+ */
+function generateShopeeXLSX(): Buffer | null {
+  let csv = '';
+  try { csv = fs.readFileSync(SHOPEE_CSV_PATH, 'utf-8'); } catch { return null; }
+  if (!csv.trim()) return null;
+
+  const lines = csv.trim().split('\n');
+  if (lines.length === 0) return null;
+
+  const rows: string[][] = [];
+  rows.push(['ID do pedido', 'Chave de Acesso']); // header XLSX
+
+  // Detecta se a primeira linha é cabeçalho (contém "pedido" ou "chave")
+  const firstLine = lines[0].toLowerCase();
+  const hasHeader = firstLine.includes('pedido') || firstLine.includes('chave') || firstLine.includes('numero');
+  const startIdx = hasHeader ? 1 : 0;
+
+  for (let i = startIdx; i < lines.length; i++) {
+    const parts = lines[i].split(/[,;]/);
+    if (parts.length >= 2 && parts[0].trim() && parts[1].trim()) {
+      rows.push([parts[0].trim(), parts[1].trim()]);
+    }
+  }
+
+  if (rows.length <= 1) return null;
+
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  // Ajusta largura das colunas
+  ws['!cols'] = [{ wch: 20 }, { wch: 50 }];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'NFs');
+  return Buffer.from(XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }));
+}
 
 // ML state
 let mlIsRunning = false;
@@ -269,6 +423,11 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === '/status') {
+    let csvCount = 0;
+    try {
+      const csvContent = fs.readFileSync(SHOPEE_CSV_PATH, 'utf-8');
+      csvCount = Math.max(0, csvContent.trim().split('\n').length - 1);
+    } catch {}
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
@@ -283,6 +442,7 @@ const server = http.createServer(async (req, res) => {
       totalOrdersSynced,
       totalNFsEmitted,
       automationPaused,
+      csvCount,
       logs: getLogs().slice(0, 50),
     }));
   } else if (url.pathname === '/run' && req.method === 'POST') {
@@ -388,6 +548,130 @@ const server = http.createServer(async (req, res) => {
     sendPendingNFsToShopee(de, ate).then(result => {
       console.log(`[SHOPEE-NF] Envio retroativo concluído:`, result);
     });
+  } else if (url.pathname === '/shopee/csv' && req.method === 'GET') {
+    // Download CSV para upload em massa na Shopee
+    try {
+      const csv = fs.readFileSync(SHOPEE_CSV_PATH, 'utf-8');
+      const lines = csv.trim().split('\n');
+      const count = Math.max(0, lines.length - 1); // subtract header
+      res.writeHead(200, {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': `attachment; filename="shopee_nfs_${new Date().toISOString().slice(0, 10)}.csv"`,
+      });
+      res.end(csv);
+      console.log(`[CSV] Download do CSV (${count} NFs)`);
+    } catch {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Nenhum CSV disponível. Processe pedidos Shopee primeiro.' }));
+    }
+  } else if (url.pathname === '/shopee/csv' && req.method === 'DELETE') {
+    // Limpa CSV (ex: após upload na Shopee)
+    try { fs.unlinkSync(SHOPEE_CSV_PATH); } catch {}
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, message: 'CSV limpo com sucesso' }));
+  } else if (url.pathname === '/shopee/xlsx' && req.method === 'GET') {
+    // Download XLSX no formato Shopee para upload em massa
+    const xlsx = generateShopeeXLSX();
+    if (xlsx) {
+      res.writeHead(200, {
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Content-Disposition': `attachment; filename="shopee_nfs_${new Date().toISOString().slice(0, 10)}.xlsx"`,
+        'Content-Length': String(xlsx.length),
+      });
+      res.end(xlsx);
+      console.log(`[XLSX] Download da planilha Shopee`);
+    } else {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Nenhuma NF disponível. Processe pedidos Shopee primeiro.' }));
+    }
+  } else if (url.pathname === '/shopee/test-logistics' && req.method === 'GET') {
+    const orderSn = url.searchParams.get('order_sn') || '';
+    if (!orderSn) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Parâmetro order_sn obrigatório' }));
+      return;
+    }
+    try {
+      console.log(`[SHOPEE] Testando API logistics para pedido ${orderSn}...`);
+      const result = await shopeeClient.getShippingParameter(orderSn);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: result.success, orderSn, ...result }, null, 2));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+  } else if (url.pathname === '/shopee/shipping-label' && req.method === 'GET') {
+    const orderSn = url.searchParams.get('order_sn') || '';
+    if (!orderSn) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Parâmetro order_sn obrigatório' }));
+      return;
+    }
+    try {
+      console.log(`[SHOPEE] Baixando etiqueta para pedido ${orderSn}...`);
+      const result = await shopeeClient.getShippingLabel(orderSn);
+      if (result.success && result.pdf) {
+        res.writeHead(200, {
+          'Content-Type': 'application/pdf',
+          'Content-Disposition': `attachment; filename="etiqueta_${orderSn}.pdf"`,
+          'Content-Length': String(result.pdf.length),
+        });
+        res.end(result.pdf);
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: result.error, orderSn, steps: result.steps }, null, 2));
+      }
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+  } else if (url.pathname === '/shopee/diagnose-label' && req.method === 'GET') {
+    const orderSn = url.searchParams.get('order_sn') || '';
+    if (!orderSn) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Parâmetro order_sn obrigatório' }));
+      return;
+    }
+    try {
+      console.log(`[SHOPEE] Diagnóstico etiqueta para pedido ${orderSn}...`);
+      const diag = await shopeeClient.diagnoseShippingLabel(orderSn);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(diag, null, 2));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+  } else if (url.pathname === '/shopee/labels-available' && req.method === 'GET') {
+    // Lista pedidos disponíveis para etiqueta (READY_TO_SHIP e PROCESSED) com status de NF
+    try {
+      const results: any[] = [];
+      for (const status of ['READY_TO_SHIP', 'PROCESSED']) {
+        const listResult = await shopeeClient.getOrderList({ orderStatus: status });
+        if (listResult.success && listResult.orders) {
+          for (const sn of listResult.orders) {
+            results.push({ order_sn: sn, status });
+          }
+        }
+      }
+      // Verifica NF de cada pedido (em paralelo, max 5 por vez)
+      const enriched: any[] = [];
+      for (let i = 0; i < results.length; i += 5) {
+        const batch = results.slice(i, i + 5);
+        const checks = await Promise.all(
+          batch.map(async (o) => {
+            const inv = await shopeeClient.checkOrderInvoice(o.order_sn);
+            return { ...o, hasNF: inv.hasInvoice, orderStatus: inv.orderStatus || o.status };
+          })
+        );
+        enriched.push(...checks);
+      }
+      const readyCount = enriched.filter(o => o.hasNF).length;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, count: enriched.length, readyForLabel: readyCount, orders: enriched }, null, 2));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
   } else if (url.pathname === '/shopee/status' && req.method === 'GET') {
     const info = shopeeClient.getConnectionInfo();
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -397,6 +681,1520 @@ const server = http.createServer(async (req, res) => {
       expiresAt: info.expiresAt,
       discountPercent: config.shopeeDiscountPercent,
     }));
+
+  // === Shopee: batch download all labels ===
+  } else if (url.pathname === '/shopee/labels-batch' && req.method === 'GET') {
+    try {
+      console.log('[SHOPEE] Download em lote de etiquetas (PDF único) iniciado...');
+      const allOrders: Array<{ order_sn: string; status: string }> = [];
+      for (const status of ['READY_TO_SHIP', 'PROCESSED']) {
+        const listResult = await shopeeClient.getOrderList({ orderStatus: status });
+        if (listResult.success && listResult.orders) {
+          for (const sn of listResult.orders) {
+            allOrders.push({ order_sn: sn, status });
+          }
+        }
+      }
+
+      if (allOrders.length === 0) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Nenhum pedido disponível para etiqueta' }));
+        return;
+      }
+
+      // Filtra apenas pedidos com NF (os sem NF não podem gerar etiqueta)
+      const prepareResults: shopeeClient.PrepareResult[] = [];
+      for (const order of allOrders) {
+        const prepResult = await shopeeClient.prepareShippingLabel(order.order_sn);
+        prepareResults.push(prepResult);
+        if (prepResult.success) {
+          await new Promise(r => setTimeout(r, 1500)); // Delay entre preparações
+        }
+      }
+
+      const prepared = prepareResults.filter(r => r.success);
+      const failed = prepareResults.filter(r => !r.success);
+      console.log(`[SHOPEE] Batch: ${prepared.length} preparados, ${failed.length} falharam`);
+
+      if (prepared.length === 0) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Nenhum pedido elegível para etiqueta', details: prepareResults }));
+        return;
+      }
+
+      // Aguarda documentos ficarem prontos
+      console.log(`[SHOPEE] Batch: aguardando documentos ficarem prontos...`);
+      await new Promise(r => setTimeout(r, 5000));
+
+      // Download único de todos os pedidos preparados → PDF combinado
+      const batchResult = await shopeeClient.downloadShippingDocumentBatch(
+        prepared.map(p => ({ order_sn: p.order_sn, docType: p.docType }))
+      );
+
+      if (batchResult.success && batchResult.pdf) {
+        const filename = `etiquetas_shopee_${new Date().toISOString().slice(0, 10)}.pdf`;
+        res.writeHead(200, {
+          'Content-Type': 'application/pdf',
+          'Content-Disposition': `attachment; filename="${filename}"`,
+          'Content-Length': String(batchResult.pdf.length),
+        });
+        res.end(batchResult.pdf);
+        console.log(`[SHOPEE] Batch: PDF único ${batchResult.pdf.length} bytes (${prepared.length} etiquetas)`);
+      } else {
+        // Fallback: se batch falhou, tenta download individual
+        console.log(`[SHOPEE] Batch download falhou (${batchResult.error}), tentando individual...`);
+        const pdfs: Buffer[] = [];
+        for (const p of prepared) {
+          const dlResult = await shopeeClient.downloadShippingDocument(p.order_sn, p.docType);
+          if (dlResult.success && dlResult.pdf) pdfs.push(dlResult.pdf);
+        }
+        if (pdfs.length > 0) {
+          // Retorna o primeiro como PDF (infelizmente sem combinar sem lib externa)
+          res.writeHead(200, {
+            'Content-Type': 'application/pdf',
+            'Content-Disposition': `attachment; filename="etiqueta_shopee_${prepared[0].order_sn}.pdf"`,
+            'Content-Length': String(pdfs[0].length),
+          });
+          res.end(pdfs[0]);
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: false,
+            error: `Batch falhou: ${batchResult.error}. Individual também falhou.`,
+            prepared: prepared.length,
+            failed: failed.length,
+            details: prepareResults,
+          }));
+        }
+      }
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+
+  // === ML: list paid orders with shipping (for labels) ===
+  } else if (url.pathname === '/ml/labels-available' && req.method === 'GET') {
+    try {
+      const daysBack = Math.min(parseInt(url.searchParams.get('days') || '3', 10), 7);
+      const startTime = Date.now();
+      console.log(`[ML] Listando pedidos pagos com envio (${daysBack} dias)...`);
+      const result = await ml.getOrdersReadyForLabels(daysBack);
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`[ML] Listagem concluída em ${elapsed}s: ${result.orders.length} pedidos`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        count: result.orders.length,
+        daysBack,
+        elapsedSeconds: parseFloat(elapsed),
+        totalPaidOrders: result.totalPaidOrders,
+        orders: result.orders,
+      }, null, 2));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+
+  // === ML: download single label by shipment_id ===
+  } else if (url.pathname === '/ml/shipping-label' && req.method === 'GET') {
+    const shipmentId = url.searchParams.get('shipment_id');
+    if (!shipmentId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Parâmetro shipment_id obrigatório' }));
+      return;
+    }
+    try {
+      console.log(`[ML] Baixando etiqueta para shipment ${shipmentId}...`);
+      const result = await ml.downloadShippingLabels([parseInt(shipmentId, 10)]);
+      if (result.success && result.pdf) {
+        res.writeHead(200, {
+          'Content-Type': 'application/pdf',
+          'Content-Disposition': `attachment; filename="etiqueta_ml_${shipmentId}.pdf"`,
+          'Content-Length': String(result.pdf.length),
+        });
+        res.end(result.pdf);
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: result.error }));
+      }
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+
+  // === ML: download label by order ID ===
+  } else if (url.pathname === '/ml/label-by-order' && req.method === 'GET') {
+    const orderId = url.searchParams.get('order_id');
+    if (!orderId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Parâmetro order_id obrigatório' }));
+      return;
+    }
+    try {
+      console.log(`[ML] Baixando etiqueta para pedido ${orderId}...`);
+      const result = await ml.downloadLabelByOrderId(parseInt(orderId, 10));
+      if (result.success && result.pdf) {
+        console.log(`[ML] Etiqueta pedido ${orderId} (shipment ${result.shipmentId}): ${result.pdf.length} bytes`);
+        res.writeHead(200, {
+          'Content-Type': 'application/pdf',
+          'Content-Disposition': `attachment; filename="etiqueta_ml_${orderId}.pdf"`,
+          'Content-Length': String(result.pdf.length),
+        });
+        res.end(result.pdf);
+      } else {
+        console.warn(`[ML] Etiqueta pedido ${orderId} falhou: ${result.error}`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: result.error, shipmentId: result.shipmentId }));
+      }
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+
+  // === ML: batch download all available labels ===
+  } else if (url.pathname === '/ml/labels-batch' && req.method === 'GET') {
+    try {
+      const daysBack = Math.min(parseInt(url.searchParams.get('days') || '3', 10), 7);
+      console.log(`[ML] Download em lote de etiquetas ML (${daysBack} dias)...`);
+      const labelsResult = await ml.getOrdersReadyForLabels(daysBack);
+
+      if (labelsResult.orders.length === 0) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Nenhum pedido ML pago com envio pendente encontrado' }));
+        return;
+      }
+
+      // Usa downloadShippingLabelsBatch que tenta batch primeiro, depois individual como fallback
+      const shipmentIds = labelsResult.orders.map(o => o.shipmentId);
+      console.log(`[ML] Baixando etiquetas para ${shipmentIds.length} pedidos...`);
+      const result = await ml.downloadShippingLabelsBatch(shipmentIds);
+
+      if (result.success && result.pdf) {
+        const failedCount = result.failedIds?.length || 0;
+        console.log(`[ML] ${result.count || 0} etiquetas baixadas` + (failedCount > 0 ? ` (${failedCount} indisponíveis)` : ''));
+        res.writeHead(200, {
+          'Content-Type': 'application/pdf',
+          'Content-Disposition': `attachment; filename="etiquetas_ml_${new Date().toISOString().slice(0, 10)}.pdf"`,
+          'Content-Length': String(result.pdf.length),
+          'X-ML-Labels-Downloaded': String(result.count || 0),
+          'X-ML-Labels-Failed': String(failedCount),
+        });
+        res.end(result.pdf);
+      } else {
+        // Nenhuma etiqueta disponível — retornar detalhes dos erros
+        const details = (result.failedDetails || []).map(d => `${d.shipment_id}: ${d.error_code} — ${d.message.slice(0, 80)}`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: false,
+          error: result.error,
+          details: details.slice(0, 10), // primeiros 10 erros
+          totalFailed: result.failedIds?.length || 0,
+          orderCount: labelsResult.orders.length,
+        }));
+      }
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+
+  // === Checklist: list items ===
+  } else if (url.pathname === '/checklist' && req.method === 'GET') {
+    const items = loadChecklist();
+    const showChecked = url.searchParams.get('show_checked') !== 'false';
+    const filtered = showChecked ? items : items.filter(i => !i.checked);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      ok: true,
+      total: items.length,
+      checked: items.filter(i => i.checked).length,
+      unchecked: items.filter(i => !i.checked).length,
+      items: filtered,
+    }));
+
+  // === Checklist: toggle item ===
+  } else if (url.pathname === '/checklist/toggle' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk: any) => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const { nfId, checked } = JSON.parse(body);
+        if (!nfId) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'nfId obrigatório' }));
+          return;
+        }
+        const items = loadChecklist();
+        const item = items.find(i => i.nfId === nfId || i.nfNumero === nfId);
+        if (!item) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Item não encontrado' }));
+          return;
+        }
+        item.checked = checked !== undefined ? !!checked : !item.checked;
+        item.checkedAt = item.checked ? new Date().toISOString() : undefined;
+        saveChecklist(items);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, nfId: item.nfId, checked: item.checked }));
+      } catch (err: any) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'JSON inválido' }));
+      }
+    });
+
+  // === Checklist: toggle all ===
+  } else if (url.pathname === '/checklist/toggle-all' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk: any) => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const { checked } = JSON.parse(body);
+        const items = loadChecklist();
+        const now = new Date().toISOString();
+        for (const item of items) {
+          item.checked = !!checked;
+          item.checkedAt = checked ? now : undefined;
+        }
+        saveChecklist(items);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, total: items.length, checked: !!checked }));
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'JSON inválido' }));
+      }
+    });
+
+  // === Checklist: clear checked items ===
+  } else if (url.pathname === '/checklist/clear-checked' && req.method === 'DELETE') {
+    const items = loadChecklist();
+    const remaining = items.filter(i => !i.checked);
+    const removed = items.length - remaining.length;
+    saveChecklist(remaining);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, removed, remaining: remaining.length }));
+
+  // === Gerar etiquetas em lote para pedidos específicos (do relatório de separação) ===
+  } else if (url.pathname === '/shopee/labels-batch-csv' && req.method === 'GET') {
+    try {
+      const orderSnsParam = url.searchParams.get('order_sns') || '';
+      const orderSns = orderSnsParam.split(',').map(s => s.trim()).filter(Boolean);
+      if (orderSns.length === 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Nenhum pedido informado' }));
+        return;
+      }
+
+      console.log(`[SHOPEE-LABELS-CSV] Gerando etiquetas para ${orderSns.length} pedidos do relatório...`);
+
+      // Prepara cada pedido (ship_order + create_document)
+      const prepareResults: shopeeClient.PrepareResult[] = [];
+      for (const sn of orderSns) {
+        const prepResult = await shopeeClient.prepareShippingLabel(sn);
+        prepareResults.push(prepResult);
+        if (prepResult.success) {
+          await new Promise(r => setTimeout(r, 1500));
+        }
+      }
+
+      const prepared = prepareResults.filter(r => r.success);
+      const failed = prepareResults.filter(r => !r.success);
+      console.log(`[SHOPEE-LABELS-CSV] ${prepared.length} preparados, ${failed.length} falharam`);
+
+      if (prepared.length === 0) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: `Nenhum pedido elegível para etiqueta (${failed.length} falharam)`, details: failed.map(f => ({ order_sn: f.order_sn, error: f.error })) }));
+        return;
+      }
+
+      // Aguarda documentos ficarem prontos
+      await new Promise(r => setTimeout(r, 5000));
+
+      // Download batch PDF
+      const batchResult = await shopeeClient.downloadShippingDocumentBatch(
+        prepared.map(p => ({ order_sn: p.order_sn, docType: p.docType }))
+      );
+
+      if (batchResult.success && batchResult.pdf) {
+        const filename = `etiquetas_separacao_${new Date().toISOString().slice(0, 10)}.pdf`;
+        res.writeHead(200, {
+          'Content-Type': 'application/pdf',
+          'Content-Disposition': `attachment; filename="${filename}"`,
+          'Content-Length': String(batchResult.pdf.length),
+        });
+        res.end(batchResult.pdf);
+        console.log(`[SHOPEE-LABELS-CSV] PDF gerado: ${batchResult.pdf.length} bytes (${prepared.length} etiquetas)`);
+      } else {
+        // Fallback individual
+        console.log(`[SHOPEE-LABELS-CSV] Batch falhou, tentando individual...`);
+        const pdfs: Buffer[] = [];
+        for (const p of prepared) {
+          const dlResult = await shopeeClient.downloadShippingDocument(p.order_sn, p.docType);
+          if (dlResult.success && dlResult.pdf) pdfs.push(dlResult.pdf);
+        }
+        if (pdfs.length > 0) {
+          res.writeHead(200, {
+            'Content-Type': 'application/pdf',
+            'Content-Disposition': `attachment; filename="etiqueta_${prepared[0].order_sn}.pdf"`,
+            'Content-Length': String(pdfs[0].length),
+          });
+          res.end(pdfs[0]);
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Não foi possível gerar nenhuma etiqueta' }));
+        }
+      }
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+
+  // === Relatório de separação: busca detalhes dos pedidos do CSV (ou checklist como fallback) ===
+  } else if (url.pathname === '/shopee/picking-list' && req.method === 'GET') {
+    try {
+      let csv = '';
+      try { csv = fs.readFileSync(SHOPEE_CSV_PATH, 'utf-8'); } catch {}
+
+      // Fallback: se CSV vazio, tenta montar a partir do checklist
+      if (!csv.trim()) {
+        let checklist: ChecklistItem[] = [];
+        try { checklist = JSON.parse(fs.readFileSync(CHECKLIST_PATH, 'utf-8')); } catch {}
+        const shopeeItems = checklist.filter(c => c.nfId && c.numeroPedido);
+        if (shopeeItems.length > 0) {
+          const fallbackLines = ['ID do pedido,Chave de Acesso,NF ID'];
+          for (const item of shopeeItems) {
+            fallbackLines.push(`${item.numeroPedido},${item.chaveAcesso || ''},${item.nfId}`);
+          }
+          csv = fallbackLines.join('\n');
+          console.log(`[PICKING] CSV vazio — usando ${shopeeItems.length} itens do checklist como fallback`);
+        }
+      }
+
+      if (!csv.trim()) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Nenhuma NF encontrada — processe pedidos Shopee primeiro' }));
+        return;
+      }
+
+      const lines = csv.trim().split('\n');
+      const firstLine = lines[0].toLowerCase();
+      const hasHeader = firstLine.includes('pedido') || firstLine.includes('chave') || firstLine.includes('numero');
+      const startIdx = hasHeader ? 1 : 0;
+
+      const pickingOrders: Array<{ order_sn: string; chaveAcesso: string; nfId: string }> = [];
+      for (let i = startIdx; i < lines.length; i++) {
+        const parts = lines[i].split(/[,;]/);
+        if (parts.length >= 2 && parts[0].trim()) {
+          const orderSn = parts[0].trim();
+          const chaveAcesso = (parts[1] || '').trim();
+          const nfId = (parts[2] || '').trim();
+          pickingOrders.push({ order_sn: orderSn, chaveAcesso, nfId });
+        }
+      }
+
+      if (pickingOrders.length === 0) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Nenhum pedido no CSV' }));
+        return;
+      }
+
+      // Recupera nfIds faltantes do checklist (CSV antigo sem terceira coluna)
+      const missing = pickingOrders.filter(o => !o.nfId);
+      if (missing.length > 0) {
+        let checklist: ChecklistItem[] = [];
+        try { checklist = JSON.parse(fs.readFileSync(CHECKLIST_PATH, 'utf-8')); } catch {}
+        if (checklist.length > 0) {
+          // Mapa 1: numeroPedido -> nfId
+          const byPedido = new Map<string, string>();
+          // Mapa 2: chaveAcesso -> nfId (fallback mais confiável)
+          const byChave = new Map<string, string>();
+          for (const item of checklist) {
+            if (item.nfId) {
+              if (item.numeroPedido) byPedido.set(item.numeroPedido, item.nfId);
+              if (item.chaveAcesso) byChave.set(item.chaveAcesso, item.nfId);
+            }
+          }
+          for (const o of missing) {
+            // Tenta por numeroPedido primeiro, depois por chaveAcesso
+            const found = byPedido.get(o.order_sn) || byChave.get(o.chaveAcesso);
+            if (found) o.nfId = found;
+          }
+          const recovered = missing.filter(o => o.nfId).length;
+          console.log(`[PICKING] Recuperados ${recovered}/${missing.length} nfIds do checklist (${checklist.length} itens no checklist)`);
+        } else {
+          console.log(`[PICKING] Checklist vazio — não foi possível recuperar nfIds`);
+        }
+      }
+
+      console.log(`[PICKING] Buscando detalhes de ${pickingOrders.length} NFs direto no Tiny (por nfId)...`);
+      const tinyResults = await tinyClient.getPickingItemsByNfIds(pickingOrders);
+
+      // Monta linhas do relatório com dados do Tiny (kits desmembrados, SKUs corretos)
+      interface PickingRow {
+        order_sn: string;
+        sku: string;
+        product: string;
+        quantity: number;
+      }
+      const rows: PickingRow[] = [];
+      const returnedSns = new Set<string>();
+      for (const r of tinyResults) {
+        if (r.items.length > 0) {
+          returnedSns.add(r.order_sn);
+          for (const item of r.items) {
+            rows.push({
+              order_sn: r.order_sn,
+              sku: item.sku || '-',
+              product: item.descricao || '-',
+              quantity: item.quantidade,
+            });
+          }
+        } else {
+          // Pedido não encontrado no Tiny ou sem itens
+          rows.push({ order_sn: r.order_sn, sku: '⚠', product: 'Erro ao buscar — tente gerar novamente', quantity: 0 });
+        }
+      }
+
+      // Resumo por produto/SKU (para filtro)
+      const skuSummary = new Map<string, { product: string; totalQty: number }>();
+      for (const r of rows) {
+        const key = r.sku + '||' + r.product;
+        const cur = skuSummary.get(key);
+        if (cur) { cur.totalQty += r.quantity; }
+        else { skuSummary.set(key, { product: r.product, totalQty: r.quantity }); }
+      }
+      let summaryOptions = '';
+      for (const [key, val] of skuSummary) {
+        const sku = key.split('||')[0];
+        const label = (sku !== '-' ? sku + ' — ' : '') + val.product + ' (total: ' + val.totalQty + ')';
+        summaryOptions += '<option value="' + key.replace(/"/g, '&quot;') + '">' + label.replace(/</g, '&lt;') + '</option>';
+      }
+
+      // Gera HTML do relatório A4
+      const now = new Date().toLocaleDateString('pt-BR');
+      let tableRows = '';
+      let seq = 0;
+      for (const r of rows) {
+        seq++;
+        const notAvailable = !returnedSns.has(r.order_sn);
+        tableRows += '<tr data-sku="' + (r.sku + '||' + r.product).replace(/"/g, '&quot;') + '" data-qty="' + r.quantity + '"' + (notAvailable ? ' style="color:#999;"' : '') + '>' +
+          '<td style="text-align:center;">' + seq + '</td>' +
+          '<td>' + r.order_sn + '</td>' +
+          '<td>' + r.sku + '</td>' +
+          '<td>' + r.product + '</td>' +
+          '<td style="text-align:center;">' + r.quantity + '</td>' +
+          '<td style="text-align:center;">☐</td>' +
+          '</tr>';
+      }
+
+      // Token para o botão de etiquetas
+      const tokenParam = url.searchParams.get('token') || '';
+
+      const html = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Relatório de Separação — ${now}</title>
+<style>
+  @page { size: A4; margin: 15mm; }
+  body { font-family: Arial, sans-serif; font-size: 11px; margin: 0; padding: 15mm; }
+  h1 { font-size: 16px; margin: 0 0 4px; }
+  .subtitle { font-size: 11px; color: #666; margin-bottom: 8px; }
+  .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; padding: 8px 12px; background: #f8f9fa; border-radius: 6px; border: 1px solid #e2e8f0; }
+  .toolbar select, .toolbar input { font-size: 11px; padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px; }
+  .toolbar button { font-size: 11px; padding: 5px 14px; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; }
+  .btn-label { background: #16a34a; color: #fff; }
+  .btn-label:hover { background: #15803d; }
+  .btn-print { background: #2563eb; color: #fff; }
+  .btn-print:hover { background: #1d4ed8; }
+  .btn-reset { background: #e2e8f0; color: #333; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ccc; padding: 5px 8px; text-align: left; }
+  th { background: #f0f0f0; font-weight: bold; font-size: 10px; text-transform: uppercase; }
+  tr:nth-child(even) { background: #fafafa; }
+  tr.hidden-row { display: none; }
+  .footer { margin-top: 12px; font-size: 10px; color: #999; text-align: right; }
+  .msg-box { margin: 8px 0; padding: 8px 12px; border-radius: 4px; font-size: 11px; display: none; }
+  .msg-ok { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+  .msg-err { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
+  @media print { .toolbar, .msg-box { display: none !important; } body { padding: 0; } }
+</style></head><body>
+<h1>Relatório de Separação</h1>
+<div class="subtitle">Data: ${now} — <span id="visibleCount">${seq}</span> itens de <span id="visibleOrders">${pickingOrders.length}</span> pedidos</div>
+
+<div class="toolbar">
+  <label>Filtrar produto:</label>
+  <select id="filterSku" onchange="applyFilters()">
+    <option value="">— Todos —</option>
+    ${summaryOptions}
+  </select>
+  <label>Qtd mínima:</label>
+  <input type="number" id="filterQtyMin" min="0" value="" placeholder="0" style="width:60px;" onchange="applyFilters()">
+  <label>Qtd máxima:</label>
+  <input type="number" id="filterQtyMax" min="0" value="" placeholder="∞" style="width:60px;" onchange="applyFilters()">
+  <button class="btn-reset" onclick="resetFilters()">Limpar filtros</button>
+  <span style="flex:1;"></span>
+  <button class="btn-label" onclick="downloadAllLabels()">🏷️ Gerar Etiquetas dos Pedidos</button>
+  <button class="btn-print" onclick="window.print()">🖨️ Imprimir</button>
+</div>
+<div id="msgLabels" class="msg-box"></div>
+
+<table>
+  <thead><tr>
+    <th style="width:30px;">#</th>
+    <th>ID Pedido</th>
+    <th>SKU</th>
+    <th>Produto</th>
+    <th style="width:40px;">Qtd</th>
+    <th style="width:40px;">✓</th>
+  </tr></thead>
+  <tbody id="pickingBody">${tableRows}</tbody>
+</table>
+<div class="footer">SyncHub — Relatório gerado em ${now}</div>
+
+<script>
+  var authToken = '${tokenParam}';
+  var authHeaders = { 'Authorization': 'Bearer ' + authToken };
+
+  function applyFilters() {
+    var skuFilter = document.getElementById('filterSku').value;
+    var qtyMin = parseInt(document.getElementById('filterQtyMin').value) || 0;
+    var qtyMax = parseInt(document.getElementById('filterQtyMax').value) || 999999;
+    var rows = document.querySelectorAll('#pickingBody tr');
+    var visible = 0;
+    var visibleOrders = new Set();
+    var seq = 0;
+    rows.forEach(function(row) {
+      var sku = row.getAttribute('data-sku') || '';
+      var qty = parseInt(row.getAttribute('data-qty')) || 0;
+      var show = true;
+      if (skuFilter && sku !== skuFilter) show = false;
+      if (qty < qtyMin || qty > qtyMax) show = false;
+      if (show) {
+        row.classList.remove('hidden-row');
+        visible++;
+        seq++;
+        row.cells[0].textContent = seq;
+        visibleOrders.add(row.cells[1].textContent);
+      } else {
+        row.classList.add('hidden-row');
+      }
+    });
+    document.getElementById('visibleCount').textContent = visible;
+    document.getElementById('visibleOrders').textContent = visibleOrders.size;
+  }
+
+  function resetFilters() {
+    document.getElementById('filterSku').value = '';
+    document.getElementById('filterQtyMin').value = '';
+    document.getElementById('filterQtyMax').value = '';
+    applyFilters();
+  }
+
+  function showMsg(ok, text) {
+    var el = document.getElementById('msgLabels');
+    el.className = 'msg-box ' + (ok ? 'msg-ok' : 'msg-err');
+    el.textContent = text;
+    el.style.display = 'block';
+  }
+
+  async function downloadAllLabels() {
+    // Coleta order_sn visíveis (não filtrados)
+    var rows = document.querySelectorAll('#pickingBody tr:not(.hidden-row)');
+    var sns = [];
+    rows.forEach(function(r) { var sn = r.cells[1].textContent; if (sn && sns.indexOf(sn) === -1) sns.push(sn); });
+    if (sns.length === 0) { showMsg(false, 'Nenhum pedido visível para gerar etiquetas'); return; }
+    showMsg(true, 'Gerando etiquetas de ' + sns.length + ' pedidos... aguarde');
+    try {
+      var r = await fetch('/shopee/labels-batch-csv?order_sns=' + encodeURIComponent(sns.join(',')) + '&token=' + encodeURIComponent(authToken));
+      if (r.status === 401) { showMsg(false, 'Não autenticado — faça login novamente'); return; }
+      var contentType = r.headers.get('content-type') || '';
+      if (contentType.includes('application/pdf')) {
+        var blob = await r.blob();
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a'); a.href = url; a.download = 'etiquetas_separacao.pdf'; a.click();
+        URL.revokeObjectURL(url);
+        showMsg(true, 'Etiquetas geradas com sucesso! (' + sns.length + ' pedidos)');
+      } else {
+        var d = await r.json();
+        showMsg(false, d.error || 'Erro ao gerar etiquetas');
+      }
+    } catch(e) { showMsg(false, 'Erro: ' + e.message); }
+  }
+</script>
+</body></html>`;
+
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Disposition': `inline; filename="relatorio_separacao_${new Date().toISOString().slice(0, 10)}.html"`,
+      });
+      res.end(html);
+      console.log(`[PICKING] Relatório gerado: ${seq} itens de ${tinyResults.length} pedidos`);
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+
+  // ========== PAINEL DE PROCESSAMENTO MANUAL ==========
+
+  } else if (url.pathname === '/pedido/processar-unico' && req.method === 'POST') {
+    // Processa pedido Shopee único — pipeline completo automático
+    try {
+      const body = await parseBody(req);
+      const { orderSn } = JSON.parse(body);
+      if (!orderSn || !orderSn.trim()) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'orderSn é obrigatório' }));
+        return;
+      }
+
+      const sn = orderSn.trim().toUpperCase();
+      console.log(`[SINGLE] Requisição para processar pedido: ${sn}`);
+
+      // Pausa automação durante processamento manual
+      const wasAutoPaused = automationPaused;
+      if (!automationPaused) automationPaused = true;
+
+      try {
+        const result = await processSingleShopeeOrder(sn);
+
+        // Se gerou NF (com ou sem chaveAcesso), adiciona ao histórico/CSV/checklist.
+        // A chaveAcesso pode demorar a chegar do SEFAZ — não devemos bloquear o CSV por isso.
+        // O nfId é suficiente para o relatório de separação funcionar.
+        if (result.nf && (result.nf.chaveAcesso || result.nf.nfId)) {
+          const processedNF: ProcessedNF = {
+            numero: result.nf.numero,
+            nfId: result.nf.nfId,
+            chaveAcesso: result.nf.chaveAcesso || '',
+            clienteNome: result.clienteNome || '',
+            numeroEcommerce: sn,
+            valorNota: result.nf.valorNota,
+            dataProcessamento: new Date().toLocaleString('pt-BR'),
+          };
+          nfHistory.unshift(processedNF);
+          if (nfHistory.length > MAX_NF_HISTORY) nfHistory.splice(MAX_NF_HISTORY);
+          appendToShopeeCSV([processedNF]);
+          addToChecklist([processedNF], 'Shopee');
+          totalNFsEmitted++;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } finally {
+        if (!wasAutoPaused) automationPaused = false;
+      }
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+
+  } else if (url.pathname === '/pedido/buscar' && req.method === 'POST') {
+    // Busca pedido — Shopee API primeiro (rápida), Tiny depois (para NF)
+    try {
+      const body = await parseBody(req);
+      const { numero } = JSON.parse(body);
+      if (!numero || !numero.trim()) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Número do pedido é obrigatório' }));
+        return;
+      }
+      const q = numero.trim();
+      console.log(`[MANUAL] Buscando pedido: ${q}`);
+
+      // Detecta formato do input
+      const isShopeeFormat = /^\d{6}[A-Z0-9]{8,10}$/.test(q);
+      const isNumericOnly = /^\d+$/.test(q);
+
+      // ======== SHOPEE: busca direto na API da Shopee (rápido, confiável) ========
+      if (isShopeeFormat) {
+        console.log(`[MANUAL] Formato Shopee detectado — buscando na API Shopee...`);
+        const shopeeOrders = await shopeeClient.getOrdersDetail([q]);
+
+        if (shopeeOrders.length > 0) {
+          const so = shopeeOrders[0];
+          console.log(`[MANUAL] Shopee retornou pedido ${so.order_sn} (${so.order_status})`);
+
+          // Verifica NF na Shopee
+          let nfEnviada = false;
+          try {
+            const inv = await shopeeClient.checkOrderInvoice(q);
+            nfEnviada = inv.hasInvoice;
+          } catch {}
+
+          // Tenta achar no Tiny (UMA tentativa rápida, não bloqueia se falhar)
+          let tinyDetail: Awaited<ReturnType<typeof tinyClient.getOrder>> | null = null;
+          let nfStatus: any = null;
+          const wasAutoPaused = automationPaused;
+          if (!automationPaused) { automationPaused = true; }
+
+          try {
+            const tinyResults = await tinyClient.searchByNumeroEcommerce(q);
+            const exact = tinyResults.filter(r => r.numero_ecommerce === q);
+            if (exact.length > 0) {
+              await new Promise(r => setTimeout(r, 1200));
+              tinyDetail = await tinyClient.getOrder(exact[0].id);
+            }
+          } catch (e: any) {
+            console.log(`[MANUAL] Tiny não respondeu para ${q} (normal se API instável): ${e.message}`);
+          }
+
+          if (!wasAutoPaused) { automationPaused = false; }
+
+          // Se encontrou no Tiny, busca dados da NF
+          if (tinyDetail?.id_nota_fiscal) {
+            try {
+              await new Promise(r => setTimeout(r, 1200));
+              const nf = await tinyClient.getNFDetails(tinyDetail.id_nota_fiscal);
+              nfStatus = {
+                nfId: tinyDetail.id_nota_fiscal,
+                numero: nf.numero || '(sem número)',
+                chaveAcesso: nf.chaveAcesso,
+                situacao: nf.situacao || 'Emitida',
+                valorNota: nf.valorNota,
+                itens: nf.itens,
+              };
+            } catch {
+              nfStatus = { nfId: tinyDetail.id_nota_fiscal, numero: '(detalhes indisponíveis)', situacao: 'NF vinculada' };
+            }
+          }
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: true,
+            pedido: {
+              id: tinyDetail?.id || '',
+              numero: tinyDetail?.numero || '',
+              numero_ecommerce: so.order_sn,
+              data_pedido: tinyDetail?.data_pedido || '',
+              situacao: tinyDetail?.situacao || so.order_status,
+              canal: 'Shopee',
+              fonte: tinyDetail ? 'shopee+tiny' : 'shopee',
+              cliente: {
+                nome: so.recipient_name || tinyDetail?.cliente?.nome || so.buyer_username,
+                cpf_cnpj: tinyDetail?.cliente?.cpf_cnpj || '',
+                cidade: tinyDetail?.cliente?.cidade || '',
+                uf: tinyDetail?.cliente?.uf || '',
+              },
+              itens: so.items.map(it => ({
+                codigo: it.model_sku || it.item_sku || '-',
+                descricao: it.item_name + (it.model_name ? ` (${it.model_name})` : ''),
+                quantidade: String(it.quantity),
+                valor_unitario: String(it.price),
+              })),
+              total_pedido: String(so.total_amount),
+              total_produtos: String(so.total_amount),
+              temNF: !!(tinyDetail?.id_nota_fiscal),
+              nf: nfStatus,
+              nfEnviada,
+              tinyEncontrado: !!tinyDetail,
+            },
+          }));
+          return;
+        }
+        // Shopee não encontrou — pode ser número errado ou pedido antigo
+        console.log(`[MANUAL] Shopee não encontrou pedido ${q}`);
+      }
+
+      // ======== TINY: busca direta (para ML ou quando Shopee não encontrou) ========
+      console.log(`[MANUAL] Buscando no Tiny...`);
+      const wasAutoPaused = automationPaused;
+      if (!automationPaused) { automationPaused = true; }
+
+      let detail: Awaited<ReturnType<typeof tinyClient.getOrder>> | null = null;
+      let tinyErr = '';
+
+      // Tenta busca por numero_ecommerce (1 tentativa)
+      try {
+        const results = await tinyClient.searchByNumeroEcommerce(q);
+        const exact = results.filter(r => r.numero_ecommerce === q);
+        if (exact.length > 0) {
+          await new Promise(r => setTimeout(r, 1200));
+          detail = await tinyClient.getOrder(exact[0].id);
+        }
+      } catch (e: any) { tinyErr = e.message; }
+
+      // Tenta busca por numero Tiny
+      if (!detail) {
+        try {
+          await new Promise(r => setTimeout(r, 1200));
+          const results = await tinyClient.searchByNumero(q);
+          if (results.length > 0) {
+            const match = results.find(r => r.numero === q) || results[0];
+            await new Promise(r => setTimeout(r, 1200));
+            detail = await tinyClient.getOrder(match.id);
+          }
+        } catch (e: any) { if (!tinyErr) tinyErr = e.message; }
+      }
+
+      // Tenta por ID direto
+      if (!detail && isNumericOnly) {
+        try {
+          await new Promise(r => setTimeout(r, 1200));
+          detail = await tinyClient.getOrder(q);
+        } catch {}
+      }
+
+      if (!wasAutoPaused) { automationPaused = false; }
+
+      if (!detail) {
+        const isTrans = tinyErr && (tinyErr.includes('transitório') || tinyErr.includes('Tente novamente') || tinyErr.includes('Bloqueada'));
+        const msg = isTrans
+          ? 'O Tiny está temporariamente sobrecarregado. Aguarde alguns segundos e tente novamente.'
+          : isShopeeFormat
+            ? `Pedido "${q}" não encontrado na Shopee nem no Tiny. Verifique se o número está correto.`
+            : `Pedido "${q}" não encontrado no Tiny. Use o número do pedido (e-commerce), número Tiny, ou ID Tiny.`;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: msg }));
+        return;
+      }
+
+      // Detecta canal
+      let canal = 'Desconhecido';
+      if (tinyClient.isShopeeOrder(detail)) canal = 'Shopee';
+      else if (tinyClient.isMercadoLivreOrder(detail)) canal = 'Mercado Livre';
+      else {
+        const ne = detail.numero_ecommerce || '';
+        if (/^\d{6}(?=[A-Z0-9]*[A-Z])[A-Z0-9]{8,10}$/.test(ne)) canal = 'Shopee';
+        else if (/^\d{10,13}$/.test(ne)) canal = 'Mercado Livre';
+      }
+
+      // NF
+      let nfStatus: any = null;
+      if (detail.id_nota_fiscal) {
+        try {
+          await new Promise(r => setTimeout(r, 1200));
+          const nf = await tinyClient.getNFDetails(detail.id_nota_fiscal);
+          nfStatus = { nfId: detail.id_nota_fiscal, numero: nf.numero || '(sem número)', chaveAcesso: nf.chaveAcesso, situacao: nf.situacao || 'Emitida', valorNota: nf.valorNota, itens: nf.itens };
+        } catch {
+          nfStatus = { nfId: detail.id_nota_fiscal, numero: '(detalhes indisponíveis)', situacao: 'NF vinculada' };
+        }
+      }
+
+      let nfEnviada = false;
+      if (canal === 'Shopee' && detail.numero_ecommerce) {
+        try { nfEnviada = (await shopeeClient.checkOrderInvoice(detail.numero_ecommerce)).hasInvoice; } catch {}
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        pedido: {
+          id: detail.id,
+          numero: detail.numero,
+          numero_ecommerce: detail.numero_ecommerce,
+          data_pedido: detail.data_pedido,
+          situacao: detail.situacao,
+          canal,
+          fonte: 'tiny',
+          cliente: { nome: detail.cliente.nome, cpf_cnpj: detail.cliente.cpf_cnpj, cidade: detail.cliente.cidade, uf: detail.cliente.uf },
+          itens: detail.itens.map(it => ({ codigo: it.codigo, descricao: it.descricao, quantidade: it.quantidade, valor_unitario: it.valor_unitario })),
+          total_pedido: detail.total_pedido,
+          total_produtos: detail.total_produtos,
+          temNF: !!detail.id_nota_fiscal,
+          nf: nfStatus,
+          nfEnviada,
+          tinyEncontrado: true,
+        },
+      }));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+
+  } else if (url.pathname === '/pedido/gerar-nf' && req.method === 'POST') {
+    // Gera NF para um pedido específico
+    try {
+      const body = await parseBody(req);
+      const { orderId, canal } = JSON.parse(body);
+      if (!orderId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'orderId é obrigatório' }));
+        return;
+      }
+
+      console.log(`[MANUAL] Gerando NF para pedido ${orderId} (canal: ${canal})`);
+      const detail = await tinyClient.getOrder(orderId);
+
+      if (detail.id_nota_fiscal) {
+        const nf = await tinyClient.getNFDetails(detail.id_nota_fiscal);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: true,
+          jaExistia: true,
+          nfId: detail.id_nota_fiscal,
+          numero: nf.numero,
+          chaveAcesso: nf.chaveAcesso,
+          situacao: nf.situacao,
+          valorNota: nf.valorNota,
+        }));
+        return;
+      }
+
+      // Validações
+      if (!tinyClient.hasClientAddress(detail)) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Pedido sem endereço completo do cliente' }));
+        return;
+      }
+      if (tinyClient.hasMaskedClientData(detail)) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Dados do cliente mascarados (***). Atualize no Tiny antes.' }));
+        return;
+      }
+
+      const discount = canal === 'Shopee' ? config.shopeeDiscountPercent : config.mlDiscountPercent;
+      const ecommerceName = canal === 'Shopee' ? 'Shopee' : undefined;
+      const nf = await tinyClient.createAndEmitNFDiscounted(detail, discount, ecommerceName);
+
+      if (nf.success) {
+        // Adiciona ao histórico e CSV
+        const processedNF: ProcessedNF = {
+          numero: nf.numero || '',
+          nfId: nf.nfId || '',
+          chaveAcesso: nf.chaveAcesso || '',
+          clienteNome: nf.clienteNome || '',
+          numeroEcommerce: nf.numeroEcommerce || '',
+          valorNota: nf.valorNota || 0,
+          dataProcessamento: new Date().toLocaleDateString('pt-BR'),
+        };
+        nfHistory.unshift(processedNF);
+        if (nfHistory.length > MAX_NF_HISTORY) nfHistory.splice(MAX_NF_HISTORY);
+        if (canal === 'Shopee') appendToShopeeCSV([processedNF]);
+        addToChecklist([processedNF], canal || 'Manual');
+        totalNFsEmitted++;
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: true,
+          nfId: nf.nfId,
+          numero: nf.numero,
+          chaveAcesso: nf.chaveAcesso,
+          valorNota: nf.valorNota,
+          desconto: discount + '%',
+        }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Falha ao gerar NF. Verifique os logs.' }));
+      }
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+
+  } else if (url.pathname === '/pedido/enviar-nf' && req.method === 'POST') {
+    // Envia NF para o marketplace (Shopee ou ML)
+    try {
+      const body = await parseBody(req);
+      const { orderSn, nfId, canal } = JSON.parse(body);
+      if (!nfId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'nfId é obrigatório' }));
+        return;
+      }
+
+      console.log(`[MANUAL] Enviando NF ${nfId} para ${canal} (pedido: ${orderSn})`);
+
+      if (canal === 'Shopee') {
+        if (!orderSn) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'orderSn é obrigatório para Shopee' }));
+          return;
+        }
+        // Verifica se já foi enviada
+        const check = await shopeeClient.checkOrderInvoice(orderSn);
+        if (check.hasInvoice) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, jaEnviada: true, message: 'NF já estava registrada na Shopee' }));
+          return;
+        }
+        // Busca XML da NF
+        const xml = await tinyClient.getNFXml(nfId);
+        if (!xml) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Não foi possível obter o XML da NF no Tiny' }));
+          return;
+        }
+        // Envia para Shopee
+        const result = await shopeeClient.uploadInvoiceDoc(orderSn, xml);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: result.success,
+          message: result.success ? 'NF enviada com sucesso para a Shopee' : undefined,
+          error: result.error,
+        }));
+      } else if (canal === 'Mercado Livre') {
+        // ML: NF é vinculada automaticamente pelo Tiny se numero_pedido_ecommerce estiver correto
+        // Mas podemos tentar via API do ML se disponível
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: true,
+          message: 'Para Mercado Livre, a NF é vinculada automaticamente pelo Tiny. Verifique no painel do ML se apareceu.',
+        }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: `Canal "${canal}" não suportado para envio de NF` }));
+      }
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+
+  } else if (url.pathname === '/pedido/etiqueta' && req.method === 'POST') {
+    // Gera etiqueta de envio
+    try {
+      const body = await parseBody(req);
+      const { orderSn, canal, shipmentId } = JSON.parse(body);
+
+      console.log(`[MANUAL] Gerando etiqueta para pedido ${orderSn} (canal: ${canal})`);
+
+      if (canal === 'Shopee') {
+        if (!orderSn) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'orderSn é obrigatório para Shopee' }));
+          return;
+        }
+        const result = await shopeeClient.getShippingLabel(orderSn);
+        if (result.success && result.pdf) {
+          res.writeHead(200, {
+            'Content-Type': 'application/pdf',
+            'Content-Disposition': `attachment; filename="etiqueta_${orderSn}.pdf"`,
+          });
+          res.end(result.pdf);
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: false,
+            error: result.error || 'Não foi possível gerar a etiqueta',
+            steps: result.steps,
+          }));
+        }
+      } else if (canal === 'Mercado Livre') {
+        if (!shipmentId) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'shipmentId necessário para ML. Consulte o ID do envio no painel do ML.' }));
+          return;
+        }
+        const result = await ml.downloadShippingLabels([parseInt(shipmentId)]);
+        if (result.success && result.pdf) {
+          res.writeHead(200, {
+            'Content-Type': 'application/pdf',
+            'Content-Disposition': `attachment; filename="etiqueta_ml_${shipmentId}.pdf"`,
+          });
+          res.end(result.pdf);
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: result.error || 'Não foi possível gerar a etiqueta' }));
+        }
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: `Canal "${canal}" não suportado` }));
+      }
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+
+  } else if (url.pathname === '/pedido/processar' && req.method === 'GET') {
+    // Página HTML do painel de processamento manual
+    const tokenParam = url.searchParams.get('token') || '';
+    const html = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>SyncHub — Processar Pedido</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f8fafc; color: #1e293b; padding: 24px; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .subtitle { color: #64748b; font-size: 13px; margin-bottom: 20px; }
+  .card { background: #fff; border-radius: 10px; border: 1px solid #e2e8f0; padding: 20px; margin-bottom: 16px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; color: #64748b; margin-bottom: 12px; letter-spacing: 0.5px; }
+  .search-row { display: flex; gap: 10px; }
+  .search-row input { flex: 1; padding: 10px 14px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; outline: none; }
+  .search-row input:focus { border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,0.1); }
+  .btn { padding: 10px 20px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.15s; display: inline-flex; align-items: center; gap: 6px; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-blue { background: #3b82f6; color: #fff; }
+  .btn-blue:hover:not(:disabled) { background: #2563eb; }
+  .btn-green { background: #16a34a; color: #fff; }
+  .btn-green:hover:not(:disabled) { background: #15803d; }
+  .btn-orange { background: #ea580c; color: #fff; }
+  .btn-orange:hover:not(:disabled) { background: #c2410c; }
+  .btn-sm { padding: 7px 14px; font-size: 13px; }
+  .msg { padding: 10px 14px; border-radius: 6px; font-size: 13px; margin-bottom: 12px; display: none; }
+  .msg-ok { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+  .msg-err { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
+  .msg-info { background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .badge-blue { background: #dbeafe; color: #1d4ed8; }
+  .badge-green { background: #dcfce7; color: #166534; }
+  .badge-orange { background: #ffedd5; color: #c2410c; }
+  .badge-gray { background: #f1f5f9; color: #64748b; }
+  .badge-purple { background: #f3e8ff; color: #7c3aed; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #f1f5f9; }
+  th { color: #64748b; font-size: 11px; text-transform: uppercase; font-weight: 600; }
+  .steps { display: flex; flex-direction: column; gap: 0; }
+  .step { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-bottom: 1px solid #f1f5f9; position: relative; }
+  .step:last-child { border-bottom: none; }
+  .step-num { width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; flex-shrink: 0; }
+  .step-pending .step-num { background: #f1f5f9; color: #94a3b8; }
+  .step-done .step-num { background: #dcfce7; color: #16a34a; }
+  .step-active .step-num { background: #dbeafe; color: #2563eb; }
+  .step-error .step-num { background: #fef2f2; color: #dc2626; }
+  .step-info { flex: 1; }
+  .step-title { font-weight: 600; font-size: 14px; }
+  .step-detail { font-size: 12px; color: #64748b; margin-top: 2px; }
+  .step-action { flex-shrink: 0; }
+  .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #e2e8f0; border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .hidden { display: none !important; }
+  .back-link { display: inline-block; margin-bottom: 16px; color: #3b82f6; text-decoration: none; font-size: 13px; font-weight: 500; }
+  .back-link:hover { text-decoration: underline; }
+</style></head><body>
+<a href="/?token=${tokenParam}" class="back-link">\u2190 Voltar ao Dashboard</a>
+<h1>Processar Pedido</h1>
+<p class="subtitle">Insira o Order SN da Shopee e processe automaticamente (NF + envio), ou busque manualmente.</p>
+
+<div class="card">
+  <h2>Processar Pedido Shopee</h2>
+  <div class="search-row">
+    <input type="text" id="inputNumero" placeholder="Order SN da Shopee (ex: 260621KV4AKGJ8)" onkeydown="if(event.key==='Enter')processarAuto()">
+    <button class="btn btn-green" id="btnProcessar" onclick="processarAuto()" style="min-width:180px;">Processar Pedido</button>
+    <button class="btn btn-blue btn-sm" id="btnBuscar" onclick="buscar()" title="Buscar sem processar (modo manual)">Buscar</button>
+  </div>
+  <p style="margin-top:8px;font-size:12px;color:#94a3b8;">Processar = busca no Tiny + gera NF + envia para Shopee (tudo autom\u00e1tico)</p>
+  <div id="msgBusca" class="msg" style="margin-top:12px;"></div>
+</div>
+
+<div id="autoResult" class="card hidden">
+  <h2>Resultado do Processamento</h2>
+  <div id="autoResultContent"></div>
+</div>
+
+<div id="pedidoInfo" class="card hidden">
+  <h2>Dados do Pedido</h2>
+  <div id="pedidoDetalhes"></div>
+</div>
+
+<div id="pedidoSteps" class="card hidden">
+  <h2>Etapas do Processamento</h2>
+  <div class="steps" id="stepsContainer"></div>
+</div>
+
+<script>
+var authToken = '${tokenParam}';
+var authHeaders = { 'Authorization': 'Bearer ' + authToken, 'Content-Type': 'application/json' };
+var pedidoAtual = null;
+
+function showMsg(id, text, type) {
+  var el = document.getElementById(id);
+  el.className = 'msg msg-' + type;
+  el.textContent = text;
+  el.style.display = 'block';
+}
+function hideMsg(id) { document.getElementById(id).style.display = 'none'; }
+
+var searchCache = {};
+var autoRetryTimer = null;
+
+async function processarAuto() {
+  var orderSn = document.getElementById('inputNumero').value.trim().toUpperCase();
+  if (!orderSn) { showMsg('msgBusca', 'Insira o Order SN da Shopee', 'err'); return; }
+  if (!/^\\d{6}[A-Z0-9]{8,10}$/.test(orderSn)) {
+    showMsg('msgBusca', 'Formato inv\u00e1lido. Use o Order SN da Shopee (ex: 260621KV4AKGJ8)', 'err');
+    return;
+  }
+  hideMsg('msgBusca');
+  document.getElementById('pedidoInfo').classList.add('hidden');
+  document.getElementById('pedidoSteps').classList.add('hidden');
+
+  var btn = document.getElementById('btnProcessar');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Processando...';
+  document.getElementById('btnBuscar').disabled = true;
+
+  var resultDiv = document.getElementById('autoResult');
+  var contentDiv = document.getElementById('autoResultContent');
+  contentDiv.innerHTML = '<div style="text-align:center;padding:20px;"><span class="spinner" style="width:24px;height:24px;"></span><p style="margin-top:8px;color:#64748b;font-size:13px;">Processando pedido ' + orderSn + '...<br>Buscando no Tiny, gerando NF, enviando para Shopee...</p></div>';
+  resultDiv.classList.remove('hidden');
+
+  try {
+    var r = await fetch('/pedido/processar-unico', { method: 'POST', headers: authHeaders, body: JSON.stringify({ orderSn: orderSn }) });
+    var d = await r.json();
+
+    if (d.error && !d.steps) {
+      contentDiv.innerHTML = '<div class="msg msg-err" style="display:block;">' + d.error + '</div>';
+      return;
+    }
+
+    var h = '';
+    if (d.success) {
+      h += '<div class="msg msg-ok" style="display:block;margin-bottom:14px;">Pedido ' + orderSn + ' processado com sucesso!</div>';
+    } else {
+      h += '<div class="msg msg-err" style="display:block;margin-bottom:14px;">Processamento parou com erro. Veja os detalhes abaixo.</div>';
+    }
+
+    // Info resumo
+    if (d.tinyNumero || d.clienteNome) {
+      h += '<div style="margin-bottom:12px;font-size:13px;color:#64748b;">';
+      if (d.tinyNumero) h += 'Pedido Tiny: <strong>#' + d.tinyNumero + '</strong> (ID ' + d.tinyId + ')';
+      if (d.clienteNome) h += ' &mdash; ' + d.clienteNome;
+      h += '</div>';
+    }
+
+    // Steps timeline
+    h += '<div class="steps">';
+    (d.steps || []).forEach(function(s, i) {
+      var cls = s.ok ? 'step-done' : 'step-error';
+      var icon = s.ok ? '\\u2705' : '\\u274C';
+      h += '<div class="step ' + cls + '">';
+      h += '<div class="step-num">' + (i + 1) + '</div>';
+      h += '<div class="step-info"><div class="step-title">' + icon + ' ' + s.step + '</div><div class="step-detail">' + s.detail + '</div></div>';
+      h += '</div>';
+    });
+    h += '</div>';
+
+    // NF info
+    if (d.nf && d.nf.chaveAcesso) {
+      h += '<div style="margin-top:14px;padding:12px;background:#f0fdf4;border-radius:8px;border:1px solid #bbf7d0;font-size:13px;">';
+      h += '<strong>NF:</strong> ' + (d.nf.numero || d.nf.nfId) + ' &mdash; R$ ' + (d.nf.valorNota || 0).toFixed(2);
+      h += '<br><strong>Chave:</strong> <span style="font-family:monospace;font-size:11px;word-break:break-all;">' + d.nf.chaveAcesso + '</span>';
+      h += '</div>';
+    }
+
+    contentDiv.innerHTML = h;
+  } catch(e) {
+    contentDiv.innerHTML = '<div class="msg msg-err" style="display:block;">Erro de conex\u00e3o: ' + e.message + '</div>';
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = 'Processar Pedido';
+    document.getElementById('btnBuscar').disabled = false;
+  }
+}
+
+async function buscar(isAutoRetry) {
+  var numero = document.getElementById('inputNumero').value.trim();
+  if (!numero) return;
+  if (autoRetryTimer) { clearInterval(autoRetryTimer); autoRetryTimer = null; }
+  hideMsg('msgBusca');
+
+  // Cache local: se já buscou esse pedido com sucesso, usa o cache
+  if (searchCache[numero] && !isAutoRetry) {
+    pedidoAtual = searchCache[numero];
+    renderPedido(pedidoAtual);
+    renderSteps(pedidoAtual);
+    return;
+  }
+
+  document.getElementById('btnBuscar').disabled = true;
+  document.getElementById('btnBuscar').innerHTML = '<span class="spinner"></span> Buscando no Tiny...';
+  document.getElementById('pedidoInfo').classList.add('hidden');
+  document.getElementById('pedidoSteps').classList.add('hidden');
+  try {
+    var r = await fetch('/pedido/buscar', { method: 'POST', headers: authHeaders, body: JSON.stringify({ numero: numero }) });
+    var d = await r.json();
+    if (!d.ok) {
+      var isTiny = (d.error || '').indexOf('sobrecarregado') >= 0 || (d.error || '').indexOf('Tiny') >= 0;
+      if (isTiny) {
+        // Auto-retry com countdown de 10 segundos
+        var secs = 10;
+        showMsg('msgBusca', 'Tiny temporariamente indisponível. Tentando novamente em ' + secs + 's...', 'info');
+        autoRetryTimer = setInterval(function() {
+          secs--;
+          if (secs <= 0) {
+            clearInterval(autoRetryTimer); autoRetryTimer = null;
+            buscar(true);
+          } else {
+            showMsg('msgBusca', 'Tiny temporariamente indisponível. Tentando novamente em ' + secs + 's...', 'info');
+          }
+        }, 1000);
+      } else {
+        showMsg('msgBusca', d.error || 'Pedido não encontrado', 'err');
+      }
+      return;
+    }
+    pedidoAtual = d.pedido;
+    searchCache[numero] = d.pedido; // Cacheia resultado
+    renderPedido(d.pedido);
+    renderSteps(d.pedido);
+  } catch(e) { showMsg('msgBusca', 'Erro: ' + e.message, 'err'); }
+  finally {
+    document.getElementById('btnBuscar').disabled = false;
+    document.getElementById('btnBuscar').innerHTML = 'Buscar';
+  }
+}
+
+function renderPedido(p) {
+  var canalBadge = p.canal === 'Shopee' ? 'badge-blue' : p.canal === 'Mercado Livre' ? 'badge-orange' : 'badge-gray';
+  var h = '<div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;">';
+  h += '<span class="badge ' + canalBadge + '">' + p.canal + '</span>';
+  h += '<span class="badge badge-purple">' + p.situacao + '</span>';
+  h += '<span style="font-size:12px;color:#94a3b8;">ID Tiny: ' + p.numero + '</span>';
+  h += '</div>';
+  h += '<table>';
+  h += '<tr><td style="width:140px;color:#64748b;font-weight:500;">N\u00ba E-commerce</td><td><strong>' + (p.numero_ecommerce || '-') + '</strong></td></tr>';
+  h += '<tr><td style="color:#64748b;font-weight:500;">Cliente</td><td>' + p.cliente.nome + '</td></tr>';
+  h += '<tr><td style="color:#64748b;font-weight:500;">Localidade</td><td>' + p.cliente.cidade + '/' + p.cliente.uf + '</td></tr>';
+  h += '<tr><td style="color:#64748b;font-weight:500;">Data</td><td>' + p.data_pedido + '</td></tr>';
+  h += '<tr><td style="color:#64748b;font-weight:500;">Total</td><td>R$ ' + parseFloat(p.total_pedido).toFixed(2) + '</td></tr>';
+  h += '</table>';
+  if (p.itens && p.itens.length > 0) {
+    h += '<div style="margin-top:12px;"><strong style="font-size:12px;color:#64748b;">ITENS:</strong></div>';
+    h += '<table style="margin-top:4px;">';
+    h += '<thead><tr><th>SKU</th><th>Produto</th><th style="text-align:center;">Qtd</th><th style="text-align:right;">Valor Unit.</th></tr></thead><tbody>';
+    p.itens.forEach(function(it) {
+      h += '<tr><td>' + (it.codigo || '-') + '</td><td>' + it.descricao + '</td><td style="text-align:center;">' + it.quantidade + '</td><td style="text-align:right;">R$ ' + parseFloat(it.valor_unitario).toFixed(2) + '</td></tr>';
+    });
+    h += '</tbody></table>';
+  }
+  document.getElementById('pedidoDetalhes').innerHTML = h;
+  document.getElementById('pedidoInfo').classList.remove('hidden');
+}
+
+function renderSteps(p) {
+  var steps = [
+    { id: 'step1', num: 1, title: 'Pedido encontrado', detail: '', done: true },
+    { id: 'step2', num: 2, title: 'Nota Fiscal (NF-e)', detail: '', done: p.temNF, actionLabel: 'Gerar NF', actionFn: 'gerarNF' },
+    { id: 'step3', num: 3, title: 'Enviar NF ao Marketplace', detail: '', done: p.nfEnviada, actionLabel: 'Enviar NF', actionFn: 'enviarNF' },
+    { id: 'step4', num: 4, title: 'Etiqueta de Envio', detail: '', done: false, actionLabel: 'Gerar Etiqueta', actionFn: 'gerarEtiqueta' },
+  ];
+
+  // Step 1 details
+  steps[0].detail = 'Pedido ' + (p.numero_ecommerce || p.numero) + ' — ' + p.canal;
+
+  // Step 2 details
+  if (p.temNF && p.nf) {
+    steps[1].detail = 'NF ' + (p.nf.numero || '') + ' — ' + (p.nf.situacao || '') + (p.nf.chaveAcesso ? ' — Chave: ...' + p.nf.chaveAcesso.slice(-8) : '');
+  } else {
+    steps[1].detail = 'Nenhuma NF vinculada a este pedido';
+  }
+
+  // Step 3 details
+  if (p.nfEnviada) {
+    steps[2].detail = 'NF j\u00e1 registrada no marketplace';
+  } else if (!p.temNF) {
+    steps[2].detail = 'Gere a NF primeiro (etapa 2)';
+  } else if (p.canal === 'Mercado Livre') {
+    steps[2].detail = 'ML: NF vinculada automaticamente pelo Tiny';
+    steps[2].done = p.temNF; // ML auto-links
+  } else {
+    steps[2].detail = 'Pendente — enviar XML da NF para a Shopee';
+  }
+
+  // Step 4
+  steps[3].detail = 'Gera e baixa o PDF da etiqueta de envio';
+
+  var h = '';
+  steps.forEach(function(s) {
+    var cls = s.done ? 'step-done' : 'step-pending';
+    var icon = s.done ? '\u2705' : '\u2B1C';
+    h += '<div class="step ' + cls + '" id="' + s.id + '">';
+    h += '<div class="step-num">' + s.num + '</div>';
+    h += '<div class="step-info"><div class="step-title">' + icon + ' ' + s.title + '</div><div class="step-detail" id="' + s.id + '-detail">' + s.detail + '</div></div>';
+    if (s.actionFn) {
+      var disabled = '';
+      if (s.id === 'step3' && !p.temNF) disabled = ' disabled';
+      if (s.id === 'step2' && p.temNF) disabled = ' disabled';
+      var btnClass = s.id === 'step2' ? 'btn-green' : s.id === 'step3' ? 'btn-orange' : 'btn-blue';
+      h += '<div class="step-action"><button class="btn ' + btnClass + ' btn-sm" id="btn-' + s.id + '" onclick="' + s.actionFn + '()"' + disabled + '>' + s.actionLabel + '</button></div>';
+    }
+    h += '</div>';
+  });
+  document.getElementById('stepsContainer').innerHTML = h;
+  document.getElementById('pedidoSteps').classList.remove('hidden');
+}
+
+function setStepState(stepId, state, detail) {
+  var el = document.getElementById(stepId);
+  el.className = 'step step-' + state;
+  var titleEl = el.querySelector('.step-title');
+  var icon = state === 'done' ? '\u2705' : state === 'error' ? '\u274C' : state === 'active' ? '\u23F3' : '\u2B1C';
+  titleEl.innerHTML = icon + ' ' + titleEl.textContent.replace(/^[\\S]+ /, '');
+  if (detail) document.getElementById(stepId + '-detail').textContent = detail;
+}
+
+function setStepLoading(stepId, label) {
+  var btn = document.getElementById('btn-' + stepId);
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> ' + label; }
+  setStepState(stepId, 'active', 'Processando...');
+}
+
+function setStepDone(stepId, detail) {
+  var btn = document.getElementById('btn-' + stepId);
+  if (btn) btn.disabled = true;
+  setStepState(stepId, 'done', detail);
+}
+
+function setStepError(stepId, detail) {
+  var btn = document.getElementById('btn-' + stepId);
+  if (btn) { btn.disabled = false; btn.innerHTML = 'Tentar novamente'; }
+  setStepState(stepId, 'error', detail);
+}
+
+async function gerarNF() {
+  if (!pedidoAtual) return;
+  setStepLoading('step2', 'Gerando...');
+  try {
+    var r = await fetch('/pedido/gerar-nf', { method: 'POST', headers: authHeaders, body: JSON.stringify({ orderId: pedidoAtual.id, canal: pedidoAtual.canal }) });
+    var d = await r.json();
+    if (d.ok) {
+      var msg = 'NF ' + (d.numero || '') + (d.jaExistia ? ' (j\u00e1 existia)' : ' gerada') + ' — ' + (d.chaveAcesso ? 'Chave: ...' + d.chaveAcesso.slice(-8) : '') + (d.valorNota ? ' — R$ ' + d.valorNota.toFixed(2) : '');
+      setStepDone('step2', msg);
+      pedidoAtual.temNF = true;
+      pedidoAtual.nf = { nfId: d.nfId, numero: d.numero, chaveAcesso: d.chaveAcesso, situacao: d.situacao || 'Autorizada', valorNota: d.valorNota };
+      // Habilita etapa 3
+      var btn3 = document.getElementById('btn-step3');
+      if (btn3) btn3.disabled = false;
+      document.getElementById('step3-detail').textContent = 'NF pronta para envio ao marketplace';
+    } else {
+      setStepError('step2', d.error || 'Erro ao gerar NF');
+    }
+  } catch(e) { setStepError('step2', 'Erro: ' + e.message); }
+}
+
+async function enviarNF() {
+  if (!pedidoAtual || !pedidoAtual.nf) return;
+  setStepLoading('step3', 'Enviando...');
+  try {
+    var r = await fetch('/pedido/enviar-nf', { method: 'POST', headers: authHeaders, body: JSON.stringify({
+      orderSn: pedidoAtual.numero_ecommerce,
+      nfId: pedidoAtual.nf.nfId,
+      canal: pedidoAtual.canal,
+    })});
+    var d = await r.json();
+    if (d.ok) {
+      setStepDone('step3', d.message || 'NF enviada com sucesso');
+      pedidoAtual.nfEnviada = true;
+    } else {
+      setStepError('step3', d.error || 'Erro ao enviar NF');
+    }
+  } catch(e) { setStepError('step3', 'Erro: ' + e.message); }
+}
+
+async function gerarEtiqueta() {
+  if (!pedidoAtual) return;
+  setStepLoading('step4', 'Gerando...');
+  try {
+    var r = await fetch('/pedido/etiqueta', { method: 'POST', headers: authHeaders, body: JSON.stringify({
+      orderSn: pedidoAtual.numero_ecommerce,
+      canal: pedidoAtual.canal,
+    })});
+    var contentType = r.headers.get('content-type') || '';
+    if (contentType.includes('application/pdf')) {
+      var blob = await r.blob();
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a'); a.href = url; a.download = 'etiqueta_' + (pedidoAtual.numero_ecommerce || 'pedido') + '.pdf'; a.click();
+      URL.revokeObjectURL(url);
+      setStepDone('step4', 'Etiqueta gerada e baixada com sucesso');
+    } else {
+      var d = await r.json();
+      var errMsg = d.error || 'Erro ao gerar etiqueta';
+      if (d.steps) {
+        errMsg += ' | Passos: ' + d.steps.map(function(s){ return s.step + '(' + (s.ok?'OK':'ERRO') + ')'; }).join(', ');
+      }
+      setStepError('step4', errMsg);
+    }
+  } catch(e) { setStepError('step4', 'Erro: ' + e.message); }
+}
+</script>
+</body></html>`;
+
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
+
   } else {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not found' }));
@@ -426,6 +2224,10 @@ async function runBot(dataInicial?: string, dataFinal?: string, skipBlockCheck =
       if (nfHistory.length > MAX_NF_HISTORY) {
         nfHistory.splice(MAX_NF_HISTORY);
       }
+      // Salva CSV para upload em massa na Shopee
+      appendToShopeeCSV(result.nfs);
+      // Adiciona ao checklist
+      addToChecklist(result.nfs, 'Shopee');
     }
   } catch (err) {
     console.error('[ERRO] Falha na execução:', err);
@@ -458,6 +2260,8 @@ async function runMLBot(date: string, mode: 'coleta' | 'pedido' = 'coleta') {
       const tagged = result.nfs.map(n => ({ ...n, _canal: 'Mercado Livre' } as any));
       nfHistory.unshift(...tagged);
       if (nfHistory.length > MAX_NF_HISTORY) nfHistory.splice(MAX_NF_HISTORY);
+      // Adiciona ao checklist
+      addToChecklist(result.nfs, 'Mercado Livre');
     }
   } catch (err) {
     console.error('[ML-BOT] Falha na execução:', err);
@@ -475,6 +2279,17 @@ cron.schedule(cronExpression, () => {
     return;
   }
   runBot();
+});
+
+// Agenda ML automático: a cada 10 minutos, processa pedidos ML do dia (modo pedido, data de hoje)
+const ML_AUTO_INTERVAL = 10; // minutos
+cron.schedule(`*/${ML_AUTO_INTERVAL} * * * *`, () => {
+  if (automationPaused) return;
+  // Usa data de hoje no formato DD/MM/YYYY
+  const now = new Date();
+  const today = `${String(now.getDate()).padStart(2, '0')}/${String(now.getMonth() + 1).padStart(2, '0')}/${now.getFullYear()}`;
+  console.log(`[ML-AUTO] Execução automática — processando pedidos ML de ${today}`);
+  runMLBot(today, 'pedido');
 });
 
 // Executa imediatamente na primeira vez (se não pausado)
@@ -723,9 +2538,13 @@ function getDashboardHtml(): string {
     <nav>
       <a href="#" class="active"><span class="icon">📊</span> Dashboard</a>
       <a href="#integracoes"><span class="icon">🔗</span> Integrações</a>
-      <a href="#sync"><span class="icon">🛒</span> Shopee</a>
-      <a href="#ml-sync"><span class="icon">🏪</span> Mercado Livre</a>
+      <a href="#sync"><span class="icon">🛒</span> Shopee NFs</a>
+      <a href="#ml-sync"><span class="icon">🏪</span> ML NFs</a>
+      <div class="section-label">Etiquetas</div>
+      <a href="#shopee-labels"><span class="icon">🏷️</span> Etiquetas Shopee</a>
+      <a href="#ml-labels"><span class="icon">🏷️</span> Etiquetas ML</a>
       <a href="#nfs"><span class="icon">📋</span> Notas Fiscais</a>
+      <a href="#checklist"><span class="icon">✅</span> Checklist</a>
       <div class="section-label">Sistema</div>
       <a href="#logs"><span class="icon">📄</span> Logs</a>
       <a href="#config"><span class="icon">⚙️</span> Configurações</a>
@@ -896,6 +2715,18 @@ function getDashboardHtml(): string {
         </div>
       </div>
 
+      <!-- Processar Pedido Manual -->
+      <div class="card" style="border: 2px solid #3b82f6; background: linear-gradient(135deg, #eff6ff 0%, #ffffff 100%);">
+        <div class="card-header" style="border-bottom-color: #bfdbfe;">
+          🎯 Processar Pedido Individual
+          <span class="card-badge" style="background:#dbeafe;color:#1d4ed8;">NOVO</span>
+        </div>
+        <div class="card-body">
+          <p style="font-size:13px; color:#64748b; margin-bottom:14px;">Insira o Order SN da Shopee e processe automaticamente: busca no Tiny, gera NF e envia para a Shopee — tudo em um clique.</p>
+          <button class="btn btn-primary" onclick="openProcessarPedido()" style="background:#3b82f6; font-size: 15px; padding: 12px 28px;">Processar Pedido Individual</button>
+        </div>
+      </div>
+
       <!-- Sync Actions -->
       <div class="card" id="sync">
         <div class="card-header">🛒 Shopee — NF com ${config.shopeeDiscountPercent}% de Desconto</div>
@@ -937,6 +2768,25 @@ function getDashboardHtml(): string {
           </div>
 
           <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
+          <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">CSV para Upload em Massa na Shopee</p>
+          <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Baixe a planilha com "ID do pedido" + "Chave de Acesso" para upload na aba "Enviar nota em massa" da Shopee.</p>
+          <div id="msgCSV" class="msg msg-ok"></div>
+          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:16px;">
+            <button class="btn btn-primary btn-sm" onclick="downloadXLSX()" style="background:#16a34a;">📥 Baixar Planilha (.xlsx)</button>
+            <button class="btn btn-secondary btn-sm" onclick="downloadCSV()">📥 Baixar CSV</button>
+            <button class="btn btn-secondary btn-sm" onclick="clearCSV()">🗑 Limpar</button>
+            <span id="csvInfo" style="font-size:12px; color:#888;"></span>
+          </div>
+
+          <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
+          <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Relatório de Separação (Picking List)</p>
+          <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Gera um relatório A4 imprimível com os pedidos do CSV atual: ID do pedido, destinatário, produto, quantidade e SKU. Use para conferência na separação dos pedidos.</p>
+          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:16px;">
+            <button class="btn btn-primary btn-sm" onclick="openPickingList()" style="background:#7c3aed;">📋 Gerar Relatório de Separação</button>
+            <span style="font-size:12px; color:#888;">Abre em nova aba para impressão</span>
+          </div>
+
+          <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
           <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Enviar NFs já existentes para a Shopee (retroativo)</p>
           <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Busca pedidos Shopee que já possuem NF emitida no Tiny e envia a chave de acesso para a API da Shopee. Útil para NFs geradas antes da integração direta.</p>
           <div id="msgShopeeNF" class="msg msg-ok"></div>
@@ -952,6 +2802,39 @@ function getDashboardHtml(): string {
             </div>
           </div>
           <div id="shopeeConnStatus" style="margin-top:12px; font-size:12px; color:#888;"></div>
+        </div>
+      </div>
+
+      <!-- Shopee Labels Section -->
+      <div class="card" id="shopee-labels">
+        <div class="card-header">🏷️ Etiquetas Shopee</div>
+        <div class="card-body">
+          <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Gere e baixe etiquetas de envio da Shopee. O sistema faz ship_order + create + download automaticamente.</p>
+          <div id="msgLabel" class="msg msg-ok"></div>
+
+          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin-bottom:12px;">
+            <div class="form-sm">
+              <label>Order SN</label>
+              <input type="text" id="labelOrderSn" placeholder="Ex: 260519S0A4X2H9" style="width:180px;">
+            </div>
+            <button class="btn btn-primary btn-sm" id="btnDownloadLabel" onclick="downloadLabel()">📦 Baixar Etiqueta</button>
+            <button class="btn btn-secondary btn-sm" id="btnDiagnoseLabel" onclick="diagnoseLabel()">🔍 Diagnosticar</button>
+            <button class="btn btn-secondary btn-sm" id="btnTestLogistics" onclick="testLogistics()">🧪 Testar API</button>
+          </div>
+
+          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:12px; padding:12px 16px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0;">
+            <button class="btn btn-primary btn-sm" id="btnListLabels" onclick="listAvailableLabels()">📋 Listar Pedidos Disponíveis</button>
+            <button class="btn btn-primary btn-sm" id="btnBatchShopee" onclick="batchDownloadShopee()" style="background:#16a34a;">📥 Baixar Todas Etiquetas</button>
+            <span id="labelsAvailableInfo" style="font-size:12px; color:#888;"></span>
+          </div>
+
+          <div id="labelsListBox" style="display:none; margin-top:8px; max-height:300px; overflow-y:auto;">
+            <table id="labelsTable"><thead><tr><th>Order SN</th><th>Status</th><th>NF</th><th>Ação</th></tr></thead><tbody id="labelsTableBody"></tbody></table>
+          </div>
+
+          <div id="logisticsResult" style="display:none; margin-top:8px;">
+            <pre id="logisticsResultPre" style="background:#f8fafc; padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap; border:1px solid #e2e8f0; max-height:250px; overflow-y:auto;"></pre>
+          </div>
         </div>
       </div>
 
@@ -1006,11 +2889,86 @@ function getDashboardHtml(): string {
         </div>
       </div>
 
+      <!-- ML Labels Section -->
+      <div class="card" id="ml-labels">
+        <div class="card-header">🏷️ Etiquetas Mercado Livre</div>
+        <div class="card-body">
+          <div id="mlLabelsNotConnected" style="display:none; padding:16px; background:#fffbeb; border-radius:8px; border:1px solid #fde68a; margin-bottom:16px;">
+            <strong style="font-size:14px;">⚠ Conta ML não conectada</strong>
+            <div style="font-size:12px;color:#888;margin:6px 0 12px;">Conecte a conta ML acima para baixar etiquetas.</div>
+          </div>
+          <div id="mlLabelsConnected" style="display:none;">
+            <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Baixe etiquetas de envio dos pedidos do Mercado Livre.</p>
+            <div id="msgMLLabel" class="msg msg-ok"></div>
+
+            <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:12px; padding:12px 16px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0;">
+              <label style="font-size:12px; color:#666;">Pedido:</label>
+              <input type="text" id="mlLabelOrderId" placeholder="Nº do pedido ML" style="width:180px; padding:4px 8px; border:1px solid #e2e8f0; border-radius:4px; font-size:12px;">
+              <button class="btn btn-primary btn-sm" id="btnMLLabelByOrder" onclick="downloadMLLabelByOrder()">📦 Baixar Etiqueta</button>
+              <span style="color:#ccc; font-size:12px;">|</span>
+              <label style="font-size:12px; color:#666;">Período:</label>
+              <select id="mlDaysBack" style="padding:4px 8px; border:1px solid #e2e8f0; border-radius:4px; font-size:12px;">
+                <option value="1">1 dia</option>
+                <option value="3" selected>3 dias</option>
+                <option value="7">7 dias</option>
+              </select>
+              <button class="btn btn-primary btn-sm" id="btnListMLLabels" onclick="listMLLabels()">📋 Listar Pedidos</button>
+              <button class="btn btn-primary btn-sm" id="btnBatchML" onclick="batchDownloadML()" style="background:#16a34a;">📥 Baixar Todas</button>
+              <span id="mlLabelsInfo" style="font-size:12px; color:#888;"></span>
+            </div>
+
+            <div id="mlLabelsListBox" style="display:none; margin-top:8px; max-height:300px; overflow-y:auto;">
+              <table id="mlLabelsTable"><thead><tr><th>Pedido</th><th>Shipment</th><th>Status</th><th>Valor</th><th>Ação</th></tr></thead><tbody id="mlLabelsTableBody"></tbody></table>
+            </div>
+
+            <div id="mlLabelResult" style="display:none; margin-top:8px;">
+              <pre id="mlLabelResultPre" style="background:#f8fafc; padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap; border:1px solid #e2e8f0; max-height:250px; overflow-y:auto;"></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- NFs Table -->
       <div class="card" id="nfs">
         <div class="card-header">📋 Notas Fiscais Emitidas</div>
         <div class="card-body" style="padding: 12px 16px;">
           <div id="nfTable"><p class="empty">Nenhuma NF emitida ainda nesta sessão</p></div>
+        </div>
+      </div>
+
+      <!-- Checklist -->
+      <div class="card" id="checklist">
+        <div class="card-header">✅ Checklist de Pedidos</div>
+        <div class="card-body" style="padding: 12px 16px;">
+          <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Lista de conferência dos pedidos com NF emitida. Marque conforme for separando/enviando.</p>
+          <div id="msgChecklist" class="msg msg-ok"></div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:12px;">
+            <button class="btn btn-primary btn-sm" onclick="loadChecklist()">🔄 Atualizar</button>
+            <button class="btn btn-secondary btn-sm" onclick="toggleAllChecklist(true)">☑ Marcar Todos</button>
+            <button class="btn btn-secondary btn-sm" onclick="toggleAllChecklist(false)">☐ Desmarcar Todos</button>
+            <button class="btn btn-secondary btn-sm" onclick="clearCheckedItems()" style="background:#ef4444;color:#fff;">🗑 Limpar Marcados</button>
+            <button class="btn btn-secondary btn-sm" onclick="printChecklist()">🖨 Imprimir</button>
+            <label style="font-size:12px; color:#666; margin-left:8px;">
+              <input type="checkbox" id="chkShowChecked" checked onchange="loadChecklist()"> Mostrar marcados
+            </label>
+            <span id="checklistInfo" style="font-size:12px; color:#888; margin-left:auto;"></span>
+          </div>
+          <div id="checklistTableBox" style="max-height:500px; overflow-y:auto;">
+            <table id="checklistTable">
+              <thead>
+                <tr>
+                  <th style="width:40px;">✓</th>
+                  <th>NF</th>
+                  <th>Pedido</th>
+                  <th>Canal</th>
+                  <th>Cliente</th>
+                  <th>Valor</th>
+                  <th>Data</th>
+                </tr>
+              </thead>
+              <tbody id="checklistTableBody"></tbody>
+            </table>
+          </div>
         </div>
       </div>
 
@@ -1121,6 +3079,8 @@ function getDashboardHtml(): string {
         document.getElementById('totalNFs').textContent = d.totalNFsEmitted || '0';
         document.getElementById('autoStatus').textContent = d.automationPaused ? '⏸ Pausada' : 'Auto a cada ${config.pollIntervalMinutes} min';
         if (d.lastResult) document.getElementById('result').textContent = JSON.stringify(d.lastResult, null, 2);
+        var csvEl = document.getElementById('csvInfo');
+        if (csvEl) csvEl.textContent = (d.csvCount || 0) + ' NFs no CSV';
         renderNFTable(d.nfHistory);
         renderLogs(d.logs);
       } catch(e) {}
@@ -1298,9 +3258,453 @@ function getDashboardHtml(): string {
       btn.disabled = false; btn.textContent = '🔍 Inspecionar API ML';
     }
 
+    async function downloadCSV() {
+      try {
+        var r = await fetch('/shopee/csv', { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        if (r.status === 404) { showMsg('msgCSV', 'Nenhum CSV disponível ainda. Processe pedidos Shopee primeiro.', false); return; }
+        var blob = await r.blob();
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = 'shopee_nfs_' + new Date().toISOString().slice(0,10) + '.csv';
+        a.click();
+        URL.revokeObjectURL(url);
+        showMsg('msgCSV', 'CSV baixado com sucesso!', true);
+      } catch(e) { showMsg('msgCSV', 'Erro: ' + e.message, false); }
+    }
+
+    async function downloadXLSX() {
+      try {
+        var r = await fetch('/shopee/xlsx', { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        if (r.status === 404) { showMsg('msgCSV', 'Nenhuma NF disponível. Processe pedidos Shopee primeiro.', false); return; }
+        var blob = await r.blob();
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = 'shopee_nfs_' + new Date().toISOString().slice(0,10) + '.xlsx';
+        a.click();
+        URL.revokeObjectURL(url);
+        showMsg('msgCSV', 'Planilha XLSX baixada! Faça upload direto na Shopee.', true);
+      } catch(e) { showMsg('msgCSV', 'Erro: ' + e.message, false); }
+    }
+
+    async function clearCSV() {
+      if (!confirm('Limpar o CSV? Faça isso após fazer o upload na Shopee.')) return;
+      try {
+        var r = await fetch('/shopee/csv', { method: 'DELETE', headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        showMsg('msgCSV', 'CSV limpo com sucesso', true);
+        document.getElementById('csvInfo').textContent = '0 NFs no CSV';
+      } catch(e) { showMsg('msgCSV', 'Erro: ' + e.message, false); }
+    }
+
+    function openPickingList() {
+      window.open('/shopee/picking-list?token=' + encodeURIComponent(authToken), '_blank');
+    }
+
+    function openProcessarPedido() {
+      window.open('/pedido/processar?token=' + encodeURIComponent(authToken), '_blank');
+    }
+
+    async function testLogistics() {
+      var orderSn = document.getElementById('labelOrderSn').value.trim();
+      if (!orderSn) { showMsg('msgLabel', 'Informe o Order SN do pedido Shopee', false); return; }
+      var btn = document.getElementById('btnTestLogistics');
+      btn.disabled = true; btn.textContent = '⏳ Testando...';
+      try {
+        var r = await fetch('/shopee/test-logistics?order_sn=' + encodeURIComponent(orderSn), { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
+        document.getElementById('logisticsResult').style.display = 'block';
+        document.getElementById('logisticsResultPre').textContent = JSON.stringify(d, null, 2);
+        if (d.ok) {
+          showMsg('msgLabel', 'API de logística acessível! Permissão OK.', true);
+        } else {
+          showMsg('msgLabel', 'Erro: ' + (d.error || 'Sem permissão ou pedido inválido'), false);
+        }
+      } catch(e) { showMsg('msgLabel', 'Erro: ' + e.message, false); }
+      btn.disabled = false; btn.textContent = '🧪 Testar API';
+    }
+
+    async function diagnoseLabel() {
+      var orderSn = document.getElementById('labelOrderSn').value.trim();
+      if (!orderSn) { showMsg('msgLabel', 'Informe o Order SN do pedido Shopee', false); return; }
+      var btn = document.getElementById('btnDiagnoseLabel');
+      btn.disabled = true; btn.textContent = '⏳ Diagnosticando...';
+      try {
+        var r = await fetch('/shopee/diagnose-label?order_sn=' + encodeURIComponent(orderSn), { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
+        document.getElementById('logisticsResult').style.display = 'block';
+        document.getElementById('logisticsResultPre').textContent = JSON.stringify(d, null, 2);
+        if (d.finalSuccess) {
+          showMsg('msgLabel', 'Diagnóstico OK — etiqueta gerada com sucesso (' + (d.pdfSize || 0) + ' bytes)', true);
+        } else {
+          var failedSteps = (d.steps || []).filter(function(s) { return !s.success; }).map(function(s) { return s.step + ': ' + s.detail; }).join(' | ');
+          showMsg('msgLabel', 'Falha: ' + failedSteps, false);
+        }
+      } catch(e) { showMsg('msgLabel', 'Erro: ' + e.message, false); }
+      btn.disabled = false; btn.textContent = '🔍 Diagnosticar';
+    }
+
+    async function downloadLabel(orderSnParam) {
+      var orderSn = orderSnParam || document.getElementById('labelOrderSn').value.trim();
+      if (!orderSn) { showMsg('msgLabel', 'Informe o Order SN do pedido Shopee', false); return; }
+      var btn = orderSnParam ? null : document.getElementById('btnDownloadLabel');
+      if (btn) { btn.disabled = true; btn.textContent = '⏳ Gerando etiqueta...'; }
+      try {
+        var r = await fetch('/shopee/shipping-label?order_sn=' + encodeURIComponent(orderSn), { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var ct = r.headers.get('content-type') || '';
+        if (ct.includes('application/pdf')) {
+          var blob = await r.blob();
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement('a');
+          a.href = url;
+          a.download = 'etiqueta_' + orderSn + '.pdf';
+          a.click();
+          URL.revokeObjectURL(url);
+          showMsg('msgLabel', 'Etiqueta ' + orderSn + ' baixada!', true);
+        } else {
+          var d = await r.json();
+          document.getElementById('logisticsResult').style.display = 'block';
+          document.getElementById('logisticsResultPre').textContent = JSON.stringify(d, null, 2);
+          showMsg('msgLabel', 'Erro ' + orderSn + ': ' + (d.error || 'Falha ao gerar etiqueta'), false);
+        }
+      } catch(e) { showMsg('msgLabel', 'Erro: ' + e.message, false); }
+      if (btn) { btn.disabled = false; btn.textContent = '📦 Baixar Etiqueta'; }
+    }
+
+    async function listAvailableLabels() {
+      var btn = document.getElementById('btnListLabels');
+      btn.disabled = true; btn.textContent = '⏳ Buscando...';
+      try {
+        var r = await fetch('/shopee/labels-available', { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
+        document.getElementById('labelsAvailableInfo').textContent = (d.count || 0) + ' pedidos encontrados (' + (d.readyForLabel || 0) + ' com NF — prontos para etiqueta)';
+        if (d.orders && d.orders.length > 0) {
+          var tbody = document.getElementById('labelsTableBody');
+          var h = '';
+          for (var i = 0; i < d.orders.length; i++) {
+            var o = d.orders[i];
+            var statusBadge = o.status === 'READY_TO_SHIP' ? 'badge-orange' : 'badge-green';
+            var nfBadge = o.hasNF ? '<span class="badge badge-green">✓ Sim</span>' : '<span class="badge badge-orange">✗ Não</span>';
+            var canDownload = o.hasNF;
+            h += '<tr>';
+            h += '<td><strong>' + o.order_sn + '</strong></td>';
+            h += '<td><span class="badge ' + statusBadge + '">' + (o.orderStatus || o.status) + '</span></td>';
+            h += '<td>' + nfBadge + '</td>';
+            if (canDownload) {
+              h += '<td><button class="btn btn-primary btn-sm" onclick="downloadLabel(\\'' + o.order_sn + '\\')">📦 Baixar</button></td>';
+            } else {
+              h += '<td><span style="color:#94a3b8; font-size:12px;">Aguardando NF</span></td>';
+            }
+            h += '</tr>';
+          }
+          tbody.innerHTML = h;
+          document.getElementById('labelsListBox').style.display = 'block';
+        } else {
+          document.getElementById('labelsListBox').style.display = 'none';
+          showMsg('msgLabel', 'Nenhum pedido pendente encontrado', false);
+        }
+      } catch(e) { showMsg('msgLabel', 'Erro: ' + e.message, false); }
+      btn.disabled = false; btn.textContent = '📋 Listar Pedidos Disponíveis';
+    }
+
+    // === Shopee batch download ===
+    async function batchDownloadShopee() {
+      var btn = document.getElementById('btnBatchShopee');
+      btn.disabled = true; btn.textContent = '⏳ Baixando todas...';
+      try {
+        // List available orders first
+        var lr = await fetch('/shopee/labels-available', { headers: authHeaders });
+        if (lr.status === 401) { handleAuthError(); return; }
+        var listData = await lr.json();
+        if (!listData.orders || listData.orders.length === 0) {
+          showMsg('msgLabel', 'Nenhum pedido disponível para etiqueta', false);
+          btn.disabled = false; btn.textContent = '📥 Baixar Todas Etiquetas';
+          return;
+        }
+
+        var total = listData.orders.length;
+        var downloaded = 0;
+        var failed = 0;
+        showMsg('msgLabel', 'Baixando ' + total + ' etiquetas...', true);
+
+        for (var i = 0; i < listData.orders.length; i++) {
+          var o = listData.orders[i];
+          btn.textContent = '⏳ ' + (i+1) + '/' + total + '...';
+          try {
+            var r = await fetch('/shopee/shipping-label?order_sn=' + encodeURIComponent(o.order_sn), { headers: authHeaders });
+            if (r.status === 401) { handleAuthError(); return; }
+            var ct = r.headers.get('content-type') || '';
+            if (ct.includes('application/pdf')) {
+              var blob = await r.blob();
+              var url = URL.createObjectURL(blob);
+              var a = document.createElement('a');
+              a.href = url; a.download = 'etiqueta_' + o.order_sn + '.pdf'; a.click();
+              URL.revokeObjectURL(url);
+              downloaded++;
+            } else {
+              failed++;
+            }
+          } catch(e) { failed++; }
+          // Small delay to not overwhelm API
+          await new Promise(function(r) { setTimeout(r, 500); });
+        }
+        showMsg('msgLabel', downloaded + ' etiquetas baixadas' + (failed > 0 ? ', ' + failed + ' falharam' : ''), downloaded > 0);
+      } catch(e) { showMsg('msgLabel', 'Erro: ' + e.message, false); }
+      btn.disabled = false; btn.textContent = '📥 Baixar Todas Etiquetas';
+    }
+
+    // === ML Labels ===
+    async function downloadMLLabelByOrder() {
+      var orderId = document.getElementById('mlLabelOrderId').value.trim();
+      if (!orderId) { showMsg('msgMLLabel', 'Informe o número do pedido ML', false); return; }
+      var btn = document.getElementById('btnMLLabelByOrder');
+      btn.disabled = true; btn.textContent = '⏳ Buscando...';
+      try {
+        var r = await fetch('/ml/label-by-order?order_id=' + encodeURIComponent(orderId), { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var ct = r.headers.get('content-type') || '';
+        if (ct.includes('application/pdf')) {
+          var blob = await r.blob();
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement('a');
+          a.href = url; a.download = 'etiqueta_ml_' + orderId + '.pdf'; a.click();
+          URL.revokeObjectURL(url);
+          showMsg('msgMLLabel', 'Etiqueta do pedido ' + orderId + ' baixada!', true);
+        } else {
+          var d = await r.json();
+          showMsg('msgMLLabel', 'Erro: ' + (d.error || 'Etiqueta não disponível para este pedido'), false);
+          if (d.shipmentId || d.error) {
+            document.getElementById('mlLabelResult').style.display = 'block';
+            document.getElementById('mlLabelResultPre').textContent = JSON.stringify(d, null, 2);
+          }
+        }
+      } catch(e) { showMsg('msgMLLabel', 'Erro: ' + e.message, false); }
+      btn.disabled = false; btn.textContent = '📦 Baixar Etiqueta';
+    }
+
+    async function refreshMLLabelsStatus() {
+      try {
+        var r = await fetch('/ml/status', { headers: authHeaders });
+        if (r.status === 401) return;
+        var d = await r.json();
+        var notConn = document.getElementById('mlLabelsNotConnected');
+        var conn = document.getElementById('mlLabelsConnected');
+        if (d.connected) {
+          if (notConn) notConn.style.display = 'none';
+          if (conn) conn.style.display = 'block';
+        } else {
+          if (notConn) notConn.style.display = 'block';
+          if (conn) conn.style.display = 'none';
+        }
+      } catch(e) {}
+    }
+
+    async function listMLLabels() {
+      var btn = document.getElementById('btnListMLLabels');
+      btn.disabled = true; btn.textContent = '⏳ Buscando...';
+      var days = document.getElementById('mlDaysBack').value || '3';
+      try {
+        var r = await fetch('/ml/labels-available?days=' + days, { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
+        var infoText = (d.count || 0) + ' pedidos pagos com envio (' + (d.daysBack || '?') + ' dias, ' + (d.elapsedSeconds || '?') + 's)';
+        document.getElementById('mlLabelsInfo').textContent = infoText;
+        if (d.orders && d.orders.length > 0) {
+          var tbody = document.getElementById('mlLabelsTableBody');
+          var h = '';
+          for (var i = 0; i < d.orders.length; i++) {
+            var o = d.orders[i];
+            var statusText = o.cachedSubstatus || o.cachedStatus || 'paid';
+            var badgeClass = o.cachedStatus === 'ready_to_ship' ? 'badge-green' : 'badge-orange';
+            h += '<tr>';
+            h += '<td><strong>' + o.orderId + '</strong></td>';
+            h += '<td>' + o.shipmentId + '</td>';
+            h += '<td><span class="badge ' + badgeClass + '">' + statusText + '</span></td>';
+            h += '<td>R$ ' + (o.totalAmount ? o.totalAmount.toFixed(2) : '-') + '</td>';
+            h += '<td><button class="btn btn-primary btn-sm" onclick="downloadMLLabel(' + o.shipmentId + ')">📦 Baixar</button></td>';
+            h += '</tr>';
+          }
+          tbody.innerHTML = h;
+          document.getElementById('mlLabelsListBox').style.display = 'block';
+        } else {
+          document.getElementById('mlLabelsListBox').style.display = 'none';
+          showMsg('msgMLLabel', 'Nenhum pedido ML pago com envio pendente', false);
+        }
+      } catch(e) { showMsg('msgMLLabel', 'Erro: ' + e.message, false); }
+      btn.disabled = false; btn.textContent = '📋 Listar Pedidos';
+    }
+
+    async function downloadMLLabel(shipmentId) {
+      try {
+        showMsg('msgMLLabel', 'Baixando etiqueta ML #' + shipmentId + '...', true);
+        var r = await fetch('/ml/shipping-label?shipment_id=' + shipmentId, { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var ct = r.headers.get('content-type') || '';
+        if (ct.includes('application/pdf')) {
+          var blob = await r.blob();
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement('a');
+          a.href = url; a.download = 'etiqueta_ml_' + shipmentId + '.pdf'; a.click();
+          URL.revokeObjectURL(url);
+          showMsg('msgMLLabel', 'Etiqueta ML #' + shipmentId + ' baixada!', true);
+        } else {
+          var d = await r.json();
+          document.getElementById('mlLabelResult').style.display = 'block';
+          document.getElementById('mlLabelResultPre').textContent = JSON.stringify(d, null, 2);
+          showMsg('msgMLLabel', 'Erro: ' + (d.error || 'Falha ao gerar etiqueta'), false);
+        }
+      } catch(e) { showMsg('msgMLLabel', 'Erro: ' + e.message, false); }
+    }
+
+    async function batchDownloadML() {
+      var btn = document.getElementById('btnBatchML');
+      btn.disabled = true; btn.textContent = '⏳ Baixando...';
+      var days = document.getElementById('mlDaysBack').value || '3';
+      try {
+        var r = await fetch('/ml/labels-batch?days=' + days, { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var ct = r.headers.get('content-type') || '';
+        if (ct.includes('application/pdf')) {
+          var downloaded = r.headers.get('x-ml-labels-downloaded') || '?';
+          var failed = r.headers.get('x-ml-labels-failed') || '0';
+          var blob = await r.blob();
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement('a');
+          a.href = url; a.download = 'etiquetas_ml_' + new Date().toISOString().slice(0,10) + '.pdf'; a.click();
+          URL.revokeObjectURL(url);
+          var msg = downloaded + ' etiquetas baixadas em PDF';
+          if (parseInt(failed) > 0) msg += ' (' + failed + ' indisponíveis — pendentes ou Fulfillment)';
+          showMsg('msgMLLabel', msg, true);
+        } else {
+          var d = await r.json();
+          var errMsg = d.error || 'Nenhuma etiqueta disponível';
+          if (d.details && d.details.length > 0) {
+            errMsg += '\\n' + d.details.slice(0, 5).join('\\n');
+          }
+          showMsg('msgMLLabel', errMsg, false);
+          document.getElementById('mlLabelResult').style.display = 'block';
+          document.getElementById('mlLabelResultPre').textContent = JSON.stringify(d, null, 2);
+        }
+      } catch(e) { showMsg('msgMLLabel', 'Erro: ' + e.message, false); }
+      btn.disabled = false; btn.textContent = '📥 Baixar Todas';
+    }
+
+    // === Checklist ===
+    async function loadChecklist() {
+      try {
+        var showChecked = document.getElementById('chkShowChecked').checked;
+        var r = await fetch('/checklist?show_checked=' + showChecked, { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
+        document.getElementById('checklistInfo').textContent =
+          d.unchecked + ' pendentes / ' + d.checked + ' conferidos / ' + d.total + ' total';
+        var tbody = document.getElementById('checklistTableBody');
+        if (!d.items || d.items.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#999;padding:20px;">Nenhum pedido no checklist</td></tr>';
+          return;
+        }
+        var h = '';
+        for (var i = 0; i < d.items.length; i++) {
+          var it = d.items[i];
+          var rowStyle = it.checked ? 'background:#f0fdf4; opacity:0.7;' : '';
+          var canalBadge = it.canal === 'Mercado Livre' ? 'badge-orange' : 'badge-blue';
+          h += '<tr style="' + rowStyle + '">';
+          h += '<td style="text-align:center;"><input type="checkbox" ' + (it.checked ? 'checked' : '') + ' onchange="toggleChecklistItem(\\'' + (it.nfId || it.nfNumero) + '\\', this.checked)"></td>';
+          h += '<td><strong>' + (it.nfNumero || it.nfId || '-') + '</strong></td>';
+          h += '<td><span class="badge badge-orange">' + (it.numeroPedido || '-') + '</span></td>';
+          h += '<td><span class="badge ' + canalBadge + '">' + (it.canal || '-') + '</span></td>';
+          h += '<td>' + (it.clienteNome || '-') + '</td>';
+          h += '<td>R$ ' + (it.valor ? it.valor.toFixed(2) : '-') + '</td>';
+          h += '<td style="font-size:11px;color:#999;">' + (it.dataEmissao || '-') + '</td>';
+          h += '</tr>';
+        }
+        tbody.innerHTML = h;
+      } catch(e) { showMsg('msgChecklist', 'Erro: ' + e.message, false); }
+    }
+
+    async function toggleChecklistItem(nfId, checked) {
+      try {
+        await fetch('/checklist/toggle', {
+          method: 'POST',
+          headers: { ...authHeaders, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ nfId: nfId, checked: checked })
+        });
+        loadChecklist();
+      } catch(e) { showMsg('msgChecklist', 'Erro: ' + e.message, false); }
+    }
+
+    async function toggleAllChecklist(checked) {
+      try {
+        await fetch('/checklist/toggle-all', {
+          method: 'POST',
+          headers: { ...authHeaders, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ checked: checked })
+        });
+        loadChecklist();
+        showMsg('msgChecklist', checked ? 'Todos marcados' : 'Todos desmarcados', true);
+      } catch(e) { showMsg('msgChecklist', 'Erro: ' + e.message, false); }
+    }
+
+    async function clearCheckedItems() {
+      if (!confirm('Remover todos os itens marcados do checklist?')) return;
+      try {
+        var r = await fetch('/checklist/clear-checked', { method: 'DELETE', headers: authHeaders });
+        var d = await r.json();
+        showMsg('msgChecklist', d.removed + ' itens removidos', true);
+        loadChecklist();
+      } catch(e) { showMsg('msgChecklist', 'Erro: ' + e.message, false); }
+    }
+
+    function printChecklist() {
+      var table = document.getElementById('checklistTable');
+      if (!table) return;
+      var w = window.open('', '_blank');
+      w.document.write('<html><head><title>Checklist de Pedidos</title>');
+      w.document.write('<style>');
+      w.document.write('body { font-family: Arial, sans-serif; font-size: 12px; margin: 20px; }');
+      w.document.write('h2 { margin-bottom: 10px; }');
+      w.document.write('table { border-collapse: collapse; width: 100%; }');
+      w.document.write('th, td { border: 1px solid #ccc; padding: 6px 10px; text-align: left; }');
+      w.document.write('th { background: #f0f0f0; font-weight: bold; }');
+      w.document.write('tr:nth-child(even) { background: #fafafa; }');
+      w.document.write('.check-col { width: 30px; text-align: center; }');
+      w.document.write('</style></head><body>');
+      w.document.write('<h2>Checklist de Pedidos — ' + new Date().toLocaleDateString('pt-BR') + '</h2>');
+      w.document.write('<table><thead><tr>');
+      w.document.write('<th class="check-col">☐</th><th>NF</th><th>Pedido</th><th>Canal</th><th>Cliente</th><th>Valor</th><th>Data</th>');
+      w.document.write('</tr></thead><tbody>');
+      var rows = document.getElementById('checklistTableBody').querySelectorAll('tr');
+      for (var i = 0; i < rows.length; i++) {
+        var cells = rows[i].querySelectorAll('td');
+        if (cells.length < 7) continue;
+        var isChecked = cells[0].querySelector('input') && cells[0].querySelector('input').checked;
+        w.document.write('<tr>');
+        w.document.write('<td class="check-col">' + (isChecked ? '✓' : '☐') + '</td>');
+        for (var j = 1; j < cells.length; j++) {
+          w.document.write('<td>' + cells[j].textContent + '</td>');
+        }
+        w.document.write('</tr>');
+      }
+      w.document.write('</tbody></table></body></html>');
+      w.document.close();
+      w.print();
+    }
+
+    // Carrega checklist ao abrir
+    loadChecklist();
+
     // Inicializa status ML e atualiza periodicamente
     refreshMLStatus();
+    refreshMLLabelsStatus();
     setInterval(refreshMLStatus, 5000);
+    setInterval(refreshMLLabelsStatus, 5000);
   </script>
 </body>
 </html>`;

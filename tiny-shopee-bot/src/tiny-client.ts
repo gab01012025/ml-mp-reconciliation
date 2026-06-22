@@ -66,25 +66,6 @@ async function tinyPost(endpoint: string, params: Record<string, string> = {}): 
   return JSON.parse(text);
 }
 
-/**
- * Faz POST com query params na URL e JSON body (formato usado por pedido.alterar)
- */
-async function tinyPostJson(endpoint: string, queryParams: Record<string, string>, jsonBody: any): Promise<any> {
-  const urlParams = new URLSearchParams({
-    token: config.tinyToken,
-    formato: 'json',
-    ...queryParams,
-  });
-
-  const response = await fetch(`${config.tinyApiUrl}/${endpoint}?${urlParams.toString()}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(jsonBody),
-  });
-
-  const text = await response.text();
-  return JSON.parse(text);
-}
 
 function ensureArray<T>(val: T | T[] | undefined): T[] {
   if (!val) return [];
@@ -176,6 +157,51 @@ export async function searchByNumeroEcommerce(numeroEcommerce: string): Promise<
     } catch (err: any) {
       lastErr = err;
       // Se for erro de rede/timeout, retry
+      if (attempt < 2) {
+        await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+        continue;
+      }
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * Busca pedidos pelo número do pedido Tiny (campo "numero").
+ * Diferente de numero_ecommerce — esse é o ID interno do Tiny.
+ */
+export async function searchByNumero(numero: string): Promise<TinyOrderSummary[]> {
+  let lastErr: any;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const data = await tinyPost('pedidos.pesquisa.php', { numero: numero });
+      const retorno = data.retorno;
+      if (retorno.status !== 'OK') {
+        const erro = retorno.erros?.[0]?.erro || retorno.erros?.erro || '';
+        const erroStr = String(erro);
+        if (erroStr.includes('não retornou registros')) return [];
+        if (erroStr.includes('Tente novamente') || erroStr.includes('executar a consulta')) {
+          lastErr = new Error(`Tiny transitório: ${erroStr}`);
+          await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+          continue;
+        }
+        throw new Error(`Tiny API error (numero=${numero}): ${erroStr}`);
+      }
+      const rawPedidos = ensureArray(retorno.pedidos);
+      return rawPedidos.map((p: any) => {
+        const ped = p.pedido || p;
+        return {
+          id: String(ped.id),
+          numero: String(ped.numero),
+          numero_ecommerce: String(ped.numero_ecommerce || ''),
+          data_pedido: String(ped.data_pedido),
+          nome: String(ped.nome),
+          valor: String(ped.valor),
+          situacao: String(ped.situacao),
+        };
+      });
+    } catch (err: any) {
+      lastErr = err;
       if (attempt < 2) {
         await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
         continue;
@@ -401,17 +427,19 @@ export async function createAndEmitNF(order: TinyOrderDetail): Promise<NFResult>
 }
 
 /**
- * Cria NF via nota.fiscal.incluir com valor unitário reduzido por percentual de desconto (Mercado Livre).
+ * Cria NF via nota.fiscal.incluir com valor unitário reduzido por percentual de desconto.
  * Ex: discountPercent=30 → NF emitida com 70% do valor unitário original de cada item.
+ * Se ecommerceName for informado, seta os campos numero_pedido_ecommerce + ecommerce
+ * para vincular a NF ao pedido do marketplace (permite auto-envio pelo Tiny).
  */
-export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discountPercent: number): Promise<NFResult> {
+export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discountPercent: number, ecommerceName?: string): Promise<NFResult> {
   const factor = (100 - discountPercent) / 100;
 
-  const nota = {
+  const nota: any = {
     nota_fiscal: {
       tipo_nota: 'N',
       natureza_operacao: 'Venda de mercadorias',
-      numero_ecommerce: order.numero_ecommerce,
+      numero_pedido_ecommerce: order.numero_ecommerce,
       frete_por_conta: 'R',
       cliente: {
         nome: order.cliente.nome,
@@ -442,6 +470,12 @@ export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discount
     },
   };
 
+  if (ecommerceName) {
+    nota.nota_fiscal.ecommerce = ecommerceName;
+  }
+
+  console.log(`[TINY] Criando NF com numero_pedido_ecommerce=${order.numero_ecommerce}${ecommerceName ? `, ecommerce=${ecommerceName}` : ''}`);
+
   const incluirResult = await tinyPost('nota.fiscal.incluir.php', { nota: JSON.stringify(nota) });
   const incluirRetorno = incluirResult.retorno;
   const registro = incluirRetorno.registros?.registro;
@@ -450,7 +484,7 @@ export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discount
   if (incluirRetorno.status !== 'OK' || reg?.status !== 'OK') {
     const erros = reg?.erros || incluirRetorno.erros;
     const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro desconhecido';
-    console.error(`[ERRO] Falha ao criar NF (ML) para pedido ${order.id}: ${errList}`);
+    console.error(`[ERRO] Falha ao criar NF para pedido ${order.id}: ${errList}`);
     return { success: false };
   }
 
@@ -459,7 +493,8 @@ export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discount
     (sum, i) => sum + parseFloat(i.valor_unitario) * parseFloat(i.quantidade) * factor,
     0,
   );
-  console.log(`[OK] NF ML ${reg.numero} criada para pedido ${order.id} (NF ID: ${nfId}) - desconto ${discountPercent}% - total: R$${valorTotal.toFixed(2)}`);
+  const tag = ecommerceName || 'NF';
+  console.log(`[OK] ${tag} ${reg.numero} criada para pedido ${order.id} (NF ID: ${nfId}) - desconto ${discountPercent}% - total: R$${valorTotal.toFixed(2)}`);
 
   await sleep(1500);
   const emitirResult = await tinyPost('nota.fiscal.emitir.php', { id: nfId });
@@ -468,12 +503,12 @@ export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discount
   if (emitirRetorno.status !== 'OK') {
     const erros = emitirRetorno.erros;
     const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro desconhecido';
-    console.error(`[ERRO] NF ML ${nfId} criada mas falhou ao emitir: ${errList}`);
+    console.error(`[ERRO] NF ${nfId} criada mas falhou ao emitir: ${errList}`);
     return { success: false, nfId };
   }
 
   const situacao = emitirRetorno.nota_fiscal?.situacao;
-  console.log(`[OK] NF ML ${nfId} emitida na SEFAZ - situacao: ${situacao}`);
+  console.log(`[OK] NF ${nfId} emitida na SEFAZ - situacao: ${situacao}`);
 
   let chaveAcesso: string | undefined;
   let numeroNF: string | undefined;
@@ -484,10 +519,10 @@ export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discount
     if (nfData) {
       chaveAcesso = nfData.chave_acesso || undefined;
       numeroNF = nfData.numero || reg.numero;
-      console.log(`[OK] Chave de acesso NF ML ${nfId}: ${chaveAcesso || 'N/A'}`);
+      console.log(`[OK] Chave de acesso NF ${nfId}: ${chaveAcesso || 'N/A'}`);
     }
   } catch (err) {
-    console.error(`[AVISO] NF ML ${nfId} emitida mas falha ao obter chave_acesso:`, err);
+    console.error(`[AVISO] NF ${nfId} emitida mas falha ao obter chave_acesso:`, err);
   }
 
   return {
@@ -504,10 +539,39 @@ export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discount
 /**
  * Obtém detalhes de uma NF já existente pelo ID (numero, chave_acesso, serie, situacao)
  */
-export async function getNFDetails(nfId: string): Promise<{ numero?: string; serie?: string; chaveAcesso?: string; situacao?: string; dataEmissao?: string; valorNota?: number; valorProdutos?: number }> {
+export interface NFDetailsFull {
+  numero?: string;
+  serie?: string;
+  chaveAcesso?: string;
+  situacao?: string;
+  dataEmissao?: string;
+  valorNota?: number;
+  valorProdutos?: number;
+  itens: Array<{ codigo: string; descricao: string; quantidade: number; valor_unitario: number; unidade: string }>;
+}
+
+export async function getNFDetails(nfId: string): Promise<NFDetailsFull> {
   const result = await tinyPost('nota.fiscal.obter.php', { id: nfId });
   const nfData = result.retorno?.nota_fiscal;
-  if (!nfData) return {};
+  if (!nfData) return { itens: [] };
+
+  // Extrai itens da NF (kits já desmembrados, SKUs corretos)
+  let nfItems: Array<{ codigo: string; descricao: string; quantidade: number; valor_unitario: number; unidade: string }> = [];
+  const rawItens = nfData.itens;
+  if (rawItens) {
+    const itemArr = ensureArray(rawItens);
+    nfItems = itemArr.map((i: any) => {
+      const it = i.item || i;
+      return {
+        codigo: String(it.codigo || ''),
+        descricao: String(it.descricao || ''),
+        quantidade: parseFloat(it.quantidade) || 1,
+        valor_unitario: parseFloat(it.valor_unitario) || 0,
+        unidade: String(it.unidade || 'UN'),
+      };
+    });
+  }
+
   return {
     numero: nfData.numero || undefined,
     serie: nfData.serie || undefined,
@@ -516,6 +580,7 @@ export async function getNFDetails(nfId: string): Promise<{ numero?: string; ser
     dataEmissao: nfData.data_emissao || undefined,
     valorNota: nfData.valor_nota ? parseFloat(nfData.valor_nota) : undefined,
     valorProdutos: nfData.valor_produtos ? parseFloat(nfData.valor_produtos) : undefined,
+    itens: nfItems,
   };
 }
 
@@ -590,8 +655,58 @@ export async function getNFXml(nfId: string): Promise<string | null> {
 }
 
 /**
- * Gera nota fiscal a partir do pedido (usa valores originais do pedido)
- * Fallback para quando não há endereço completo do cliente
+ * Altera os preços dos itens de um pedido no Tiny (aplica desconto percentual).
+ * Usado antes de gerar NF para que a NF vinculada ao pedido tenha os valores corretos.
+ */
+export async function alterOrderPrices(
+  orderId: string,
+  order: TinyOrderDetail,
+  discountPercent: number,
+): Promise<{ success: boolean; error?: string }> {
+  const factor = (100 - discountPercent) / 100;
+
+  const pedido = {
+    pedido: {
+      itens: order.itens.map(item => {
+        const vuOriginal = parseFloat(item.valor_unitario);
+        const vuReduzido = Math.max(0.01, +(vuOriginal * factor).toFixed(3));
+        return {
+          item: {
+            id_produto: item.id_produto,
+            descricao: item.descricao,
+            unidade: item.unidade,
+            quantidade: item.quantidade,
+            valor_unitario: vuReduzido.toFixed(3),
+          },
+        };
+      }),
+    },
+  };
+
+  const data = await tinyPost('pedido.alterar.php', {
+    id: orderId,
+    pedido: JSON.stringify(pedido),
+  });
+  const retorno = data.retorno;
+
+  if (retorno.status !== 'OK') {
+    const erros = retorno.erros;
+    const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro desconhecido';
+    console.error(`[ERRO] Falha ao alterar pedido ${orderId}: ${errList}`);
+    return { success: false, error: errList };
+  }
+
+  const totalReduzido = order.itens.reduce(
+    (sum, i) => sum + parseFloat(i.valor_unitario) * parseFloat(i.quantidade) * factor,
+    0,
+  );
+  console.log(`[OK] Pedido ${orderId} alterado: desconto ${discountPercent}% aplicado — novo total aprox R$${totalReduzido.toFixed(2)}`);
+  return { success: true };
+}
+
+/**
+ * Gera nota fiscal a partir do pedido (usa valores atuais do pedido).
+ * A NF fica vinculada ao pedido, permitindo que o Tiny envie automaticamente para a Shopee.
  */
 export async function generateNF(orderId: string): Promise<{ success: boolean; nfId?: string }> {
   const data = await tinyPost('gerar.nota.fiscal.pedido.php', { id: orderId });
@@ -606,12 +721,259 @@ export async function generateNF(orderId: string): Promise<{ success: boolean; n
   const registros = ensureArray(retorno.registros?.registro ?? retorno.registros);
   const registro = registros[0]?.registro || registros[0];
   const nfId = registro?.idNotaFiscal;
-  console.log(`[OK] NF gerada (fallback) para pedido ${orderId} - NF ID: ${nfId || 'N/A'}`);
+  console.log(`[OK] NF gerada a partir do pedido ${orderId} - NF ID: ${nfId || 'N/A'}`);
   return { success: true, nfId: nfId ? String(nfId) : undefined };
+}
+
+/**
+ * Emite uma NF (rascunho) na SEFAZ.
+ */
+export async function emitNF(nfId: string): Promise<{ success: boolean; situacao?: string; error?: string }> {
+  const data = await tinyPost('nota.fiscal.emitir.php', { id: nfId });
+  const retorno = data.retorno;
+
+  if (retorno.status !== 'OK') {
+    const erros = retorno.erros;
+    const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro desconhecido';
+    console.error(`[ERRO] Falha ao emitir NF ${nfId}: ${errList}`);
+    return { success: false, error: errList };
+  }
+
+  const situacao = retorno.nota_fiscal?.situacao;
+  console.log(`[OK] NF ${nfId} emitida na SEFAZ - situacao: ${situacao}`);
+  return { success: true, situacao };
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * Busca itens detalhados (com SKU/codigo desmembrado) para uma lista de order_sn do e-commerce.
+ * Retorna dados do Tiny com kits já desmembrados.
+ */
+export interface PickingItem {
+  order_sn: string;
+  sku: string;
+  descricao: string;
+  quantidade: number;
+  valor_unitario: number;
+}
+export interface PickingOrderResult {
+  order_sn: string;
+  clienteNome: string;
+  items: PickingItem[];
+  error?: string;
+}
+// Cache em memória para não re-buscar pedidos já consultados (evita rate limit)
+const pickingCache = new Map<string, PickingOrderResult>();
+const PICKING_CACHE_TTL = 30 * 60 * 1000; // 30 minutos
+const pickingCacheTime = new Map<string, number>();
+
+export function clearPickingCache(): void {
+  pickingCache.clear();
+  pickingCacheTime.clear();
+  console.log('[PICKING] Cache limpo');
+}
+
+export async function getOrderItemsForPicking(orderSns: string[]): Promise<PickingOrderResult[]> {
+  const results: PickingOrderResult[] = [];
+  const now = Date.now();
+
+  // Limpa cache expirado
+  for (const [key, ts] of pickingCacheTime) {
+    if (now - ts > PICKING_CACHE_TTL) { pickingCache.delete(key); pickingCacheTime.delete(key); }
+  }
+
+  const toFetch: string[] = [];
+  for (const sn of orderSns) {
+    const cached = pickingCache.get(sn);
+    if (cached) {
+      results.push(cached);
+    } else {
+      toFetch.push(sn);
+    }
+  }
+
+  if (toFetch.length > 0) {
+    console.log(`[PICKING] ${toFetch.length} pedidos para buscar no Tiny (${orderSns.length - toFetch.length} em cache)`);
+  }
+
+  for (const sn of toFetch) {
+    let success = false;
+    // Retry até 3 vezes para erros transitórios do Tiny
+    for (let attempt = 0; attempt < 3 && !success; attempt++) {
+      try {
+        if (attempt > 0) {
+          console.log(`[PICKING] ${sn}: tentativa ${attempt + 1}/3...`);
+          await sleep(3000 * attempt); // backoff: 3s, 6s
+        }
+
+        // Delay entre chamadas para respeitar rate limit do Tiny (60 req/min)
+        await sleep(1200);
+
+        // 1) Busca pedido no Tiny pelo numero_ecommerce
+        const found = await searchByNumeroEcommerce(sn);
+        // Filtra match exato — Tiny faz busca parcial (LIKE) e retorna pedidos com numero_ecommerce similar
+        const exactMatch = found.filter(f => f.numero_ecommerce === sn);
+        const match = exactMatch.length > 0 ? exactMatch[0] : null;
+        if (!match) {
+          if (found.length > 0) {
+            console.log(`[PICKING] ${sn}: Tiny retornou ${found.length} pedidos mas nenhum é match exato (primeiro: ${found[0].numero_ecommerce})`);
+          }
+          const r: PickingOrderResult = { order_sn: sn, clienteNome: '', items: [], error: 'Pedido não encontrado no Tiny' };
+          results.push(r);
+          pickingCache.set(sn, r);
+          pickingCacheTime.set(sn, now);
+          success = true;
+          continue;
+        }
+
+        await sleep(1200);
+
+        // 2) Busca detalhes do pedido (para nome do cliente e id_nota_fiscal)
+        const detail = await getOrder(match.id);
+        const clienteNome = detail.cliente.nome;
+
+        // 3) Se o pedido tem NF, busca itens da NF (kits desmembrados, SKUs corretos)
+        let items: PickingItem[];
+        if (detail.id_nota_fiscal) {
+          await sleep(1200);
+          const nf = await getNFDetails(detail.id_nota_fiscal);
+          if (nf.itens && nf.itens.length > 0) {
+            items = nf.itens.map(it => ({
+              order_sn: sn,
+              sku: it.codigo || '-',
+              descricao: it.descricao || '-',
+              quantidade: it.quantidade,
+              valor_unitario: it.valor_unitario,
+            }));
+            console.log(`[PICKING] ${sn}: ${nf.itens.length} itens da NF ${detail.id_nota_fiscal} (SKUs desmembrados)`);
+          } else {
+            items = detail.itens.map(it => ({
+              order_sn: sn,
+              sku: it.codigo || '-',
+              descricao: it.descricao || '-',
+              quantidade: parseFloat(it.quantidade) || 1,
+              valor_unitario: parseFloat(it.valor_unitario) || 0,
+            }));
+          }
+        } else {
+          items = detail.itens.map(it => ({
+            order_sn: sn,
+            sku: it.codigo || '-',
+            descricao: it.descricao || '-',
+            quantidade: parseFloat(it.quantidade) || 1,
+            valor_unitario: parseFloat(it.valor_unitario) || 0,
+          }));
+          console.log(`[PICKING] ${sn}: sem NF, usando ${detail.itens.length} itens do pedido`);
+        }
+
+        const r: PickingOrderResult = { order_sn: sn, clienteNome, items };
+        results.push(r);
+        // Só cacheia resultados com sucesso (com itens)
+        pickingCache.set(sn, r);
+        pickingCacheTime.set(sn, now);
+        success = true;
+      } catch (err: any) {
+        const errMsg = String(err.message || err);
+        const isTransient = errMsg.includes('Tente novamente') || errMsg.includes('executar a consulta') || errMsg.includes('Bloqueada');
+        if (isTransient && attempt < 2) {
+          console.warn(`[PICKING] ${sn}: erro transitório (tentativa ${attempt + 1}), retentando...`);
+          continue; // retry
+        }
+        console.warn(`[PICKING] Erro ao buscar pedido ${sn} no Tiny:`, errMsg);
+        const r: PickingOrderResult = { order_sn: sn, clienteNome: '', items: [], error: errMsg };
+        results.push(r);
+        // NUNCA cacheia erros — tenta de novo na próxima geração do relatório
+        success = true; // sai do loop de retry
+      }
+    }
+  }
+
+  // Reordena na mesma ordem dos orderSns originais
+  const map = new Map(results.map(r => [r.order_sn, r]));
+  return orderSns.map(sn => map.get(sn)!).filter(Boolean);
+}
+
+/**
+ * Busca itens para picking usando nfId direto (sem buscar pedido no Tiny).
+ * Muito mais rápido e confiável — evita problemas de match parcial do Tiny.
+ */
+export async function getPickingItemsByNfIds(orders: Array<{ order_sn: string; nfId: string }>): Promise<PickingOrderResult[]> {
+  const results: PickingOrderResult[] = [];
+  const now = Date.now();
+
+  // Limpa cache expirado
+  for (const [key, ts] of pickingCacheTime) {
+    if (now - ts > PICKING_CACHE_TTL) { pickingCache.delete(key); pickingCacheTime.delete(key); }
+  }
+
+  const toFetch: Array<{ order_sn: string; nfId: string }> = [];
+  for (const o of orders) {
+    const cached = pickingCache.get(o.order_sn);
+    if (cached) {
+      results.push(cached);
+    } else {
+      toFetch.push(o);
+    }
+  }
+
+  if (toFetch.length > 0) {
+    console.log(`[PICKING] ${toFetch.length} NFs para buscar direto no Tiny (${orders.length - toFetch.length} em cache)`);
+  }
+
+  for (const o of toFetch) {
+    if (!o.nfId) {
+      const r: PickingOrderResult = { order_sn: o.order_sn, clienteNome: '', items: [], error: 'NF ID não disponível' };
+      results.push(r);
+      continue;
+    }
+
+    let success = false;
+    for (let attempt = 0; attempt < 3 && !success; attempt++) {
+      try {
+        if (attempt > 0) {
+          console.log(`[PICKING] ${o.order_sn}: tentativa ${attempt + 1}/3...`);
+          await sleep(3000 * attempt);
+        }
+        await sleep(1200); // rate limit
+
+        const nf = await getNFDetails(o.nfId);
+        let items: PickingItem[] = [];
+        if (nf.itens && nf.itens.length > 0) {
+          items = nf.itens.map(it => ({
+            order_sn: o.order_sn,
+            sku: it.codigo || '-',
+            descricao: it.descricao || '-',
+            quantidade: it.quantidade,
+            valor_unitario: it.valor_unitario,
+          }));
+          console.log(`[PICKING] ${o.order_sn}: ${nf.itens.length} itens da NF ${o.nfId} (SKUs desmembrados)`);
+        }
+
+        const r: PickingOrderResult = { order_sn: o.order_sn, clienteNome: '', items };
+        results.push(r);
+        pickingCache.set(o.order_sn, r);
+        pickingCacheTime.set(o.order_sn, now);
+        success = true;
+      } catch (err: any) {
+        const errMsg = String(err.message || err);
+        const isTransient = errMsg.includes('Tente novamente') || errMsg.includes('executar a consulta') || errMsg.includes('Bloqueada');
+        if (isTransient && attempt < 2) {
+          console.warn(`[PICKING] ${o.order_sn}: erro transitório (tentativa ${attempt + 1}), retentando...`);
+          continue;
+        }
+        console.warn(`[PICKING] Erro ao buscar NF ${o.nfId} para pedido ${o.order_sn}:`, errMsg);
+        const r: PickingOrderResult = { order_sn: o.order_sn, clienteNome: '', items: [], error: errMsg };
+        results.push(r);
+        success = true;
+      }
+    }
+  }
+
+  // Reordena na mesma ordem dos orders originais
+  const map = new Map(results.map(r => [r.order_sn, r]));
+  return orders.map(o => map.get(o.order_sn)!).filter(Boolean);
+}
 

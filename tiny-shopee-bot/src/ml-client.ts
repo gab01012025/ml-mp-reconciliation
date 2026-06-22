@@ -155,6 +155,7 @@ async function mlGet(path: string, params?: Record<string, string>): Promise<any
 
   // Retry com backoff exponencial em 429/5xx ou body vazio
   let lastErr: any;
+  let hitRateLimit = false;
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
       const res = await fetch(url.toString(), {
@@ -162,6 +163,7 @@ async function mlGet(path: string, params?: Record<string, string>): Promise<any
       });
       const text = await res.text();
       if (res.status === 429) {
+        hitRateLimit = true;
         const retryAfter = parseInt(res.headers.get('retry-after') || '0', 10);
         const wait = retryAfter > 0 ? retryAfter * 1000 : Math.min(2000 * Math.pow(2, attempt), 30000);
         console.warn(`[ML] 429 rate limit em ${path} — aguardando ${wait}ms (tentativa ${attempt + 1}/5)`);
@@ -189,6 +191,10 @@ async function mlGet(path: string, params?: Record<string, string>): Promise<any
       lastErr = err;
       if (attempt < 4) { await new Promise(r => setTimeout(r, 800 * (attempt + 1))); continue; }
     }
+  }
+  // Inclui "429 rate limit" na mensagem se esse foi o motivo
+  if (hitRateLimit) {
+    throw new Error(`ML API ${path}: 429 rate limit — máximo de tentativas atingido`);
   }
   throw lastErr || new Error(`ML API ${path}: máximo de tentativas atingido`);
 }
@@ -250,7 +256,7 @@ export async function searchOrdersByDate(dataInicial: string, dataFinal: string)
  * Filtragem por data de coleta (pay_before) é feita no bot.service.ts.
  * Removido filtro shipping.status=ready_to_ship que não retorna nada para pedidos Full.
  */
-export async function searchRecentPaidOrders(daysBack: number = 30): Promise<MLOrderSummary[]> {
+export async function searchRecentPaidOrders(daysBack: number = 30, maxPages: number = 60): Promise<MLOrderSummary[]> {
   const t = loadTokens();
   if (!t) throw new Error('ML não conectado');
 
@@ -264,7 +270,7 @@ export async function searchRecentPaidOrders(daysBack: number = 30): Promise<MLO
 
   let offset = 0;
   const limit = 50;
-  for (let page = 0; page < 60; page++) {
+  for (let page = 0; page < maxPages; page++) {
     try {
       const data = await mlGet('/orders/search', {
         seller: String(t.user_id),
@@ -469,6 +475,357 @@ function ddmmyyyyToIso(d: string, endOfDay: boolean): string {
   const [dd, mm, yyyy] = d.split('/');
   const time = endOfDay ? '23:59:59.999-03:00' : '00:00:00.000-03:00';
   return `${yyyy}-${mm}-${dd}T${time}`;
+}
+
+// === Shipping Labels ===
+
+/**
+ * Lista pedidos ML com shipments prontos para impressão de etiqueta.
+ * Busca pedidos pagos dos últimos N dias e filtra os que têm shipment com status ready_to_ship.
+ */
+export interface LabelOrderInfo {
+  orderId: number;
+  shipmentId: number;
+  totalAmount: number;
+  dateClosed: string;
+  cachedStatus?: string;    // status do cache se disponível
+  cachedSubstatus?: string;
+}
+
+export interface LabelsResult {
+  orders: LabelOrderInfo[];
+  totalPaidOrders: number;
+}
+
+/**
+ * Busca pedidos recentes sem filtrar por status (pega paid, confirmed, etc.).
+ * Para labels, precisamos de todos os pedidos com shipping_id,
+ * pois order.status=paid pode não capturar todos os que têm etiqueta.
+ */
+async function searchRecentOrdersAllStatuses(daysBack: number, maxPages: number = 5): Promise<MLOrderSummary[]> {
+  const t = loadTokens();
+  if (!t) throw new Error('ML não conectado');
+
+  const now = new Date();
+  const past = new Date(now.getTime() - daysBack * 24 * 60 * 60 * 1000);
+
+  const all: MLOrderSummary[] = [];
+  const seen = new Set<number>();
+
+  let offset = 0;
+  const limit = 50;
+  for (let page = 0; page < maxPages; page++) {
+    try {
+      const data = await mlGet('/orders/search', {
+        seller: String(t.user_id),
+        'order.date_created.from': past.toISOString(),
+        'order.date_created.to': now.toISOString(),
+        sort: 'date_desc',
+        offset: String(offset),
+        limit: String(limit),
+      });
+      const results = data?.results || [];
+      for (const o of results) {
+        if (seen.has(o.id)) continue;
+        seen.add(o.id);
+        all.push({
+          id: o.id,
+          status: o.status,
+          date_closed: o.date_closed,
+          total_amount: o.total_amount,
+          shipping_id: o.shipping?.id,
+        });
+      }
+      if (results.length < limit) break;
+      offset += limit;
+    } catch (err) {
+      console.warn('[ML] searchRecentOrdersAllStatuses falhou na página', page, err);
+      break;
+    }
+  }
+  console.log(`[ML] searchRecentOrdersAllStatuses (${daysBack}d): ${all.length} pedidos`);
+  return all;
+}
+
+/**
+ * Lista pedidos com shipping_id para download de etiquetas.
+ * NÃO faz chamadas individuais a /shipments/{id} — usa apenas cache local.
+ * Busca sem filtro de status para capturar TODOS os pedidos com envio.
+ */
+export async function getOrdersReadyForLabels(daysBack: number = 7): Promise<LabelsResult> {
+  const safeDays = Math.min(daysBack, 7);
+  const orders = await searchRecentOrdersAllStatuses(safeDays, 5);
+  const results: LabelOrderInfo[] = [];
+
+  // Status de pedido que não fazem sentido para etiquetas
+  const skipOrderStatuses = ['cancelled', 'invalid'];
+
+  for (const o of orders) {
+    if (!o.shipping_id) continue;
+    if (skipOrderStatuses.includes(o.status)) continue;
+
+    // Usa cache se disponível para mostrar status, mas NÃO faz novas chamadas à API
+    const cached = readShipmentCache(o.shipping_id);
+
+    // Se temos cache e o status é terminal (já enviado/entregue), pula
+    if (cached) {
+      const terminalStatuses = ['shipped', 'delivered', 'not_delivered', 'cancelled'];
+      if (terminalStatuses.includes(cached.status || '')) continue;
+    }
+
+    results.push({
+      orderId: o.id,
+      shipmentId: o.shipping_id,
+      totalAmount: o.total_amount,
+      dateClosed: o.date_closed,
+      cachedStatus: cached?.status,
+      cachedSubstatus: cached?.substatus,
+    });
+  }
+
+  console.log(`[ML] ${results.length} pedidos com envio pendente (de ${orders.length} total, ${safeDays} dias)`);
+  return {
+    orders: results,
+    totalPaidOrders: orders.length,
+  };
+}
+
+/**
+ * Faz uma única chamada a /shipment_labels com os IDs fornecidos.
+ * Retorna { pdf } se sucesso, ou { failedIds, errorDetails } se falhou.
+ */
+async function tryShipmentLabels(ids: number[]): Promise<{
+  pdf?: Buffer;
+  failedIds?: number[];
+  errorDetails?: Array<{ shipment_id: number; message: string; error_code: string }>;
+  error?: string;
+}> {
+  const token = await getValidAccessToken();
+  const url = `${ML_API_URL}/shipment_labels?shipment_ids=${ids.join(',')}&response_type=pdf`;
+
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/pdf',
+    },
+  });
+
+  const contentType = res.headers.get('content-type') || '';
+
+  if (contentType.includes('application/pdf')) {
+    const arrayBuffer = await res.arrayBuffer();
+    return { pdf: Buffer.from(arrayBuffer) };
+  }
+
+  // Resposta de erro — parsear failed_shipments
+  const text = await res.text();
+  try {
+    const json = JSON.parse(text);
+    if (json.failed_shipments && Array.isArray(json.failed_shipments)) {
+      const failedIds = json.failed_shipments.map((f: any) => parseInt(String(f.shipment_id), 10));
+      const errorDetails = json.failed_shipments.map((f: any) => ({
+        shipment_id: parseInt(String(f.shipment_id), 10),
+        message: f.message || '',
+        error_code: f.error_code || '',
+      }));
+      return { failedIds, errorDetails };
+    }
+    // Erro genérico (ex: "Shipment Id X: message")
+    const errMsg = json.error || json.message || text.slice(0, 300);
+    // Tentar extrair shipment_id do erro genérico: "Shipment Id 12345: ..."
+    const match = errMsg.match(/Shipment Id (\d+)/i);
+    if (match) {
+      const failedId = parseInt(match[1], 10);
+      return {
+        failedIds: [failedId],
+        errorDetails: [{ shipment_id: failedId, message: errMsg, error_code: 'unknown' }],
+      };
+    }
+    return { error: errMsg };
+  } catch {
+    return { error: `HTTP ${res.status}: ${text.slice(0, 200)}` };
+  }
+}
+
+/**
+ * Baixa etiquetas em lote via /shipment_labels.
+ * Estratégia: tenta batch → parseia erros → remove IDs que falharam → retry.
+ * Máximo 3 tentativas para convergir para os IDs válidos.
+ */
+export async function downloadShippingLabelsBatch(
+  shipmentIds: number[]
+): Promise<{
+  success: boolean;
+  pdf?: Buffer;
+  count?: number;
+  failedIds?: number[];
+  failedDetails?: Array<{ shipment_id: number; message: string; error_code: string }>;
+  error?: string;
+}> {
+  if (!shipmentIds || shipmentIds.length === 0) {
+    return { success: false, error: 'Nenhum shipment_id fornecido' };
+  }
+
+  const BATCH_SIZE = 50;
+  const allPdfs: Buffer[] = [];
+  const allFailed: number[] = [];
+  const allFailedDetails: Array<{ shipment_id: number; message: string; error_code: string }> = [];
+  let totalSuccess = 0;
+
+  // Dividir em lotes de 50
+  const batches: number[][] = [];
+  for (let i = 0; i < shipmentIds.length; i += BATCH_SIZE) {
+    batches.push(shipmentIds.slice(i, i + BATCH_SIZE));
+  }
+
+  for (const batch of batches) {
+    let remaining = [...batch];
+    const MAX_RETRIES = 3;
+
+    for (let attempt = 0; attempt < MAX_RETRIES && remaining.length > 0; attempt++) {
+      console.log(`[ML] shipment_labels: tentativa ${attempt + 1} com ${remaining.length} IDs...`);
+
+      try {
+        const result = await tryShipmentLabels(remaining);
+
+        if (result.pdf) {
+          // Batch inteiro deu certo
+          allPdfs.push(result.pdf);
+          totalSuccess += remaining.length;
+          console.log(`[ML] shipment_labels: ${remaining.length} etiquetas OK`);
+          remaining = [];
+          break;
+        }
+
+        if (result.failedIds && result.failedIds.length > 0) {
+          // Remover os que falharam e tentar novamente com os restantes
+          const failedSet = new Set(result.failedIds);
+          for (const detail of (result.errorDetails || [])) {
+            if (!allFailedDetails.some(d => d.shipment_id === detail.shipment_id)) {
+              allFailedDetails.push(detail);
+              console.warn(`[ML] Etiqueta indisponível: shipment ${detail.shipment_id} — ${detail.error_code}: ${detail.message.slice(0, 100)}`);
+            }
+          }
+          allFailed.push(...result.failedIds.filter(id => !allFailed.includes(id)));
+          remaining = remaining.filter(id => !failedSet.has(id));
+
+          if (remaining.length === 0) {
+            console.warn(`[ML] Todos os ${batch.length} IDs falharam neste lote`);
+            break;
+          }
+          console.log(`[ML] ${result.failedIds.length} falharam, tentando ${remaining.length} restantes...`);
+          continue;
+        }
+
+        // Erro genérico sem failed_shipments identificáveis
+        console.warn(`[ML] shipment_labels erro genérico: ${result.error}`);
+        allFailed.push(...remaining);
+        remaining = [];
+        break;
+      } catch (err: any) {
+        console.warn(`[ML] shipment_labels exceção: ${err.message}`);
+        allFailed.push(...remaining);
+        remaining = [];
+        break;
+      }
+    }
+
+    // Se sobrou algum remaining após MAX_RETRIES, marca como falho
+    if (remaining.length > 0) {
+      allFailed.push(...remaining);
+    }
+  }
+
+  if (allPdfs.length === 0) {
+    // Montar mensagem de erro descritiva
+    const reasons = allFailedDetails.reduce((acc, d) => {
+      const code = d.error_code || 'unknown';
+      acc[code] = (acc[code] || 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
+    const reasonStr = Object.entries(reasons).map(([code, n]) => `${code}: ${n}`).join(', ');
+    return {
+      success: false,
+      failedIds: allFailed,
+      failedDetails: allFailedDetails,
+      error: `Nenhuma etiqueta disponível (${allFailed.length} falharam${reasonStr ? ' — ' + reasonStr : ''})`,
+    };
+  }
+
+  const finalPdf = allPdfs.length === 1 ? allPdfs[0] : Buffer.concat(allPdfs);
+  return {
+    success: true,
+    pdf: finalPdf,
+    count: totalSuccess,
+    failedIds: allFailed.length > 0 ? allFailed : undefined,
+    failedDetails: allFailedDetails.length > 0 ? allFailedDetails : undefined,
+  };
+}
+
+/**
+ * Baixa etiqueta(s) de envio do Mercado Livre em formato PDF.
+ * Aceita até 50 shipment IDs por chamada (limite da API ML).
+ * Retorna o PDF buffer ou erro.
+ */
+export async function downloadShippingLabels(shipmentIds: number[]): Promise<{ success: boolean; pdf?: Buffer; error?: string }> {
+  if (!shipmentIds || shipmentIds.length === 0) {
+    return { success: false, error: 'Nenhum shipment_id fornecido' };
+  }
+  if (shipmentIds.length > 50) {
+    return { success: false, error: `Máximo 50 etiquetas por vez (recebido: ${shipmentIds.length})` };
+  }
+
+  try {
+    const token = await getValidAccessToken();
+    const ids = shipmentIds.join(',');
+    const url = `${ML_API_URL}/shipment_labels?shipment_ids=${ids}&response_type=pdf`;
+
+    const res = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/pdf',
+      },
+    });
+
+    const contentType = res.headers.get('content-type') || '';
+    console.log(`[ML] shipment_labels: status=${res.status} content-type=${contentType} ids=${ids}`);
+
+    if (contentType.includes('application/pdf')) {
+      const arrayBuffer = await res.arrayBuffer();
+      return { success: true, pdf: Buffer.from(arrayBuffer) };
+    }
+
+    // Error response (JSON)
+    const text = await res.text();
+    try {
+      const json = JSON.parse(text);
+      return { success: false, error: `${json.error || json.message || 'unknown'}: ${json.cause?.[0]?.message || text.slice(0, 200)}` };
+    } catch {
+      return { success: false, error: `HTTP ${res.status}: ${text.slice(0, 200)}` };
+    }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) };
+  }
+}
+
+/**
+ * Baixa etiqueta de um único pedido ML pelo order_id.
+ * Busca o shipment_id do pedido e baixa a etiqueta.
+ */
+export async function downloadLabelByOrderId(orderId: number): Promise<{ success: boolean; pdf?: Buffer; shipmentId?: number; error?: string }> {
+  try {
+    // Busca dados do pedido para pegar o shipping_id
+    const orderData = await mlGet(`/orders/${orderId}`);
+    const shipmentId = orderData?.shipping?.id;
+    if (!shipmentId) {
+      return { success: false, error: 'Pedido sem shipment_id' };
+    }
+
+    const result = await downloadShippingLabels([shipmentId]);
+    return { ...result, shipmentId };
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) };
+  }
 }
 
 export function disconnect(): void {
