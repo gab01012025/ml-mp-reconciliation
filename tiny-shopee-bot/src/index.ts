@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as cron from 'node-cron';
 import * as XLSX from 'xlsx';
 import { config } from './config';
-import { processNewShopeeOrders, processMercadoLivreOrdersForDate, processMercadoLivreByCollectionDate, clearProcessedOrders, sendPendingNFsToShopee, ProcessedNF, processSingleShopeeOrder } from './bot.service';
+import { processNewShopeeOrders, processMercadoLivreOrdersForDate, processMercadoLivreByCollectionDate, clearProcessedOrders, sendPendingNFsToShopee, ProcessedNF, processSingleShopeeOrder, OrderSnRange } from './bot.service';
 import { getLogs } from './log-buffer';
 import * as ml from './ml-client';
 import * as shopeeClient from './shopee-client';
@@ -451,12 +451,19 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Sincronização já em andamento. Aguarde finalizar.' }));
       return;
     }
+    // Filtro opcional por range de order_sn
+    const fromSn = url.searchParams.get('from_sn') || undefined;
+    const toSn = url.searchParams.get('to_sn') || undefined;
+    const snRange: OrderSnRange | undefined = (fromSn || toSn) ? { from: fromSn, to: toSn } : undefined;
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ message: 'Sincronização manual iniciada' }));
-    runBot(undefined, undefined, true);
+    res.end(JSON.stringify({ message: 'Sincronização manual iniciada', from_sn: fromSn || '*', to_sn: toSn || '*' }));
+    runBot(undefined, undefined, true, snRange);
   } else if (url.pathname === '/reprocess' && req.method === 'POST') {
     const dataInicial = url.searchParams.get('de') || undefined;
     const dataFinal = url.searchParams.get('ate') || undefined;
+    const fromSn = url.searchParams.get('from_sn') || undefined;
+    const toSn = url.searchParams.get('to_sn') || undefined;
+    const snRange: OrderSnRange | undefined = (fromSn || toSn) ? { from: fromSn, to: toSn } : undefined;
     const dateRegex = /^\d{2}\/\d{2}\/\d{4}$/;
     if (dataInicial && !dateRegex.test(dataInicial)) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -476,8 +483,8 @@ const server = http.createServer(async (req, res) => {
     }
     clearProcessedOrders();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ message: 'Reprocessamento iniciado', de: dataInicial || 'ontem', ate: dataFinal || 'hoje' }));
-    runBot(dataInicial, dataFinal, true);
+    res.end(JSON.stringify({ message: 'Reprocessamento iniciado', de: dataInicial || 'ontem', ate: dataFinal || 'hoje', from_sn: fromSn || '*', to_sn: toSn || '*' }));
+    runBot(dataInicial, dataFinal, true, snRange);
   } else if (url.pathname === '/toggle-automation' && req.method === 'POST') {
     automationPaused = !automationPaused;
     console.log(`[SERVER] Automação ${automationPaused ? 'PAUSADA' : 'ATIVADA'} pelo painel`);
@@ -644,7 +651,9 @@ const server = http.createServer(async (req, res) => {
   } else if (url.pathname === '/shopee/labels-available' && req.method === 'GET') {
     // Lista pedidos disponíveis para etiqueta (READY_TO_SHIP e PROCESSED) com status de NF
     try {
-      const results: any[] = [];
+      const fromSn = url.searchParams.get('from_sn')?.toUpperCase() || '';
+      const toSn = url.searchParams.get('to_sn')?.toUpperCase() || '';
+      let results: any[] = [];
       for (const status of ['READY_TO_SHIP', 'PROCESSED']) {
         const listResult = await shopeeClient.getOrderList({ orderStatus: status });
         if (listResult.success && listResult.orders) {
@@ -652,6 +661,15 @@ const server = http.createServer(async (req, res) => {
             results.push({ order_sn: sn, status });
           }
         }
+      }
+      // Filtro por range de order_sn
+      if (fromSn || toSn) {
+        results = results.filter(o => {
+          const sn = o.order_sn.toUpperCase();
+          if (fromSn && sn < fromSn) return false;
+          if (toSn && sn > toSn) return false;
+          return true;
+        });
       }
       // Verifica NF de cada pedido (em paralelo, max 5 por vez)
       const enriched: any[] = [];
@@ -667,7 +685,7 @@ const server = http.createServer(async (req, res) => {
       }
       const readyCount = enriched.filter(o => o.hasNF).length;
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, count: enriched.length, readyForLabel: readyCount, orders: enriched }, null, 2));
+      res.end(JSON.stringify({ ok: true, count: enriched.length, readyForLabel: readyCount, orders: enriched, fromSn: fromSn || '*', toSn: toSn || '*' }, null, 2));
     } catch (err: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message || String(err) }));
@@ -685,10 +703,12 @@ const server = http.createServer(async (req, res) => {
   // === Shopee: batch download all labels (PDF único) ===
   } else if (url.pathname === '/shopee/labels-batch' && req.method === 'GET') {
     try {
-      console.log('[SHOPEE] Download em lote de etiquetas (PDF único) iniciado...');
+      const fromSn = url.searchParams.get('from_sn')?.toUpperCase() || '';
+      const toSn = url.searchParams.get('to_sn')?.toUpperCase() || '';
+      console.log(`[SHOPEE] Download em lote de etiquetas (PDF único) iniciado... (from_sn: ${fromSn || '*'}, to_sn: ${toSn || '*'})`);
 
       // 1) Lista todos os pedidos READY_TO_SHIP + PROCESSED
-      const allOrders: Array<{ order_sn: string; status: string }> = [];
+      let allOrders: Array<{ order_sn: string; status: string }> = [];
       for (const status of ['READY_TO_SHIP', 'PROCESSED']) {
         const listResult = await shopeeClient.getOrderList({ orderStatus: status });
         if (listResult.success && listResult.orders) {
@@ -696,6 +716,17 @@ const server = http.createServer(async (req, res) => {
             allOrders.push({ order_sn: sn, status });
           }
         }
+      }
+
+      // Filtro por range de order_sn
+      if (fromSn || toSn) {
+        allOrders = allOrders.filter(o => {
+          const sn = o.order_sn.toUpperCase();
+          if (fromSn && sn < fromSn) return false;
+          if (toSn && sn > toSn) return false;
+          return true;
+        });
+        console.log(`[SHOPEE] Batch: ${allOrders.length} pedidos no range ${fromSn || '*'} a ${toSn || '*'}`);
       }
 
       if (allOrders.length === 0) {
@@ -1087,9 +1118,11 @@ const server = http.createServer(async (req, res) => {
   // === Relatório de separação: busca pedidos READY_TO_SHIP + PROCESSED da Shopee API ===
   } else if (url.pathname === '/shopee/picking-list' && req.method === 'GET') {
     try {
-      // Parâmetro opcional: ?status=all (padrão) ou ?status=processed
+      // Parâmetros opcionais
       const statusFilter = url.searchParams.get('status') || 'all';
-      console.log(`[PICKING] Buscando pedidos na Shopee API (filtro: ${statusFilter})...`);
+      const fromSn = url.searchParams.get('from_sn')?.toUpperCase() || '';
+      const toSn = url.searchParams.get('to_sn')?.toUpperCase() || '';
+      console.log(`[PICKING] Buscando pedidos na Shopee API (filtro: ${statusFilter}, from_sn: ${fromSn || '*'}, to_sn: ${toSn || '*'})...`);
 
       const allOrderSns: string[] = [];
 
@@ -1123,8 +1156,26 @@ const server = http.createServer(async (req, res) => {
 
       console.log(`[PICKING] Total de pedidos encontrados: ${allOrderSns.length}`);
 
+      // 1b) Filtro por range de order_sn (De / Até)
+      let filteredOrderSns = allOrderSns;
+      if (fromSn || toSn) {
+        filteredOrderSns = allOrderSns.filter(sn => {
+          const snUpper = sn.toUpperCase();
+          if (fromSn && snUpper < fromSn) return false;
+          if (toSn && snUpper > toSn) return false;
+          return true;
+        });
+        console.log(`[PICKING] Filtro order_sn: ${filteredOrderSns.length}/${allOrderSns.length} pedidos no range`);
+      }
+
+      if (filteredOrderSns.length === 0) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<html><body><h2>Nenhum pedido encontrado no range ${fromSn || '*'} a ${toSn || '*'}</h2></body></html>`);
+        return;
+      }
+
       // 2) Busca detalhes (itens + invoice_data) em batches de 50
-      const allDetails = await shopeeClient.getOrdersDetail(allOrderSns);
+      const allDetails = await shopeeClient.getOrdersDetail(filteredOrderSns);
       const withInvoice = allDetails.filter(d => d.has_invoice).length;
       const withoutInvoice = allDetails.length - withInvoice;
       console.log(`[PICKING] ${allDetails.length} pedidos: ${withInvoice} com NF, ${withoutInvoice} sem NF`);
@@ -2288,15 +2339,16 @@ server.listen(config.port, () => {
   console.log(`[SERVER] Health check em http://localhost:${config.port}/health`);
 });
 
-async function runBot(dataInicial?: string, dataFinal?: string, skipBlockCheck = false) {
+async function runBot(dataInicial?: string, dataFinal?: string, skipBlockCheck = false, orderSnRange?: OrderSnRange) {
   if (isRunning) return;
   isRunning = true;
   const mode = dataInicial ? `reprocessamento ${dataInicial} a ${dataFinal}` : 'verificação';
   if (skipBlockCheck) console.log(`[BOT] Execucao manual - ignorando bloqueio de horario`);
+  if (orderSnRange) console.log(`[BOT] Filtro order_sn: de=${orderSnRange.from || '*'} até=${orderSnRange.to || '*'}`);
   console.log(`\n[${new Date().toLocaleString('pt-BR')}] Iniciando ${mode}...`);
 
   try {
-    const result = await processNewShopeeOrders(dataInicial, dataFinal, skipBlockCheck);
+    const result = await processNewShopeeOrders(dataInicial, dataFinal, skipBlockCheck, orderSnRange);
     lastResult = result;
     lastRun = new Date();
     totalOrdersSynced += result.found;
@@ -2835,6 +2887,21 @@ function getDashboardHtml(): string {
             <span style="font-size:13px; color:#999;">Busca pedidos Shopee de ontem e hoje e emite NF com ${config.shopeeDiscountPercent}% de desconto</span>
           </div>
 
+          <div style="padding:12px 16px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0; margin-bottom:16px;">
+            <p style="font-size:12px; color:#64748b; margin-bottom:8px; font-weight:600;">Filtro por N° do Pedido (opcional)</p>
+            <div class="inline-form" style="margin-bottom:0;">
+              <div class="form-sm">
+                <label>De (Order SN)</label>
+                <input type="text" id="syncFromSn" placeholder="Ex: 260621MFN2GF8A" style="width:180px; text-transform:uppercase;">
+              </div>
+              <div class="form-sm">
+                <label>Até (Order SN)</label>
+                <input type="text" id="syncToSn" placeholder="Ex: 260623NNQ35E3G" style="width:180px; text-transform:uppercase;">
+              </div>
+              <span style="font-size:11px; color:#94a3b8; align-self:center;">Deixe vazio para processar todos</span>
+            </div>
+          </div>
+
           <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
           <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Reprocessar Período Específico (Shopee)</p>
           <div id="msgReprocess" class="msg msg-ok"></div>
@@ -2864,9 +2931,17 @@ function getDashboardHtml(): string {
           <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
           <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Relatório de Separação (Picking List)</p>
           <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Puxa direto da Shopee API todos os pedidos prontos para envio (A Enviar + Processados). Mostra SKU, produto e quantidade para separação no estoque. Filtro por NF disponível.</p>
-          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:16px;">
+          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin-bottom:8px;">
+            <div class="form-sm">
+              <label>De (Order SN)</label>
+              <input type="text" id="pickFromSn" placeholder="Ex: 260621..." style="width:170px; text-transform:uppercase;">
+            </div>
+            <div class="form-sm">
+              <label>Até (Order SN)</label>
+              <input type="text" id="pickToSn" placeholder="Ex: 260623..." style="width:170px; text-transform:uppercase;">
+            </div>
             <button class="btn btn-primary btn-sm" onclick="openPickingList()" style="background:#7c3aed;">📋 Gerar Relatório de Separação</button>
-            <span style="font-size:12px; color:#888;">Abre em nova aba para impressão</span>
+            <span style="font-size:11px; color:#94a3b8; align-self:center;">Vazio = todos os pedidos</span>
           </div>
 
           <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
@@ -2905,10 +2980,23 @@ function getDashboardHtml(): string {
             <button class="btn btn-secondary btn-sm" id="btnTestLogistics" onclick="testLogistics()">🧪 Testar API</button>
           </div>
 
-          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:12px; padding:12px 16px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0;">
-            <button class="btn btn-primary btn-sm" id="btnListLabels" onclick="listAvailableLabels()">📋 Listar Pedidos Disponíveis</button>
-            <button class="btn btn-primary btn-sm" id="btnBatchShopee" onclick="batchDownloadShopee()" style="background:#16a34a;">📥 Baixar Todas Etiquetas (PDF único)</button>
-            <span id="labelsAvailableInfo" style="font-size:12px; color:#888;"></span>
+          <div style="padding:12px 16px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0; margin-bottom:12px;">
+            <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin-bottom:10px;">
+              <div class="form-sm">
+                <label>De (Order SN)</label>
+                <input type="text" id="labelFromSn" placeholder="Ex: 260621..." style="width:170px; text-transform:uppercase;">
+              </div>
+              <div class="form-sm">
+                <label>Até (Order SN)</label>
+                <input type="text" id="labelToSn" placeholder="Ex: 260623..." style="width:170px; text-transform:uppercase;">
+              </div>
+              <span style="font-size:11px; color:#94a3b8; align-self:center;">Vazio = todos os pedidos</span>
+            </div>
+            <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+              <button class="btn btn-primary btn-sm" id="btnListLabels" onclick="listAvailableLabels()">📋 Listar Pedidos</button>
+              <button class="btn btn-primary btn-sm" id="btnBatchShopee" onclick="batchDownloadShopee()" style="background:#16a34a;">📥 Baixar Todas Etiquetas (PDF único)</button>
+              <span id="labelsAvailableInfo" style="font-size:12px; color:#888;"></span>
+            </div>
           </div>
 
           <div id="labelsListBox" style="display:none; margin-top:8px; max-height:300px; overflow-y:auto;">
@@ -3173,10 +3261,21 @@ function getDashboardHtml(): string {
       var btn = document.getElementById('btnSync');
       btn.disabled = true; btn.textContent = '⏳ Sincronizando...';
       try {
-        var r = await fetch('/run', { method: 'POST', headers: authHeaders });
+        var params = '';
+        var fromSn = (document.getElementById('syncFromSn').value || '').trim().toUpperCase();
+        var toSn = (document.getElementById('syncToSn').value || '').trim().toUpperCase();
+        if (fromSn || toSn) {
+          var p = [];
+          if (fromSn) p.push('from_sn=' + encodeURIComponent(fromSn));
+          if (toSn) p.push('to_sn=' + encodeURIComponent(toSn));
+          params = '?' + p.join('&');
+        }
+        var r = await fetch('/run' + params, { method: 'POST', headers: authHeaders });
         if (r.status === 401) { handleAuthError(); return; }
         var d = await r.json();
-        showMsg('msgRun', r.ok ? d.message : d.error, r.ok);
+        var msg = r.ok ? d.message : d.error;
+        if (fromSn || toSn) msg += ' (Filtro: ' + (fromSn || '*') + ' a ' + (toSn || '*') + ')';
+        showMsg('msgRun', msg, r.ok);
       } catch(e) { showMsg('msgRun', 'Erro: ' + e.message, false); }
       btn.disabled = false; btn.textContent = '▶ Sincronizar Agora';
     }
@@ -3239,7 +3338,12 @@ function getDashboardHtml(): string {
       var btn = document.getElementById('btnReprocess');
       btn.disabled = true; btn.textContent = '⏳ Reprocessando...';
       try {
-        var r = await fetch('/reprocess?de=' + encodeURIComponent(de) + '&ate=' + encodeURIComponent(ate), { method: 'POST', headers: authHeaders });
+        var params = 'de=' + encodeURIComponent(de) + '&ate=' + encodeURIComponent(ate);
+        var fromSn = (document.getElementById('syncFromSn').value || '').trim().toUpperCase();
+        var toSn = (document.getElementById('syncToSn').value || '').trim().toUpperCase();
+        if (fromSn) params += '&from_sn=' + encodeURIComponent(fromSn);
+        if (toSn) params += '&to_sn=' + encodeURIComponent(toSn);
+        var r = await fetch('/reprocess?' + params, { method: 'POST', headers: authHeaders });
         if (r.status === 401) { handleAuthError(); return; }
         var d = await r.json();
         showMsg('msgReprocess', d.message || d.error, r.ok);
@@ -3384,7 +3488,12 @@ function getDashboardHtml(): string {
     }
 
     function openPickingList() {
-      window.open('/shopee/picking-list?token=' + encodeURIComponent(authToken), '_blank');
+      var urlParts = '/shopee/picking-list?token=' + encodeURIComponent(authToken);
+      var fromSn = (document.getElementById('pickFromSn').value || '').trim().toUpperCase();
+      var toSn = (document.getElementById('pickToSn').value || '').trim().toUpperCase();
+      if (fromSn) urlParts += '&from_sn=' + encodeURIComponent(fromSn);
+      if (toSn) urlParts += '&to_sn=' + encodeURIComponent(toSn);
+      window.open(urlParts, '_blank');
     }
 
     function openProcessarPedido() {
@@ -3460,11 +3569,20 @@ function getDashboardHtml(): string {
       if (btn) { btn.disabled = false; btn.textContent = '📦 Baixar Etiqueta'; }
     }
 
+    function getLabelSnFilter() {
+      var fromSn = (document.getElementById('labelFromSn').value || '').trim().toUpperCase();
+      var toSn = (document.getElementById('labelToSn').value || '').trim().toUpperCase();
+      var params = '';
+      if (fromSn) params += '&from_sn=' + encodeURIComponent(fromSn);
+      if (toSn) params += '&to_sn=' + encodeURIComponent(toSn);
+      return params;
+    }
+
     async function listAvailableLabels() {
       var btn = document.getElementById('btnListLabels');
       btn.disabled = true; btn.textContent = '⏳ Buscando...';
       try {
-        var r = await fetch('/shopee/labels-available', { headers: authHeaders });
+        var r = await fetch('/shopee/labels-available?' + getLabelSnFilter(), { headers: authHeaders });
         if (r.status === 401) { handleAuthError(); return; }
         var d = await r.json();
         document.getElementById('labelsAvailableInfo').textContent = (d.count || 0) + ' pedidos encontrados (' + (d.readyForLabel || 0) + ' com NF — prontos para etiqueta)';
@@ -3503,7 +3621,7 @@ function getDashboardHtml(): string {
       btn.disabled = true; btn.textContent = '⏳ Preparando etiquetas...';
       showMsg('msgLabel', 'Gerando PDF único com todas as etiquetas... isso pode levar alguns minutos.', true);
       try {
-        var r = await fetch('/shopee/labels-batch', { headers: authHeaders });
+        var r = await fetch('/shopee/labels-batch?' + getLabelSnFilter(), { headers: authHeaders });
         if (r.status === 401) { handleAuthError(); return; }
         var ct = r.headers.get('content-type') || '';
         if (ct.includes('application/pdf')) {

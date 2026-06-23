@@ -77,7 +77,12 @@ export interface BotResult {
 /**
  * Busca e processa pedidos Shopee novos
  */
-export async function processNewShopeeOrders(customDataInicial?: string, customDataFinal?: string, skipBlockCheck = false): Promise<BotResult> {
+export interface OrderSnRange {
+  from?: string; // order_sn inicial (inclusive)
+  to?: string;   // order_sn final (inclusive)
+}
+
+export async function processNewShopeeOrders(customDataInicial?: string, customDataFinal?: string, skipBlockCheck = false, orderSnRange?: OrderSnRange): Promise<BotResult> {
   const stats: BotResult = { found: 0, altered: 0, nfGenerated: 0, skippedNF: 0, errors: 0, nfs: [] };
 
   let dataInicial: string;
@@ -124,10 +129,26 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
     // Filtra pedidos que parecem ser da Shopee pelo formato do Order SN (YYMMDD + alfanum)
     // Status ignorados: Cancelado, Enviado (ja foram processados completamente)
     const statusIgnorados = new Set(['Cancelado', 'Enviado']);
-    const potentialShopee = allOrders.filter(o => {
+    let potentialShopee = allOrders.filter(o => {
       const ne = o.numero_ecommerce;
       return SHOPEE_ORDER_SN_REGEX.test(ne) && !statusIgnorados.has(o.situacao);
     });
+
+    // Filtro por range de order_sn (De / Até)
+    if (orderSnRange) {
+      const fromSn = orderSnRange.from?.toUpperCase();
+      const toSn = orderSnRange.to?.toUpperCase();
+      if (fromSn || toSn) {
+        const before = potentialShopee.length;
+        potentialShopee = potentialShopee.filter(o => {
+          const sn = o.numero_ecommerce.toUpperCase();
+          if (fromSn && sn < fromSn) return false;
+          if (toSn && sn > toSn) return false;
+          return true;
+        });
+        console.log(`[BOT] Filtro order_sn: de=${fromSn || '*'} até=${toSn || '*'} → ${potentialShopee.length}/${before} pedidos`);
+      }
+    }
 
     console.log(`[BOT] ${allOrders.length} pedidos totais, ${potentialShopee.length} possiveis Shopee pendentes`);
 
