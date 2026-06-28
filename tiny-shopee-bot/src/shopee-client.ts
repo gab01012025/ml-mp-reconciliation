@@ -916,8 +916,23 @@ export async function getShippingLabel(orderSn: string): Promise<LabelResult> {
   }
 
   // Step 2b: create_shipping_document (usa tipo sugerido; fallback para todos os tipos)
-  const createResult = await createShippingDocument(orderSn, suggestedDocType);
+  let createResult = await createShippingDocument(orderSn, suggestedDocType);
   let usedDocType = createResult.docType; // tipo que deu certo (para passar ao download)
+
+  // Se falhou com tracking_number_invalid, tenta ship_order e cria de novo
+  if (!createResult.success && createResult.error?.includes('tracking_number_invalid')) {
+    console.log(`[SHOPEE] Etiqueta: ${orderSn} tracking inválido — tentando ship_order para re-gerar...`);
+    steps.push({ step: 'create_shipping_document', ok: false, detail: `tracking_number_invalid — tentando re-ship...` });
+    const retryShip = await shipOrder(orderSn);
+    const shipErr = (retryShip.error || '').toLowerCase();
+    if (retryShip.success || shipErr.includes('already') || shipErr.includes('shipped') || shipErr.includes('processed')) {
+      await new Promise(r => setTimeout(r, 3000));
+      const docParam2 = await getShippingDocumentParameter(orderSn);
+      createResult = await createShippingDocument(orderSn, docParam2.suggestedType || suggestedDocType);
+      usedDocType = createResult.docType;
+    }
+  }
+
   if (createResult.success) {
     steps.push({ step: 'create_shipping_document', ok: true, detail: `Documento criado/existente (${usedDocType || 'auto'})` });
   } else {
@@ -997,7 +1012,23 @@ export async function prepareShippingLabel(orderSn: string): Promise<PrepareResu
   }
 
   // Cria documento
-  const createResult = await createShippingDocument(orderSn, suggestedDocType);
+  let createResult = await createShippingDocument(orderSn, suggestedDocType);
+
+  // Se falhou com tracking_number_invalid, tenta ship_order (re-arranjar envio) e cria de novo
+  if (!createResult.success && createResult.error?.includes('tracking_number_invalid')) {
+    console.log(`[SHOPEE] Batch: ${orderSn} tracking inválido — tentando ship_order para re-gerar...`);
+    const retryShip = await shipOrder(orderSn);
+    const shipErr = (retryShip.error || '').toLowerCase();
+    // Se ship_order retornou "already shipped" ou similar, o tracking pode ter sido atualizado
+    if (retryShip.success || shipErr.includes('already') || shipErr.includes('shipped') || shipErr.includes('processed')) {
+      await new Promise(r => setTimeout(r, 3000));
+      // Re-descobre tipo de documento (pode ter mudado após ship_order)
+      const docParam2 = await getShippingDocumentParameter(orderSn);
+      const retryDocType = docParam2.suggestedType || suggestedDocType;
+      createResult = await createShippingDocument(orderSn, retryDocType);
+    }
+  }
+
   if (!createResult.success) {
     return { order_sn: orderSn, success: false, error: `create: ${createResult.error}` };
   }

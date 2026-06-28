@@ -501,6 +501,349 @@ const server = http.createServer(async (req, res) => {
       isRunning: mlIsRunning,
       lastResult: mlLastResult,
     }));
+  } else if (url.pathname === '/tiny/test-lista-preco' && req.method === 'POST') {
+    // Preview: mostra como ficaria a NF com desconto da lista de preço
+    let pedidoId = (url.searchParams.get('pedido_id') || '').trim();
+    const listaId = parseInt(url.searchParams.get('lista_id') || '0', 10);
+    const criarNF = url.searchParams.get('criar') === '1'; // flag para realmente criar
+    if (!pedidoId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Informe pedido_id' }));
+      return;
+    }
+    try {
+      // Resolve ID do pedido
+      let resolvedId = pedidoId;
+      let resolveNote = '';
+      let resolved = false;
+
+      try { await tinyClient.getOrder(resolvedId); resolved = true; } catch {}
+
+      if (!resolved) {
+        try {
+          const byNumero = await tinyClient.searchByNumero(pedidoId);
+          if (byNumero.length > 0) { resolvedId = byNumero[0].id; resolveNote = `#${byNumero[0].numero} → id=${resolvedId}`; resolved = true; }
+        } catch {}
+      }
+      if (!resolved) {
+        try {
+          const byEcom = await tinyClient.searchByNumeroEcommerce(pedidoId);
+          if (byEcom.length > 0) { resolvedId = byEcom[0].id; resolveNote = `ecommerce → id=${resolvedId}`; resolved = true; }
+        } catch {}
+      }
+      if (!resolved) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `Pedido "${pedidoId}" não encontrado no Tiny` }));
+        return;
+      }
+
+      // Busca pedido e lista de preço
+      const order = await tinyClient.getOrder(resolvedId);
+      const listas = await tinyClient.getPriceLists();
+      const lista = listas.find(l => l.id === listaId);
+
+      if (!lista && listaId !== 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `Lista ${listaId} não encontrada. Disponíveis: ${listas.map(l => `${l.descricao}(${l.id})`).join(', ')}` }));
+        return;
+      }
+
+      const descontoPct = lista ? -lista.acrescimo_desconto : 0;
+      const factor = (100 - descontoPct) / 100;
+
+      // Preview dos itens com desconto
+      const preview = order.itens.map(i => {
+        const vuOrig = parseFloat(i.valor_unitario);
+        const vuDesc = Math.max(0.01, +(vuOrig * factor).toFixed(3));
+        const qty = parseFloat(i.quantidade);
+        return {
+          descricao: i.descricao,
+          quantidade: i.quantidade,
+          valor_original: vuOrig.toFixed(3),
+          valor_desconto: vuDesc.toFixed(3),
+          subtotal_original: (vuOrig * qty).toFixed(2),
+          subtotal_desconto: (vuDesc * qty).toFixed(2),
+        };
+      });
+
+      const totalOrig = preview.reduce((s, i) => s + parseFloat(i.subtotal_original), 0);
+      const totalDesc = preview.reduce((s, i) => s + parseFloat(i.subtotal_desconto), 0);
+
+      let nfResult: any = null;
+      if (criarNF) {
+        // Cria NF de verdade (sem emitir na SEFAZ por segurança)
+        const nota: any = {
+          nota_fiscal: {
+            tipo_nota: 'N',
+            natureza_operacao: 'Venda de mercadorias',
+            numero_pedido_ecommerce: order.numero_ecommerce,
+            frete_por_conta: 'R',
+            cliente: {
+              nome: order.cliente.nome,
+              tipo_pessoa: order.cliente.tipo_pessoa,
+              cpf_cnpj: order.cliente.cpf_cnpj,
+              ie: order.cliente.ie,
+              endereco: order.cliente.endereco,
+              numero: order.cliente.numero,
+              complemento: order.cliente.complemento,
+              bairro: order.cliente.bairro,
+              cep: order.cliente.cep,
+              cidade: order.cliente.cidade,
+              uf: order.cliente.uf,
+            },
+            itens: order.itens.map(item => {
+              const vuOrig = parseFloat(item.valor_unitario);
+              const vuDesc = Math.max(0.01, +(vuOrig * factor).toFixed(3));
+              return {
+                item: {
+                  id_produto: item.id_produto,
+                  descricao: item.descricao,
+                  unidade: item.unidade,
+                  quantidade: item.quantidade,
+                  valor_unitario: vuDesc.toFixed(3),
+                },
+              };
+            }),
+          },
+        };
+
+        console.log(`[TESTE] Criando NF teste para pedido ${resolvedId} com ${descontoPct}% desconto...`);
+        const data = await tinyClient.tinyPostPublic('nota.fiscal.incluir.php', { nota: JSON.stringify(nota) });
+        const retorno = data.retorno;
+        const reg = Array.isArray(retorno.registros?.registro) ? retorno.registros.registro[0] : retorno.registros?.registro;
+
+        if (retorno.status === 'OK' && reg?.status === 'OK') {
+          nfResult = { ok: true, nfId: reg.id, numero: reg.numero, serie: reg.serie };
+          console.log(`[OK] NF teste criada: ID=${reg.id}, numero=${reg.numero}`);
+        } else {
+          const erros = reg?.erros || retorno.erros;
+          const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro';
+          nfResult = { ok: false, error: errList, raw: retorno };
+        }
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        resolveNote: resolveNote || undefined,
+        pedidoId: resolvedId,
+        pedidoNumero: order.numero,
+        numeroEcommerce: order.numero_ecommerce,
+        situacao: order.situacao,
+        lista: lista ? { id: lista.id, descricao: lista.descricao, acrescimo_desconto: lista.acrescimo_desconto } : null,
+        descontoPct,
+        totalOriginal: totalOrig.toFixed(2),
+        totalComDesconto: totalDesc.toFixed(2),
+        economia: (totalOrig - totalDesc).toFixed(2),
+        itens: preview,
+        nfCriada: nfResult,
+      }, null, 2));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+  } else if (url.pathname === '/tiny/diag-alterar' && req.method === 'POST') {
+    // Diagnóstico: testa diferentes formatos de pedido.alterar.php
+    const pedidoTinyId = (url.searchParams.get('id') || '').trim();
+    if (!pedidoTinyId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Informe ?id=ID_INTERNO_TINY (ex: 907214870)' }));
+      return;
+    }
+    const tinyToken = config.tinyToken;
+    const tinyUrl = config.tinyApiUrl;
+    const results: Array<{ name: string; sent: string; status: string; response: any }> = [];
+
+    // Helper para testar um formato
+    const tryFormat = async (name: string, bodyStr: string) => {
+      try {
+        const resp = await fetch(`${tinyUrl}/pedido.alterar.php`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: bodyStr,
+        });
+        const text = await resp.text();
+        const json = JSON.parse(text);
+        results.push({ name, sent: bodyStr.replace(tinyToken, 'TOKEN'), status: json.retorno?.status || '?', response: json.retorno });
+      } catch (e: any) {
+        results.push({ name, sent: bodyStr.replace(tinyToken, 'TOKEN'), status: 'EXCEPTION', response: e.message });
+      }
+    };
+
+    // Primeiro resolve o ID: se não for numérico puro, busca
+    let resolvedId = pedidoTinyId;
+    let resolveNote = '';
+    if (!/^\d+$/.test(pedidoTinyId) || pedidoTinyId.length < 8) {
+      // Tenta buscar por numero do pedido Tiny
+      try {
+        const byNumero = await tinyClient.searchByNumero(pedidoTinyId);
+        if (byNumero.length > 0) {
+          resolvedId = byNumero[0].id;
+          resolveNote = `Resolvido: #${byNumero[0].numero} → id=${resolvedId}`;
+        }
+      } catch {}
+      if (resolvedId === pedidoTinyId) {
+        try {
+          const byEcom = await tinyClient.searchByNumeroEcommerce(pedidoTinyId);
+          if (byEcom.length > 0) {
+            resolvedId = byEcom[0].id;
+            resolveNote = `Resolvido: ecommerce ${pedidoTinyId} → id=${resolvedId}`;
+          }
+        } catch {}
+      }
+    }
+
+    const obsTest = 'teste API ' + Date.now();
+
+    // 1. dados_pedido encoded (padrão URLSearchParams)
+    await tryFormat('dados_pedido encoded', `token=${tinyToken}&formato=json&id=${resolvedId}&dados_pedido=${encodeURIComponent(JSON.stringify({ dados_pedido: { obs: obsTest } }))}`);
+    await new Promise(r => setTimeout(r, 1000));
+
+    // 2. dados_pedido SEM encode (como PHP faz: concatenação direta)
+    const rawJson2 = JSON.stringify({ dados_pedido: { obs: obsTest } });
+    await tryFormat('dados_pedido RAW (sem encode)', `token=${tinyToken}&formato=json&id=${resolvedId}&dados_pedido=${rawJson2}`);
+    await new Promise(r => setTimeout(r, 1000));
+
+    // 3. dados_pedido flat SEM encode
+    const rawJson3 = JSON.stringify({ obs: obsTest });
+    await tryFormat('dados_pedido flat RAW', `token=${tinyToken}&formato=json&id=${resolvedId}&dados_pedido=${rawJson3}`);
+    await new Promise(r => setTimeout(r, 1000));
+
+    // 4. pedido SEM encode (formato PHP estilo pedido.incluir)
+    const rawJson4 = JSON.stringify({ pedido: { obs: obsTest } });
+    await tryFormat('pedido RAW', `token=${tinyToken}&formato=json&id=${resolvedId}&pedido=${rawJson4}`);
+    await new Promise(r => setTimeout(r, 1000));
+
+    // 5. SEM formato=json (talvez o formato= interfere)
+    const rawJson5 = JSON.stringify({ dados_pedido: { obs: obsTest } });
+    await tryFormat('sem formato=json + dados_pedido RAW', `token=${tinyToken}&id=${resolvedId}&dados_pedido=${rawJson5}`);
+    await new Promise(r => setTimeout(r, 1000));
+
+    // 6. Content-Type JSON body
+    try {
+      const jsonBody = JSON.stringify({ token: tinyToken, id: resolvedId, formato: 'json', dados_pedido: { obs: obsTest } });
+      const resp = await fetch(`${tinyUrl}/pedido.alterar.php`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: jsonBody,
+      });
+      const text = await resp.text();
+      let json: any;
+      try { json = JSON.parse(text); } catch { json = { raw: text.slice(0, 500) }; }
+      results.push({ name: 'JSON body (application/json)', sent: jsonBody.replace(tinyToken, 'TOKEN'), status: json.retorno?.status || '?', response: json.retorno || json });
+    } catch (e: any) {
+      results.push({ name: 'JSON body', sent: '...', status: 'EXCEPTION', response: e.message });
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ pedidoId: pedidoTinyId, resolvedId, resolveNote: resolveNote || undefined, results }, null, 2));
+  } else if (url.pathname === '/ml/clear-cache' && req.method === 'POST') {
+    clearProcessedOrders();
+    console.log('[ML] Cache de pedidos verificados limpo manualmente');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, message: 'Cache limpo. Próxima execução ML vai reverificar todos os pedidos.' }));
+  } else if (url.pathname === '/ml/inspect' && req.method === 'GET') {
+    const mlOrderId = (url.searchParams.get('order_id') || '').trim();
+    if (!mlOrderId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Informe order_id (número do pedido ML)' }));
+      return;
+    }
+    try {
+      const steps: Array<{ step: string; ok: boolean; detail: string }> = [];
+
+      // 1. Buscar no ML API (shipment)
+      let mlFound = false;
+      let payBefore: string | undefined;
+      let shipStatus: string | undefined;
+      if (ml.isConnected()) {
+        try {
+          const mlOrders = await ml.searchRecentPaidOrders(7);
+          const match = mlOrders.find(o => String(o.id) === mlOrderId);
+          if (match) {
+            mlFound = true;
+            steps.push({ step: 'Buscar no ML API', ok: true, detail: `Pedido encontrado. Status: ${match.status}, shipping_id: ${match.shipping_id || 'N/A'}` });
+            if (match.shipping_id) {
+              try {
+                const ship = await ml.getShipment(match.shipping_id);
+                payBefore = ship.pay_before_full || undefined;
+                shipStatus = ship.status;
+                steps.push({ step: 'Verificar shipment', ok: true, detail: `Status: ${ship.status}, pay_before: ${payBefore || 'N/A'}, logistic_type: ${ship.logistic_type || 'N/A'}` });
+              } catch (e: any) {
+                steps.push({ step: 'Verificar shipment', ok: false, detail: `Erro ao buscar shipment ${match.shipping_id}: ${e.message}` });
+              }
+            } else {
+              steps.push({ step: 'Verificar shipment', ok: false, detail: 'Pedido sem shipping_id' });
+            }
+          } else {
+            steps.push({ step: 'Buscar no ML API', ok: false, detail: `Pedido ${mlOrderId} NÃO encontrado entre ${mlOrders.length} pedidos paid dos últimos 7 dias` });
+          }
+        } catch (e: any) {
+          steps.push({ step: 'Buscar no ML API', ok: false, detail: `Erro: ${e.message}` });
+        }
+      } else {
+        steps.push({ step: 'Buscar no ML API', ok: false, detail: 'Conta ML não conectada' });
+      }
+
+      // 2. Buscar no Tiny
+      let tinyDetail: any = null;
+      try {
+        const tinyMatches = await tinyClient.searchByNumeroEcommerce(mlOrderId);
+        if (tinyMatches.length === 0) {
+          steps.push({ step: 'Buscar no Tiny', ok: false, detail: `Pedido ${mlOrderId} NÃO encontrado no Tiny (numero_ecommerce). O pedido pode não ter sido importado ainda.` });
+        } else {
+          steps.push({ step: 'Buscar no Tiny', ok: true, detail: `${tinyMatches.length} registro(s): ${tinyMatches.map(t => `#${t.numero} (${t.situacao})`).join(', ')}` });
+          // Pega o primeiro match para inspecionar
+          const firstMatch = tinyMatches[0];
+          try {
+            tinyDetail = await tinyClient.getOrder(firstMatch.id);
+            const isML = tinyClient.isMercadoLivreOrder(tinyDetail);
+            const isCPF = tinyClient.isPessoaFisica(tinyDetail);
+            const hasNF = !!tinyDetail.id_nota_fiscal;
+            const hasAddr = tinyClient.hasClientAddress(tinyDetail);
+            const isMasked = tinyClient.hasMaskedClientData(tinyDetail);
+            const hasNumEC = !!tinyDetail.numero_ecommerce;
+
+            const checks = [
+              `É ML: ${isML ? 'SIM' : 'NÃO'}`,
+              `É CPF: ${isCPF ? 'SIM' : `NÃO (tipo=${tinyDetail.cliente?.tipo_pessoa})`}`,
+              `Já tem NF: ${hasNF ? `SIM (id=${tinyDetail.id_nota_fiscal})` : 'NÃO'}`,
+              `Tem endereço: ${hasAddr ? 'SIM' : 'NÃO'}`,
+              `Dados mascarados: ${isMasked ? 'SIM' : 'NÃO'}`,
+              `numero_ecommerce: ${hasNumEC ? tinyDetail.numero_ecommerce : 'VAZIO'}`,
+              `Situação: ${tinyDetail.situacao || 'N/A'}`,
+              `Total: R$${tinyDetail.total_pedido || '?'}`,
+            ];
+            steps.push({ step: 'Verificar detalhes Tiny', ok: true, detail: checks.join(' | ') });
+
+            // 3. Diagnóstico final
+            if (!isML) {
+              steps.push({ step: 'Diagnóstico', ok: false, detail: 'Pedido NÃO identificado como ML no Tiny. O bot vai ignorar.' });
+            } else if (hasNF) {
+              steps.push({ step: 'Diagnóstico', ok: false, detail: 'Pedido JÁ TEM NF no Tiny. O bot vai pular.' });
+            } else if (!isCPF) {
+              steps.push({ step: 'Diagnóstico', ok: false, detail: `Pedido é CNPJ/PJ (tipo=${tinyDetail.cliente?.tipo_pessoa}). O bot só gera NF para CPF.` });
+            } else if (isMasked) {
+              steps.push({ step: 'Diagnóstico', ok: false, detail: 'Dados do cliente mascarados. O bot vai pular.' });
+            } else if (!hasAddr) {
+              steps.push({ step: 'Diagnóstico', ok: false, detail: 'Sem endereço completo no Tiny. O bot vai pular.' });
+            } else {
+              steps.push({ step: 'Diagnóstico', ok: true, detail: 'APTO para gerar NF! Se o pay_before estiver dentro da data de coleta escolhida, a NF será gerada.' });
+            }
+          } catch (e: any) {
+            steps.push({ step: 'Verificar detalhes Tiny', ok: false, detail: `Erro ao buscar detalhes: ${e.message}` });
+          }
+        }
+      } catch (e: any) {
+        steps.push({ step: 'Buscar no Tiny', ok: false, detail: `Erro Tiny: ${e.message}` });
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, mlOrderId, steps }, null, 2));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
   } else if (url.pathname === '/ml/disconnect' && req.method === 'POST') {
     ml.disconnect();
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -3040,6 +3383,7 @@ function getDashboardHtml(): string {
               <button class="btn btn-primary btn-sm" onclick="mlQuickRun('hoje')" id="btnMLHoje">📅 Coleta Hoje</button>
               <button class="btn btn-primary btn-sm" onclick="mlQuickRun('amanha')" id="btnMLAmanha">📅 Coleta Amanhã</button>
               <button class="btn btn-secondary btn-sm" onclick="mlDebug()" id="btnMLDebug">🔍 Inspecionar API ML</button>
+              <button class="btn btn-secondary btn-sm" onclick="mlClearCache()" id="btnMLClearCache" style="background:#ef4444;color:#fff;border-color:#ef4444;">🗑 Limpar Cache ML</button>
             </div>
 
             <hr style="border:none; border-top:1px solid #f0f0f0; margin: 6px 0 14px;">
@@ -3055,6 +3399,16 @@ function getDashboardHtml(): string {
             <div id="mlLastResultBox" style="margin-top:16px; display:none;">
               <p style="font-size:12px;color:#888;font-weight:600;margin-bottom:6px;">Último processamento ML:</p>
               <pre id="mlLastResult" style="background:#f8fafc; padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap; border:1px solid #e2e8f0;"></pre>
+            </div>
+
+            <hr style="border:none; border-top:1px solid #f0f0f0; margin: 14px 0;">
+            <p style="font-size:12px; color:#888; margin-bottom:10px; font-weight:600;">Inspecionar pedido ML específico</p>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <input type="text" id="mlInspectOrderId" placeholder="Nº pedido ML (ex: 2000013682785673)" style="width:280px; padding:6px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px; font-family:monospace;">
+              <button class="btn btn-secondary btn-sm" onclick="mlInspectOrder()" id="btnMLInspect">🔍 Inspecionar</button>
+            </div>
+            <div id="mlInspectResult" style="display:none; margin-top:10px;">
+              <pre id="mlInspectPre" style="background:#f8fafc; padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap; border:1px solid #e2e8f0; max-height:300px; overflow-y:auto;"></pre>
             </div>
           </div>
         </div>
@@ -3154,6 +3508,33 @@ function getDashboardHtml(): string {
       </div>
 
       <!-- Last Result -->
+      <div class="card" id="test-lista-preco">
+        <div class="card-header">🧪 NF com Desconto (Lista de Preço)</div>
+        <div class="card-body">
+          <p style="font-size:12px; color:#888; margin-bottom:10px;">Cria NF via nota.fiscal.incluir com valores reduzidos pela lista de preço. Primeiro faz preview, depois pode criar a NF.</p>
+          <div id="msgTestLP" class="msg msg-ok"></div>
+          <div style="display:flex; gap:8px; align-items:end; flex-wrap:wrap;">
+            <div class="form-sm">
+              <label>Nº Pedido (Tiny ou Ecommerce)</label>
+              <input type="text" id="testLPPedidoId" placeholder="ex: 243787 ou 58466..." style="width:200px;">
+            </div>
+            <div class="form-sm">
+              <label>Lista de Preço</label>
+              <select id="testLPListaId" style="padding:6px 8px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;">
+                <option value="0">Padrão (0)</option>
+                <option value="418">SHOPEE (418)</option>
+                <option value="419">ML (419)</option>
+              </select>
+            </div>
+            <button class="btn btn-secondary btn-sm" onclick="testListaPreco(false)" id="btnTestLP">🔍 Preview</button>
+            <button class="btn btn-secondary btn-sm" onclick="testListaPreco(true)" id="btnCriarNF" style="background:#16a34a;">📄 Criar NF</button>
+          </div>
+          <div id="testLPResult" style="display:none; margin-top:10px;">
+            <div id="testLPPreview"></div>
+          </div>
+        </div>
+      </div>
+
       <div class="card" id="config">
         <div class="card-header">📊 Último Resultado Detalhado</div>
         <div class="card-body">
@@ -3428,6 +3809,115 @@ function getDashboardHtml(): string {
         await r.json();
         refreshMLStatus();
       } catch(e) {}
+    }
+
+    async function mlClearCache() {
+      if (!confirm('Limpar o cache de pedidos ML verificados? A próxima execução vai reverificar todos os pedidos.')) return;
+      var btn = document.getElementById('btnMLClearCache');
+      btn.disabled = true; btn.textContent = '⏳ Limpando...';
+      try {
+        var r = await fetch('/ml/clear-cache', { method: 'POST', headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
+        showMsg('msgML', '✓ ' + d.message, true);
+      } catch(e) { showMsg('msgML', 'Erro ao limpar cache: ' + e.message, false); }
+      btn.disabled = false; btn.textContent = '🗑 Limpar Cache ML';
+    }
+
+    async function mlInspectOrder() {
+      var orderId = document.getElementById('mlInspectOrderId').value.trim();
+      if (!orderId) { showMsg('msgML', 'Informe o número do pedido ML.', false); return; }
+      var btn = document.getElementById('btnMLInspect');
+      btn.disabled = true; btn.textContent = '⏳ Inspecionando...';
+      try {
+        var r = await fetch('/ml/inspect?order_id=' + encodeURIComponent(orderId), { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
+        var box = document.getElementById('mlInspectResult');
+        box.style.display = 'block';
+        if (d.steps) {
+          var html = d.steps.map(function(s) {
+            var icon = s.ok ? '✅' : '❌';
+            return icon + ' <strong>' + s.step + '</strong>: ' + s.detail;
+          }).join('\\n');
+          document.getElementById('mlInspectPre').innerHTML = html;
+        } else {
+          document.getElementById('mlInspectPre').textContent = JSON.stringify(d, null, 2);
+        }
+      } catch(e) { showMsg('msgML', 'Erro: ' + e.message, false); }
+      btn.disabled = false; btn.textContent = '🔍 Inspecionar';
+    }
+
+    async function testListaPreco(criar) {
+      var pedidoId = document.getElementById('testLPPedidoId').value.trim();
+      if (!pedidoId) { showMsg('msgTestLP', 'Informe o nº do pedido.', false); return; }
+      var listaId = document.getElementById('testLPListaId').value;
+      var btnP = document.getElementById('btnTestLP');
+      var btnC = document.getElementById('btnCriarNF');
+
+      if (criar && !confirm('Criar NF com desconto para o pedido ' + pedidoId + '?')) return;
+
+      btnP.disabled = true; btnC.disabled = true;
+      btnP.textContent = '⏳ ...'; btnC.textContent = '⏳ ...';
+
+      try {
+        var qry = '/tiny/test-lista-preco?pedido_id=' + encodeURIComponent(pedidoId) + '&lista_id=' + listaId;
+        if (criar) qry += '&criar=1';
+        var r = await fetch(qry, { method: 'POST', headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
+        var box = document.getElementById('testLPResult');
+        box.style.display = 'block';
+        var container = document.getElementById('testLPPreview');
+
+        if (d.ok) {
+          var h = '';
+          if (d.resolveNote) h += '<div style="color:#6366f1;font-size:12px;margin-bottom:6px;">ℹ️ ' + escapeHtml(d.resolveNote) + '</div>';
+          h += '<div style="font-size:13px;margin-bottom:8px;"><strong>Pedido #' + escapeHtml(d.pedidoNumero || d.pedidoId) + '</strong>';
+          if (d.numeroEcommerce) h += ' <span class="badge badge-blue">' + escapeHtml(d.numeroEcommerce) + '</span>';
+          h += ' <span class="badge badge-orange">' + escapeHtml(d.situacao || '?') + '</span>';
+          h += '</div>';
+
+          if (d.lista) {
+            h += '<div style="font-size:12px;color:#666;margin-bottom:8px;">Lista: <strong>' + escapeHtml(d.lista.descricao) + '</strong> (desconto ' + d.descontoPct + '%)</div>';
+          }
+
+          h += '<table style="font-size:12px;width:100%;"><thead><tr><th style="text-align:left;">Item</th><th>Qtd</th><th>V.Original</th><th>V.Desconto</th><th>Sub.Orig</th><th>Sub.Desc</th></tr></thead><tbody>';
+          for (var i = 0; i < d.itens.length; i++) {
+            var it = d.itens[i];
+            h += '<tr><td style="text-align:left;">' + escapeHtml(it.descricao) + '</td>';
+            h += '<td style="text-align:center;">' + it.quantidade + '</td>';
+            h += '<td style="text-align:right;">R$' + it.valor_original + '</td>';
+            h += '<td style="text-align:right;color:#16a34a;font-weight:bold;">R$' + it.valor_desconto + '</td>';
+            h += '<td style="text-align:right;">R$' + it.subtotal_original + '</td>';
+            h += '<td style="text-align:right;color:#16a34a;">R$' + it.subtotal_desconto + '</td></tr>';
+          }
+          h += '</tbody></table>';
+
+          h += '<div style="margin-top:8px;padding:8px 12px;background:#f0fdf4;border-radius:6px;border:1px solid #bbf7d0;font-size:13px;">';
+          h += '<strong>Total original:</strong> R$ ' + d.totalOriginal + ' → <strong>Com desconto:</strong> R$ ' + d.totalComDesconto;
+          h += ' <span style="color:#16a34a;font-weight:bold;">(economia: R$ ' + d.economia + ')</span></div>';
+
+          if (d.nfCriada) {
+            if (d.nfCriada.ok) {
+              h += '<div style="margin-top:8px;padding:8px 12px;background:#dbeafe;border-radius:6px;border:1px solid #93c5fd;font-size:13px;">✅ <strong>NF criada!</strong> ID: ' + d.nfCriada.nfId + ', Número: ' + (d.nfCriada.numero || '-') + ', Série: ' + (d.nfCriada.serie || '-') + '<br><span style="font-size:11px;color:#666;">NF criada sem emissão na SEFAZ (modo teste). Emita manualmente no Tiny se desejar.</span></div>';
+              showMsg('msgTestLP', 'NF criada com sucesso! ID: ' + d.nfCriada.nfId, true);
+            } else {
+              h += '<div style="margin-top:8px;padding:8px 12px;background:#fef2f2;border-radius:6px;border:1px solid #fca5a5;font-size:13px;">❌ <strong>Erro ao criar NF:</strong> ' + escapeHtml(d.nfCriada.error || 'Erro desconhecido') + '</div>';
+              showMsg('msgTestLP', 'Erro ao criar NF: ' + (d.nfCriada.error || 'erro'), false);
+            }
+          } else {
+            showMsg('msgTestLP', 'Preview OK! Clique "Criar NF" para gerar a nota fiscal.', true);
+          }
+
+          container.innerHTML = h;
+        } else {
+          container.innerHTML = '<pre style="background:#fef2f2;padding:12px;border-radius:8px;font-size:12px;white-space:pre-wrap;border:1px solid #fca5a5;">ERRO: ' + escapeHtml(d.error || 'Erro desconhecido') + '</pre>';
+          showMsg('msgTestLP', 'Falha: ' + (d.error || 'erro'), false);
+        }
+      } catch(e) { showMsg('msgTestLP', 'Erro: ' + e.message, false); }
+      btnP.disabled = false; btnP.textContent = '🔍 Preview';
+      btnC.disabled = false; btnC.textContent = '📄 Criar NF';
     }
 
     async function mlDebug() {

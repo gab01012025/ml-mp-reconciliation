@@ -293,6 +293,9 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
     }
     console.log(`[BOT-ML] ${allOrders.length} pedidos no dia, ${candidates.length} não-cancelados, ${skippedFaturado} já faturados, ${skippedCache} já verificados antes → ${needsCheck.length} para analisar`);
 
+    // Contadores detalhados de motivo de skip
+    const skipReasons = { naoML: 0, naoCPF: 0, mascarado: 0, jaTemNF: 0, semEndereco: 0, semNumEcommerce: 0, cacheAntes: skippedCache, jaFaturado: skippedFaturado };
+
     for (const order of needsCheck) {
       try {
         await sleep(1100);
@@ -300,6 +303,7 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
 
         if (!isMercadoLivreOrder(detail)) {
           checkedMLOrders.add(order.id);
+          skipReasons.naoML++;
           continue;
         }
 
@@ -310,6 +314,7 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
           console.log(`[BOT-ML] Pedido ${detail.numero} NÃO é CPF (tipo=${detail.cliente.tipo_pessoa}, doc=${detail.cliente.cpf_cnpj}) - PULANDO`);
           stats.skippedNF++;
           checkedMLOrders.add(order.id);
+          skipReasons.naoCPF++;
           continue;
         }
 
@@ -317,12 +322,14 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
           console.log(`[BOT-ML] Pedido ${detail.numero} dados mascarados - PULANDO`);
           stats.skippedNF++;
           checkedMLOrders.add(order.id);
+          skipReasons.mascarado++;
           continue;
         }
 
         if (detail.id_nota_fiscal) {
           console.log(`[BOT-ML] Pedido ${detail.numero} já tem NF (${detail.id_nota_fiscal}), pulando`);
           checkedMLOrders.add(order.id);
+          skipReasons.jaTemNF++;
           continue;
         }
 
@@ -330,6 +337,7 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
           console.log(`[BOT-ML] Pedido ${detail.numero} sem endereço completo - PULANDO`);
           stats.skippedNF++;
           checkedMLOrders.add(order.id);
+          skipReasons.semEndereco++;
           continue;
         }
 
@@ -337,6 +345,7 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
           console.log(`[BOT-ML] Pedido ${detail.numero} sem numero_ecommerce - PULANDO`);
           stats.skippedNF++;
           checkedMLOrders.add(order.id);
+          skipReasons.semNumEcommerce++;
           continue;
         }
 
@@ -368,28 +377,36 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
         stats.errors++;
       }
     }
+
+    console.log(`[BOT-ML] Resultado: ${stats.found} pedidos ML, ${stats.nfGenerated} NFs emitidas com ${discount}% desconto, ${stats.skippedNF} pulados, ${stats.errors} erros`);
+    const reasons = Object.entries(skipReasons).filter(([, v]) => v > 0).map(([k, v]) => {
+      const labels: Record<string, string> = { naoML: 'não é ML', naoCPF: 'CNPJ (não CPF)', mascarado: 'dados mascarados', jaTemNF: 'já tem NF', semEndereco: 'sem endereço', semNumEcommerce: 'sem nº ecommerce', cacheAntes: 'já verificado (cache)', jaFaturado: 'já faturado/atendido' };
+      return `${labels[k] || k}: ${v}`;
+    });
+    if (reasons.length > 0) console.log(`[BOT-ML] Detalhamento pulados: ${reasons.join(' | ')}`);
   } catch (err) {
     console.error('[BOT-ML] Falha na busca de pedidos:', err);
   }
-
-  console.log(`[BOT-ML] Resultado: ${stats.found} pedidos ML, ${stats.nfGenerated} NFs emitidas com ${discount}% desconto, ${stats.skippedNF} pulados, ${stats.errors} erros`);
   return stats;
 }
 
 /**
- * Processa pedidos ML cujo DEADLINE DE NF (pay_before) cai até o fim do dia selecionado.
- * Para pedidos Full (logistic_type=fulfillment) não existe data de coleta do seller — o ML
- * agrupa os pedidos em "Coleta | Hoje/Amanhã" pelo `estimated_delivery_time.pay_before`,
- * que é o deadline para a NF estar emitida antes da expedição.
+ * Processa pedidos ML cujo DEADLINE DE NF (pay_before) cai até o fim do dia SEGUINTE ao selecionado.
+ * O ML agrupa pedidos em "Coleta | Hoje/Amanhã" pela data de coleta, mas o `pay_before`
+ * (deadline para emissão da NF) costuma ser 1 dia DEPOIS da coleta (ex: coleta 25/06 → pay_before 26/06 11h).
+ * Por isso filtramos pay_before <= (dataColeta + 1 dia) 23:59 para capturar todos os pedidos da coleta.
  */
 export async function processMercadoLivreByCollectionDate(dataColeta: string): Promise<BotResult> {
   const stats: BotResult = { found: 0, altered: 0, nfGenerated: 0, skippedNF: 0, errors: 0, nfs: [] };
   const discount = config.mlDiscountPercent;
   const isoTarget = ddmmyyyyToIsoDate(dataColeta);
-  // Fim do dia selecionado em horário BR (-03:00)
-  const targetEnd = new Date(`${isoTarget}T23:59:59.999-03:00`).getTime();
+  // pay_before geralmente é 1 dia após a coleta — extende a janela em +1 dia
+  const targetDate = new Date(`${isoTarget}T00:00:00.000-03:00`);
+  targetDate.setDate(targetDate.getDate() + 1);
+  const targetEnd = new Date(`${targetDate.toISOString().slice(0, 10)}T23:59:59.999-03:00`).getTime();
+  const targetEndLabel = targetDate.toISOString().slice(0, 10);
 
-  console.log(`\n[BOT-ML] Buscando pedidos com deadline NF (pay_before) até ${dataColeta} 23:59 (=${isoTarget}) — desconto ${discount}% para CPF`);
+  console.log(`\n[BOT-ML] Buscando pedidos com deadline NF (pay_before) até ${targetEndLabel} 23:59 (coleta=${dataColeta}) — desconto ${discount}% para CPF`);
 
   if (!ml.isConnected()) {
     console.error('[BOT-ML] Conta Mercado Livre não conectada — abortando.');
@@ -462,7 +479,7 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
     }
   }
   ml.flushShipmentCache();
-  console.log(`[BOT-ML] ${shipChecked} shipments verificados (${cacheHits} via cache, ${shipChecked - cacheHits} via API), ${matchingOrderIds.length} com pay_before <= ${dataColeta} 23:59`);
+  console.log(`[BOT-ML] ${shipChecked} shipments verificados (${cacheHits} via cache, ${shipChecked - cacheHits} via API), ${matchingOrderIds.length} com pay_before <= ${targetEndLabel} 23:59 (coleta=${dataColeta})`);
 
   // Filtra pedidos ML já verificados anteriormente
   const mlToCheck = matchingOrderIds.filter(id => !checkedMLOrders.has(String(id)));
@@ -471,14 +488,18 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
     console.log(`[BOT-ML] ${mlSkippedCache} pedidos ML já verificados antes, ${mlToCheck.length} para analisar`);
   }
 
+  // Contadores detalhados de motivo de skip
+  const skipReasons = { naoNoTiny: 0, naoML: 0, naoCPF: 0, mascarado: 0, jaTemNF: 0, semEndereco: 0, semNumEcommerce: 0, cacheAntes: mlSkippedCache };
+
   for (const mlOrderId of mlToCheck) {
     try {
       await sleep(1100);
       const tinyMatches = await searchByNumeroEcommerce(String(mlOrderId));
       if (tinyMatches.length === 0) {
-        console.log(`[BOT-ML] Pedido ML ${mlOrderId} não encontrado no Tiny — PULANDO`);
+        console.log(`[BOT-ML] Pedido ML ${mlOrderId} não encontrado no Tiny — PULANDO (será tentado de novo na próxima execução)`);
         stats.skippedNF++;
-        checkedMLOrders.add(String(mlOrderId));
+        skipReasons.naoNoTiny++;
+        // NÃO adiciona ao cache — pedido pode ser sincronizado ao Tiny mais tarde
         continue;
       }
 
@@ -491,6 +512,7 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
         if (!isMercadoLivreOrder(detail)) {
           console.log(`[BOT-ML] Pedido Tiny ${summary.numero} não é ML — PULANDO`);
           checkedMLOrders.add(summary.id);
+          skipReasons.naoML++;
           continue;
         }
 
@@ -500,29 +522,34 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
           console.log(`[BOT-ML] Pedido ${detail.numero} NÃO é CPF (tipo=${detail.cliente.tipo_pessoa}) - PULANDO`);
           stats.skippedNF++;
           checkedMLOrders.add(summary.id);
+          skipReasons.naoCPF++;
           continue;
         }
         if (hasMaskedClientData(detail)) {
           console.log(`[BOT-ML] Pedido ${detail.numero} dados mascarados - PULANDO`);
           stats.skippedNF++;
           checkedMLOrders.add(summary.id);
+          skipReasons.mascarado++;
           continue;
         }
         if (detail.id_nota_fiscal) {
           console.log(`[BOT-ML] Pedido ${detail.numero} já tem NF (${detail.id_nota_fiscal}), pulando`);
           checkedMLOrders.add(summary.id);
+          skipReasons.jaTemNF++;
           continue;
         }
         if (!hasClientAddress(detail)) {
           console.log(`[BOT-ML] Pedido ${detail.numero} sem endereço - PULANDO`);
           stats.skippedNF++;
           checkedMLOrders.add(summary.id);
+          skipReasons.semEndereco++;
           continue;
         }
         if (!detail.numero_ecommerce) {
           console.log(`[BOT-ML] Pedido ${detail.numero} sem numero_ecommerce - PULANDO`);
           stats.skippedNF++;
           checkedMLOrders.add(summary.id);
+          skipReasons.semNumEcommerce++;
           continue;
         }
 
@@ -555,6 +582,11 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
   }
 
   console.log(`[BOT-ML] Resultado coleta=${dataColeta}: ${stats.found} pedidos, ${stats.nfGenerated} NFs com ${discount}%, ${stats.skippedNF} pulados, ${stats.errors} erros`);
+  const reasons = Object.entries(skipReasons).filter(([, v]) => v > 0).map(([k, v]) => {
+    const labels: Record<string, string> = { naoNoTiny: 'não encontrado no Tiny', naoML: 'não é ML', naoCPF: 'CNPJ (não CPF)', mascarado: 'dados mascarados', jaTemNF: 'já tem NF', semEndereco: 'sem endereço', semNumEcommerce: 'sem nº ecommerce', cacheAntes: 'já verificado (cache)' };
+    return `${labels[k] || k}: ${v}`;
+  });
+  if (reasons.length > 0) console.log(`[BOT-ML] Detalhamento pulados: ${reasons.join(' | ')}`);
   return stats;
 }
 

@@ -49,23 +49,45 @@ interface TinyOrderDetail {
   id_nota_fiscal?: string;
 }
 
-async function tinyPost(endpoint: string, params: Record<string, string> = {}): Promise<any> {
+async function tinyPost(endpoint: string, params: Record<string, string> = {}, maxRetries = 3): Promise<any> {
   const body = new URLSearchParams({
     token: config.tinyToken,
     formato: 'json',
     ...params,
   });
 
-  const response = await fetch(`${config.tinyApiUrl}/${endpoint}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body.toString(),
-  });
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const response = await fetch(`${config.tinyApiUrl}/${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
 
-  const text = await response.text();
-  return JSON.parse(text);
+    const text = await response.text();
+    const data = JSON.parse(text);
+
+    // Detecta erro transitório do Tiny e faz retry automático
+    const retorno = data.retorno;
+    if (retorno && retorno.status !== 'OK') {
+      const erroStr = String(retorno.erros?.[0]?.erro || retorno.erros?.erro || '');
+      if ((erroStr.includes('Tente novamente') || erroStr.includes('executar a consulta')) && attempt < maxRetries - 1) {
+        const wait = 2000 * (attempt + 1);
+        console.log(`[TINY] Erro transitório em ${endpoint} (tentativa ${attempt + 1}/${maxRetries}): ${erroStr.slice(0, 80)} — retry em ${wait}ms...`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+    }
+
+    return data;
+  }
+
+  // fallback (nunca deve chegar aqui)
+  throw new Error(`[TINY] ${endpoint}: falhou após ${maxRetries} tentativas`);
 }
 
+
+/** Wrapper público para tinyPost (para endpoints de teste) */
+export { tinyPost as tinyPostPublic };
 
 function ensureArray<T>(val: T | T[] | undefined): T[] {
   if (!val) return [];
@@ -121,49 +143,30 @@ export async function searchOrders(params: {
 
 /**
  * Busca pedido(s) Tiny por numero_ecommerce (ID externo do marketplace).
- * Faz retry em erros transitórios do Tiny ("Tente novamente mais tarde").
+ * Retry de erros transitórios é feito automaticamente pelo tinyPost.
  */
 export async function searchByNumeroEcommerce(numeroEcommerce: string): Promise<TinyOrderSummary[]> {
-  let lastErr: any;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const data = await tinyPost('pedidos.pesquisa.php', { numero_ecommerce: numeroEcommerce });
-      const retorno = data.retorno;
-      if (retorno.status !== 'OK') {
-        const erro = retorno.erros?.[0]?.erro || retorno.erros?.erro || '';
-        const erroStr = String(erro);
-        if (erroStr.includes('não retornou registros')) return [];
-        // Erros transitórios do Tiny — retry
-        if (erroStr.includes('Tente novamente') || erroStr.includes('executar a consulta')) {
-          lastErr = new Error(`Tiny transitório: ${erroStr}`);
-          await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
-          continue;
-        }
-        throw new Error(`Tiny API error (numero_ecommerce=${numeroEcommerce}): ${erroStr}`);
-      }
-      const rawPedidos = ensureArray(retorno.pedidos);
-      return rawPedidos.map((p: any) => {
-        const ped = p.pedido || p;
-        return {
-          id: String(ped.id),
-          numero: String(ped.numero),
-          numero_ecommerce: String(ped.numero_ecommerce || ''),
-          data_pedido: String(ped.data_pedido),
-          nome: String(ped.nome),
-          valor: String(ped.valor),
-          situacao: String(ped.situacao),
-        };
-      });
-    } catch (err: any) {
-      lastErr = err;
-      // Se for erro de rede/timeout, retry
-      if (attempt < 2) {
-        await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
-        continue;
-      }
-    }
+  const data = await tinyPost('pedidos.pesquisa.php', { numero_ecommerce: numeroEcommerce });
+  const retorno = data.retorno;
+  if (retorno.status !== 'OK') {
+    const erro = retorno.erros?.[0]?.erro || retorno.erros?.erro || '';
+    const erroStr = String(erro);
+    if (erroStr.includes('não retornou registros')) return [];
+    throw new Error(`Tiny API error (numero_ecommerce=${numeroEcommerce}): ${erroStr}`);
   }
-  throw lastErr;
+  const rawPedidos = ensureArray(retorno.pedidos);
+  return rawPedidos.map((p: any) => {
+    const ped = p.pedido || p;
+    return {
+      id: String(ped.id),
+      numero: String(ped.numero),
+      numero_ecommerce: String(ped.numero_ecommerce || ''),
+      data_pedido: String(ped.data_pedido),
+      nome: String(ped.nome),
+      valor: String(ped.valor),
+      situacao: String(ped.situacao),
+    };
+  });
 }
 
 /**
@@ -171,44 +174,27 @@ export async function searchByNumeroEcommerce(numeroEcommerce: string): Promise<
  * Diferente de numero_ecommerce — esse é o ID interno do Tiny.
  */
 export async function searchByNumero(numero: string): Promise<TinyOrderSummary[]> {
-  let lastErr: any;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const data = await tinyPost('pedidos.pesquisa.php', { numero: numero });
-      const retorno = data.retorno;
-      if (retorno.status !== 'OK') {
-        const erro = retorno.erros?.[0]?.erro || retorno.erros?.erro || '';
-        const erroStr = String(erro);
-        if (erroStr.includes('não retornou registros')) return [];
-        if (erroStr.includes('Tente novamente') || erroStr.includes('executar a consulta')) {
-          lastErr = new Error(`Tiny transitório: ${erroStr}`);
-          await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
-          continue;
-        }
-        throw new Error(`Tiny API error (numero=${numero}): ${erroStr}`);
-      }
-      const rawPedidos = ensureArray(retorno.pedidos);
-      return rawPedidos.map((p: any) => {
-        const ped = p.pedido || p;
-        return {
-          id: String(ped.id),
-          numero: String(ped.numero),
-          numero_ecommerce: String(ped.numero_ecommerce || ''),
-          data_pedido: String(ped.data_pedido),
-          nome: String(ped.nome),
-          valor: String(ped.valor),
-          situacao: String(ped.situacao),
-        };
-      });
-    } catch (err: any) {
-      lastErr = err;
-      if (attempt < 2) {
-        await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
-        continue;
-      }
-    }
+  const data = await tinyPost('pedidos.pesquisa.php', { numero: numero });
+  const retorno = data.retorno;
+  if (retorno.status !== 'OK') {
+    const erro = retorno.erros?.[0]?.erro || retorno.erros?.erro || '';
+    const erroStr = String(erro);
+    if (erroStr.includes('não retornou registros')) return [];
+    throw new Error(`Tiny API error (numero=${numero}): ${erroStr}`);
   }
-  throw lastErr;
+  const rawPedidos = ensureArray(retorno.pedidos);
+  return rawPedidos.map((p: any) => {
+    const ped = p.pedido || p;
+    return {
+      id: String(ped.id),
+      numero: String(ped.numero),
+      numero_ecommerce: String(ped.numero_ecommerce || ''),
+      data_pedido: String(ped.data_pedido),
+      nome: String(ped.nome),
+      valor: String(ped.valor),
+      situacao: String(ped.situacao),
+    };
+  });
 }
 
 /**
@@ -702,6 +688,68 @@ export async function alterOrderPrices(
   );
   console.log(`[OK] Pedido ${orderId} alterado: desconto ${discountPercent}% aplicado — novo total aprox R$${totalReduzido.toFixed(2)}`);
   return { success: true };
+}
+
+/**
+ * Busca todas as listas de preço cadastradas no Tiny.
+ * Retorna id, descricao e acrescimo_desconto (ex: -10 = 10% desconto).
+ */
+export async function getPriceLists(): Promise<Array<{ id: number; descricao: string; acrescimo_desconto: number }>> {
+  const data = await tinyPost('listas.precos.pesquisa.php', {});
+  const retorno = data.retorno;
+  if (retorno.status !== 'OK') {
+    const erro = retorno.erros?.[0]?.erro || retorno.erros?.erro || 'Erro desconhecido';
+    if (String(erro).includes('não retornou registros')) return [];
+    throw new Error(`Tiny API error (listas de preço): ${erro}`);
+  }
+  const registros = ensureArray(retorno.registros);
+  return registros.map((r: any) => {
+    const reg = r.registro || r;
+    return {
+      id: Number(reg.id),
+      descricao: String(reg.descricao),
+      acrescimo_desconto: Number(reg.acrescimo_desconto || 0),
+    };
+  });
+}
+
+/**
+ * Aplica a Lista de Preço em um pedido Tiny.
+ * Como pedido.alterar não suporta id_lista_preco, busca a % de desconto da lista
+ * e aplica nos preços dos itens via alterOrderPrices.
+ */
+export async function setOrderPriceList(
+  orderId: string,
+  idListaPreco: number,
+): Promise<{ success: boolean; error?: string; rawResponse?: any; discountPercent?: number; listaDescricao?: string }> {
+  // 1. Busca listas de preço para encontrar a % de desconto
+  const listas = await getPriceLists();
+  const lista = listas.find(l => l.id === idListaPreco);
+  if (!lista) {
+    return { success: false, error: `Lista de preço ID=${idListaPreco} não encontrada. Listas disponíveis: ${listas.map(l => `${l.descricao} (${l.id})`).join(', ')}` };
+  }
+
+  // acrescimo_desconto negativo = desconto (ex: -10 = 10% desconto)
+  // acrescimo_desconto positivo = acréscimo (ex: 5 = 5% acréscimo)
+  const discountPercent = -lista.acrescimo_desconto; // inverte: -10 vira 10% desconto
+  console.log(`[TINY] Lista "${lista.descricao}" (id=${lista.id}): acrescimo_desconto=${lista.acrescimo_desconto}% → desconto=${discountPercent}%`);
+
+  if (discountPercent === 0) {
+    return { success: true, discountPercent: 0, listaDescricao: lista.descricao, error: 'Lista com desconto 0% — nada a alterar' };
+  }
+
+  // 2. Busca pedido atual
+  const order = await getOrder(orderId);
+
+  // 3. Aplica desconto nos itens
+  const result = await alterOrderPrices(orderId, order, discountPercent);
+
+  return {
+    success: result.success,
+    error: result.error,
+    discountPercent,
+    listaDescricao: lista.descricao,
+  };
 }
 
 /**
