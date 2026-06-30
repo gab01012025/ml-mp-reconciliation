@@ -2614,6 +2614,8 @@ function renderSteps(p) {
   // Step 2 details
   if (p.temNF && p.nf) {
     steps[1].detail = 'NF ' + (p.nf.numero || '') + ' — ' + (p.nf.situacao || '') + (p.nf.chaveAcesso ? ' — Chave: ...' + p.nf.chaveAcesso.slice(-8) : '');
+  } else if (!p.id && p.canal === 'Shopee') {
+    steps[1].detail = 'Pedido não encontrado no Tiny — clique para buscar e gerar NF';
   } else {
     steps[1].detail = 'Nenhuma NF vinculada a este pedido';
   }
@@ -2682,6 +2684,33 @@ function setStepError(stepId, detail) {
 
 async function gerarNF() {
   if (!pedidoAtual) return;
+  // Se não tem ID do Tiny, tenta pipeline completo via processar-unico
+  if (!pedidoAtual.id && pedidoAtual.canal === 'Shopee' && pedidoAtual.numero_ecommerce) {
+    setStepLoading('step2', 'Buscando no Tiny + gerando NF...');
+    try {
+      var r2 = await fetch('/pedido/processar-unico', { method: 'POST', headers: authHeaders, body: JSON.stringify({ orderSn: pedidoAtual.numero_ecommerce }) });
+      var d2 = await r2.json();
+      if (d2.result && d2.result.nf) {
+        var nfMsg = 'NF ' + (d2.result.nf.numero || '') + ' — Chave: ...' + (d2.result.nf.chaveAcesso || '').slice(-8) + (d2.result.nf.valorNota ? ' — R$ ' + d2.result.nf.valorNota.toFixed(2) : '');
+        setStepDone('step2', nfMsg);
+        pedidoAtual.temNF = true;
+        pedidoAtual.id = d2.result.tinyId || '';
+        pedidoAtual.nf = d2.result.nf;
+      } else {
+        var errDetail = 'Falha ao gerar NF';
+        if (d2.result && d2.result.steps) {
+          var failedStep = d2.result.steps.filter(function(s) { return !s.ok; });
+          if (failedStep.length > 0) errDetail = failedStep[failedStep.length - 1].detail;
+        }
+        setStepError('step2', errDetail);
+      }
+    } catch(e) { setStepError('step2', 'Erro: ' + e.message); }
+    return;
+  }
+  if (!pedidoAtual.id) {
+    setStepError('step2', 'Pedido não encontrado no Tiny. Verifique se foi importado.');
+    return;
+  }
   setStepLoading('step2', 'Gerando...');
   try {
     var r = await fetch('/pedido/gerar-nf', { method: 'POST', headers: authHeaders, body: JSON.stringify({ orderId: pedidoAtual.id, canal: pedidoAtual.canal }) });
