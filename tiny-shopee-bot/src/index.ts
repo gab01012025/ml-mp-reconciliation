@@ -231,14 +231,14 @@ const server = http.createServer(async (req, res) => {
   // Public: health
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.13-persist', uptime: process.uptime() }));
+    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.94', uptime: process.uptime() }));
     return;
   }
 
   // Public: version check (for debugging deploys)
   if (url.pathname === '/version') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ version: 'v3.13-persist', deployed: startTime.toISOString() }));
+    res.end(JSON.stringify({ version: 'v3.94', deployed: startTime.toISOString() }));
     return;
   }
 
@@ -2832,7 +2832,7 @@ function getLoginHtml(error?: string): string {
       <div class="int-badge"><span class="dot"></span> Mercado Livre</div>
       <div class="int-badge"><span class="dot"></span> Tiny ERP</div>
     </div>
-    <div class="footer">SyncHub v3.2 — Integrador de Marketplaces e ERPs</div>
+    <div class="footer">SyncHub v3.94 — Integrador de Marketplaces e ERPs</div>
   </div>
   <script>
     if (localStorage.getItem('auth_token')) { window.location.href = '/'; }
@@ -2997,6 +2997,14 @@ function getDashboardHtml(): string {
     .sync-flow .flow-node .flow-sub { font-size: 10px; color: #999; }
     .sync-flow .flow-arrow { font-size: 20px; color: #94a3b8; }
 
+    .step-number { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border-radius: 50%; background: #0f3460; color: white; font-size: 12px; font-weight: 700; margin-right: 6px; }
+    .tab-bar { display: flex; gap: 0; border-bottom: 2px solid #e8ecf0; margin-bottom: 20px; }
+    .tab-bar .tab-btn { padding: 10px 20px; font-size: 14px; font-weight: 600; color: #888; background: none; border: none; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.15s; }
+    .tab-bar .tab-btn:hover { color: #555; }
+    .tab-bar .tab-btn.active { color: #0f3460; border-bottom-color: #0f3460; }
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
+
     @media (max-width: 900px) {
       .sidebar { display: none; }
       .main { margin-left: 0; }
@@ -3016,18 +3024,18 @@ function getDashboardHtml(): string {
     <nav>
       <a href="#" class="active"><span class="icon">📊</span> Dashboard</a>
       <a href="#integracoes"><span class="icon">🔗</span> Integrações</a>
-      <a href="#sync"><span class="icon">🛒</span> Shopee NFs</a>
-      <a href="#ml-sync"><span class="icon">🏪</span> ML NFs</a>
-      <div class="section-label">Etiquetas</div>
-      <a href="#shopee-labels"><span class="icon">🏷️</span> Etiquetas Shopee</a>
-      <a href="#ml-labels"><span class="icon">🏷️</span> Etiquetas ML</a>
-      <a href="#nfs"><span class="icon">📋</span> Notas Fiscais</a>
+      <div class="section-label">Fluxo Operacional</div>
+      <a href="#step-pedidos"><span class="icon">📦</span> 1. Listar Pedidos</a>
+      <a href="#step-emitir"><span class="icon">📄</span> 2. Emitir Notas</a>
+      <a href="#step-enviar"><span class="icon">📤</span> 3. Enviar Notas</a>
+      <a href="#step-etiquetas"><span class="icon">🏷️</span> 4. Etiquetas</a>
+      <div class="section-label">Consultas</div>
+      <a href="#nfs"><span class="icon">📋</span> Histórico NFs</a>
       <a href="#checklist"><span class="icon">✅</span> Checklist</a>
       <div class="section-label">Sistema</div>
       <a href="#logs"><span class="icon">📄</span> Logs</a>
-      <a href="#config"><span class="icon">⚙️</span> Configurações</a>
     </nav>
-    <div class="sidebar-footer">SyncHub v3.2<br>Integrador ERP/HUB</div>
+    <div class="sidebar-footer">SyncHub v3.94<br>Integrador ERP/HUB</div>
   </div>
 
   <!-- Main -->
@@ -3076,48 +3084,7 @@ function getDashboardHtml(): string {
           <span class="card-badge badge-green">3 ativas</span>
         </div>
         <div class="card-body">
-          <!-- Sync Flow Diagram -->
-          <div class="sync-flow">
-            <div class="flow-node">
-              <div class="flow-icon">🛒</div>
-              <div class="flow-label">Shopee</div>
-              <div class="flow-sub">Marketplace</div>
-            </div>
-            <div class="flow-arrow">→</div>
-            <div class="flow-node" style="border-color: #0f3460;">
-              <div class="flow-icon">🔄</div>
-              <div class="flow-label">SyncHub</div>
-              <div class="flow-sub">Integrador</div>
-            </div>
-            <div class="flow-arrow">→</div>
-            <div class="flow-node">
-              <div class="flow-icon">📦</div>
-              <div class="flow-label">Tiny ERP</div>
-              <div class="flow-sub">ERP / Olist</div>
-            </div>
-          </div>
-          <div class="sync-flow" style="margin-top:-8px;">
-            <div class="flow-node">
-              <div class="flow-icon">🏪</div>
-              <div class="flow-label">Mercado Livre</div>
-              <div class="flow-sub">Marketplace</div>
-            </div>
-            <div class="flow-arrow">→</div>
-            <div class="flow-node" style="border-color: #0f3460;">
-              <div class="flow-icon">🔄</div>
-              <div class="flow-label">SyncHub</div>
-              <div class="flow-sub">Integrador</div>
-            </div>
-            <div class="flow-arrow">→</div>
-            <div class="flow-node">
-              <div class="flow-icon">📋</div>
-              <div class="flow-label">SEFAZ</div>
-              <div class="flow-sub">Nota Fiscal</div>
-            </div>
-          </div>
-
-          <!-- Integration Cards -->
-          <div class="int-grid" style="margin-top: 20px;">
+          <div class="int-grid">
             <!-- Shopee -->
             <div class="int-card">
               <div class="int-status-badge active"><span>●</span> Ativo</div>
@@ -3193,269 +3160,348 @@ function getDashboardHtml(): string {
         </div>
       </div>
 
-      <!-- Processar Pedido Manual -->
-      <div class="card" style="border: 2px solid #3b82f6; background: linear-gradient(135deg, #eff6ff 0%, #ffffff 100%);">
-        <div class="card-header" style="border-bottom-color: #bfdbfe;">
-          🎯 Processar Pedido Individual
-          <span class="card-badge" style="background:#dbeafe;color:#1d4ed8;">NOVO</span>
-        </div>
+      <!-- ===== PASSO 1: LISTAR PEDIDOS ===== -->
+      <div class="card" id="step-pedidos">
+        <div class="card-header"><span class="step-number">1</span> Listar Pedidos <span class="card-badge badge-blue">Shopee + ML</span></div>
         <div class="card-body">
-          <p style="font-size:13px; color:#64748b; margin-bottom:14px;">Insira o Order SN da Shopee e processe automaticamente: busca no Tiny, gera NF e envia para a Shopee — tudo em um clique.</p>
-          <button class="btn btn-primary" onclick="openProcessarPedido()" style="background:#3b82f6; font-size: 15px; padding: 12px 28px;">Processar Pedido Individual</button>
-        </div>
-      </div>
+          <p style="font-size:13px; color:#64748b; margin-bottom:16px;">Sincronize pedidos dos marketplaces, gere NFs automaticamente e acompanhe o status.</p>
 
-      <!-- Sync Actions -->
-      <div class="card" id="sync">
-        <div class="card-header">🛒 Shopee — NF com ${config.shopeeDiscountPercent}% de Desconto</div>
-        <div class="card-body">
-          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; padding:12px 16px; background:${automationPaused ? '#fffbeb' : '#f0fdf4'}; border-radius:8px; border:1px solid ${automationPaused ? '#fde68a' : '#bbf7d0'};">
-            <div>
-              <strong style="font-size:14px;">${automationPaused ? '⏸ Automação Pausada' : '▶ Automação Ativa'}</strong>
-              <div style="font-size:12px;color:#888;margin-top:2px;" id="autoLabel">${automationPaused ? 'Apenas sincronização manual funciona' : 'Sincronizando automaticamente a cada ' + config.pollIntervalMinutes + ' min'}</div>
-            </div>
-            <button class="btn ${automationPaused ? 'btn-primary' : 'btn-secondary'} btn-sm" id="btnToggle" onclick="toggleAuto()">${automationPaused ? '▶ Ativar' : '⏸ Pausar'}</button>
+          <div class="tab-bar">
+            <button class="tab-btn active" onclick="switchTab('pedidos','shopee')">🛒 Shopee</button>
+            <button class="tab-btn" onclick="switchTab('pedidos','ml')">🏪 Mercado Livre</button>
           </div>
 
-          <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px;">
-            <div style="font-size:13px;color:#666;">Última execução:</div>
-            <div style="font-size:13px;font-weight:600;" id="lastSync">${lastRunText}</div>
-            <div style="font-size:11px;color:#999;" id="autoStatus">${automationPaused ? '⏸ Pausada' : 'Auto a cada ' + config.pollIntervalMinutes + ' min'}</div>
-          </div>
-
-          <div id="msgToggle" class="msg msg-ok"></div>
-          <div id="msgRun" class="msg msg-ok"></div>
-          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin: 16px 0;">
-            <button class="btn btn-primary" id="btnSync" onclick="syncNow()">▶ Sincronizar Shopee Agora</button>
-            <span style="font-size:13px; color:#999;">Busca pedidos Shopee de ontem e hoje e emite NF com ${config.shopeeDiscountPercent}% de desconto</span>
-          </div>
-
-          <div style="padding:12px 16px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0; margin-bottom:16px;">
-            <p style="font-size:12px; color:#64748b; margin-bottom:8px; font-weight:600;">Filtro por N° do Pedido (opcional)</p>
-            <div class="inline-form" style="margin-bottom:0;">
-              <div class="form-sm">
-                <label>De (Order SN)</label>
-                <input type="text" id="syncFromSn" placeholder="Ex: 260621MFN2GF8A" style="width:180px; text-transform:uppercase;">
-              </div>
-              <div class="form-sm">
-                <label>Até (Order SN)</label>
-                <input type="text" id="syncToSn" placeholder="Ex: 260623NNQ35E3G" style="width:180px; text-transform:uppercase;">
-              </div>
-              <span style="font-size:11px; color:#94a3b8; align-self:center;">Deixe vazio para processar todos</span>
-            </div>
-          </div>
-
-          <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
-          <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Reprocessar Período Específico (Shopee)</p>
-          <div id="msgReprocess" class="msg msg-ok"></div>
-          <div class="inline-form">
-            <div class="form-sm">
-              <label>Data Inicial</label>
-              <input type="text" id="de" placeholder="dd/mm/aaaa" maxlength="10">
-            </div>
-            <div class="form-sm">
-              <label>Data Final</label>
-              <input type="text" id="ate" placeholder="dd/mm/aaaa" maxlength="10">
-            </div>
-            <button class="btn btn-secondary btn-sm" id="btnReprocess" onclick="reprocessar()">🔄 Reprocessar Shopee</button>
-          </div>
-
-          <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
-          <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">CSV para Upload em Massa na Shopee</p>
-          <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Baixe a planilha com "ID do pedido" + "Chave de Acesso" para upload na aba "Enviar nota em massa" da Shopee.</p>
-          <div id="msgCSV" class="msg msg-ok"></div>
-          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:16px;">
-            <button class="btn btn-primary btn-sm" onclick="downloadXLSX()" style="background:#16a34a;">📥 Baixar Planilha (.xlsx)</button>
-            <button class="btn btn-secondary btn-sm" onclick="downloadCSV()">📥 Baixar CSV</button>
-            <button class="btn btn-secondary btn-sm" onclick="clearCSV()">🗑 Limpar</button>
-            <span id="csvInfo" style="font-size:12px; color:#888;"></span>
-          </div>
-
-          <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
-          <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Relatório de Separação (Picking List)</p>
-          <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Puxa direto da Shopee API todos os pedidos prontos para envio (A Enviar + Processados). Mostra SKU, produto e quantidade para separação no estoque. Filtro por NF disponível.</p>
-          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin-bottom:8px;">
-            <div class="form-sm">
-              <label>De (Order SN)</label>
-              <input type="text" id="pickFromSn" placeholder="Ex: 260621..." style="width:170px; text-transform:uppercase;">
-            </div>
-            <div class="form-sm">
-              <label>Até (Order SN)</label>
-              <input type="text" id="pickToSn" placeholder="Ex: 260623..." style="width:170px; text-transform:uppercase;">
-            </div>
-            <button class="btn btn-primary btn-sm" onclick="openPickingList()" style="background:#7c3aed;">📋 Gerar Relatório de Separação</button>
-            <span style="font-size:11px; color:#94a3b8; align-self:center;">Vazio = todos os pedidos</span>
-          </div>
-
-          <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
-          <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Enviar NFs já existentes para a Shopee (retroativo)</p>
-          <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Busca pedidos Shopee que já possuem NF emitida no Tiny e envia a chave de acesso para a API da Shopee. Útil para NFs geradas antes da integração direta.</p>
-          <div id="msgShopeeNF" class="msg msg-ok"></div>
-          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end;">
-            <button class="btn btn-primary btn-sm" id="btnShopeeNF" onclick="sendNFsToShopee()">📤 Enviar NFs para Shopee</button>
-            <div class="form-sm">
-              <label>De (opcional)</label>
-              <input type="text" id="shopeeNfDe" placeholder="dd/mm/aaaa" maxlength="10">
-            </div>
-            <div class="form-sm">
-              <label>Até (opcional)</label>
-              <input type="text" id="shopeeNfAte" placeholder="dd/mm/aaaa" maxlength="10">
-            </div>
-          </div>
-          <div id="shopeeConnStatus" style="margin-top:12px; font-size:12px; color:#888;"></div>
-        </div>
-      </div>
-
-      <!-- Shopee Labels Section -->
-      <div class="card" id="shopee-labels">
-        <div class="card-header">🏷️ Etiquetas Shopee</div>
-        <div class="card-body">
-          <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Gere e baixe etiquetas de envio da Shopee. O sistema faz ship_order + create + download automaticamente.</p>
-          <div id="msgLabel" class="msg msg-ok"></div>
-
-          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin-bottom:12px;">
-            <div class="form-sm">
-              <label>Order SN</label>
-              <input type="text" id="labelOrderSn" placeholder="Ex: 260519S0A4X2H9" style="width:180px;">
-            </div>
-            <button class="btn btn-primary btn-sm" id="btnDownloadLabel" onclick="downloadLabel()">📦 Baixar Etiqueta</button>
-            <button class="btn btn-secondary btn-sm" id="btnDiagnoseLabel" onclick="diagnoseLabel()">🔍 Diagnosticar</button>
-            <button class="btn btn-secondary btn-sm" id="btnTestLogistics" onclick="testLogistics()">🧪 Testar API</button>
-          </div>
-
-          <div style="padding:12px 16px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0; margin-bottom:12px;">
-            <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin-bottom:10px;">
-              <div class="form-sm">
-                <label>De (Order SN)</label>
-                <input type="text" id="labelFromSn" placeholder="Ex: 260621..." style="width:170px; text-transform:uppercase;">
-              </div>
-              <div class="form-sm">
-                <label>Até (Order SN)</label>
-                <input type="text" id="labelToSn" placeholder="Ex: 260623..." style="width:170px; text-transform:uppercase;">
-              </div>
-              <span style="font-size:11px; color:#94a3b8; align-self:center;">Vazio = todos os pedidos</span>
-            </div>
-            <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
-              <button class="btn btn-primary btn-sm" id="btnListLabels" onclick="listAvailableLabels()">📋 Listar Pedidos</button>
-              <button class="btn btn-primary btn-sm" id="btnBatchShopee" onclick="batchDownloadShopee()" style="background:#16a34a;">📥 Baixar Todas Etiquetas (PDF único)</button>
-              <span id="labelsAvailableInfo" style="font-size:12px; color:#888;"></span>
-            </div>
-          </div>
-
-          <div id="labelsListBox" style="display:none; margin-top:8px; max-height:300px; overflow-y:auto;">
-            <table id="labelsTable"><thead><tr><th>Order SN</th><th>Status</th><th>NF</th><th>Ação</th></tr></thead><tbody id="labelsTableBody"></tbody></table>
-          </div>
-
-          <div id="logisticsResult" style="display:none; margin-top:8px;">
-            <pre id="logisticsResultPre" style="background:#f8fafc; padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap; border:1px solid #e2e8f0; max-height:250px; overflow-y:auto;"></pre>
-          </div>
-        </div>
-      </div>
-
-      <!-- Mercado Livre Processing -->
-      <div class="card" id="ml-sync">
-        <div class="card-header">
-          🏪 Mercado Livre — NF com ${config.mlDiscountPercent}% de Desconto (CPF)
-          <span class="card-badge" id="mlHeaderBadge">...</span>
-        </div>
-        <div class="card-body">
-          <div id="mlNotConnected" style="display:none; padding:16px; background:#fffbeb; border-radius:8px; border:1px solid #fde68a; margin-bottom:16px;">
-            <strong style="font-size:14px;">⚠ Conta Mercado Livre não conectada</strong>
-            <div style="font-size:12px;color:#888;margin:6px 0 12px;">Você precisa autorizar o SyncHub a acessar sua conta ML antes de processar pedidos.</div>
-            <a href="/ml/connect" class="btn btn-primary btn-sm" style="text-decoration:none;">🔗 Conectar conta Mercado Livre</a>
-          </div>
-          <div id="mlConnected" style="display:none;">
-            <div style="padding:12px 16px; background:#f0fdf4; border-radius:8px; border:1px solid #bbf7d0; margin-bottom:16px; display:flex; justify-content:space-between; align-items:center;">
+          <!-- Shopee Tab -->
+          <div class="tab-pane active" id="pedidos-shopee">
+            <span id="sync"></span>
+            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; padding:12px 16px; background:${automationPaused ? '#fffbeb' : '#f0fdf4'}; border-radius:8px; border:1px solid ${automationPaused ? '#fde68a' : '#bbf7d0'};">
               <div>
-                <strong style="font-size:14px;">✓ Conta ML conectada</strong>
-                <div style="font-size:12px;color:#666;margin-top:2px;">Seller ID: <span id="mlSellerId" style="font-family:monospace;">...</span></div>
+                <strong style="font-size:14px;">${automationPaused ? '⏸ Automação Pausada' : '▶ Automação Ativa'}</strong>
+                <div style="font-size:12px;color:#888;margin-top:2px;" id="autoLabel">${automationPaused ? 'Apenas sincronização manual funciona' : 'Sincronizando automaticamente a cada ' + config.pollIntervalMinutes + ' min'}</div>
               </div>
-              <button class="btn btn-secondary btn-sm" onclick="mlDisconnect()">Desconectar</button>
+              <button class="btn ${automationPaused ? 'btn-primary' : 'btn-secondary'} btn-sm" id="btnToggle" onclick="toggleAuto()">${automationPaused ? '▶ Ativar' : '⏸ Pausar'}</button>
             </div>
 
-            <p style="font-size:13px; color:#666; margin-bottom:14px;">
-              Gera NF para os pedidos do Mercado Livre cuja <strong>data de coleta</strong> seja o dia escolhido. Apenas <strong>CPF</strong> (Pessoa Física), com desconto de <strong>${config.mlDiscountPercent}%</strong> sobre o valor dos produtos. Pedidos que já têm NF são ignorados.
-            </p>
-
-            <div id="msgML" class="msg msg-ok"></div>
-
-            <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px;">
-              <button class="btn btn-primary btn-sm" onclick="mlQuickRun('hoje')" id="btnMLHoje">📅 Coleta Hoje</button>
-              <button class="btn btn-primary btn-sm" onclick="mlQuickRun('amanha')" id="btnMLAmanha">📅 Coleta Amanhã</button>
-              <button class="btn btn-secondary btn-sm" onclick="mlDebug()" id="btnMLDebug">🔍 Inspecionar API ML</button>
-              <button class="btn btn-secondary btn-sm" onclick="mlClearCache()" id="btnMLClearCache" style="background:#ef4444;color:#fff;border-color:#ef4444;">🗑 Limpar Cache ML</button>
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px;">
+              <div style="font-size:13px;color:#666;">Última execução:</div>
+              <div style="font-size:13px;font-weight:600;" id="lastSync">${lastRunText}</div>
+              <div style="font-size:11px;color:#999;" id="autoStatus">${automationPaused ? '⏸ Pausada' : 'Auto a cada ' + config.pollIntervalMinutes + ' min'}</div>
             </div>
 
-            <hr style="border:none; border-top:1px solid #f0f0f0; margin: 6px 0 14px;">
-            <p style="font-size:12px; color:#888; margin-bottom:10px; font-weight:600;">Ou escolha um dia específico de coleta</p>
+            <div id="msgToggle" class="msg msg-ok"></div>
+            <div id="msgRun" class="msg msg-ok"></div>
+            <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin: 16px 0;">
+              <button class="btn btn-primary" id="btnSync" onclick="syncNow()">▶ Sincronizar Shopee Agora</button>
+              <span style="font-size:13px; color:#999;">Busca pedidos de ontem/hoje e emite NF com desconto da lista de preço</span>
+            </div>
+
+            <div style="padding:12px 16px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0; margin-bottom:16px;">
+              <p style="font-size:12px; color:#64748b; margin-bottom:8px; font-weight:600;">Filtro por N° do Pedido (opcional)</p>
+              <div class="inline-form" style="margin-bottom:0;">
+                <div class="form-sm">
+                  <label>De (Order SN)</label>
+                  <input type="text" id="syncFromSn" placeholder="Ex: 260621MFN2GF8A" style="width:180px; text-transform:uppercase;">
+                </div>
+                <div class="form-sm">
+                  <label>Até (Order SN)</label>
+                  <input type="text" id="syncToSn" placeholder="Ex: 260623NNQ35E3G" style="width:180px; text-transform:uppercase;">
+                </div>
+                <span style="font-size:11px; color:#94a3b8; align-self:center;">Deixe vazio para processar todos</span>
+              </div>
+            </div>
+
+            <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
+            <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Reprocessar Período Específico</p>
+            <div id="msgReprocess" class="msg msg-ok"></div>
             <div class="inline-form">
               <div class="form-sm">
-                <label>Data de coleta</label>
-                <input type="text" id="mlDate" placeholder="dd/mm/aaaa" maxlength="10">
+                <label>Data Inicial</label>
+                <input type="text" id="de" placeholder="dd/mm/aaaa" maxlength="10">
               </div>
-              <button class="btn btn-secondary btn-sm" id="btnML" onclick="processMLDay()">🏪 Gerar NFs</button>
+              <div class="form-sm">
+                <label>Data Final</label>
+                <input type="text" id="ate" placeholder="dd/mm/aaaa" maxlength="10">
+              </div>
+              <button class="btn btn-secondary btn-sm" id="btnReprocess" onclick="reprocessar()">🔄 Reprocessar</button>
             </div>
+            <div id="shopeeConnStatus" style="margin-top:12px; font-size:12px; color:#888;"></div>
+          </div>
 
-            <div id="mlLastResultBox" style="margin-top:16px; display:none;">
-              <p style="font-size:12px;color:#888;font-weight:600;margin-bottom:6px;">Último processamento ML:</p>
-              <pre id="mlLastResult" style="background:#f8fafc; padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap; border:1px solid #e2e8f0;"></pre>
+          <!-- ML Tab -->
+          <div class="tab-pane" id="pedidos-ml">
+            <span id="ml-sync"></span>
+            <span id="mlHeaderBadge" style="display:none;"></span>
+            <div id="mlNotConnected" style="display:none; padding:16px; background:#fffbeb; border-radius:8px; border:1px solid #fde68a; margin-bottom:16px;">
+              <strong style="font-size:14px;">⚠ Conta Mercado Livre não conectada</strong>
+              <div style="font-size:12px;color:#888;margin:6px 0 12px;">Autorize o SyncHub a acessar sua conta ML antes de processar pedidos.</div>
+              <a href="/ml/connect" class="btn btn-primary btn-sm" style="text-decoration:none;">🔗 Conectar conta Mercado Livre</a>
             </div>
+            <div id="mlConnected" style="display:none;">
+              <div style="padding:12px 16px; background:#f0fdf4; border-radius:8px; border:1px solid #bbf7d0; margin-bottom:16px; display:flex; justify-content:space-between; align-items:center;">
+                <div>
+                  <strong style="font-size:14px;">✓ Conta ML conectada</strong>
+                  <div style="font-size:12px;color:#666;margin-top:2px;">Seller ID: <span id="mlSellerId" style="font-family:monospace;">...</span></div>
+                </div>
+                <button class="btn btn-secondary btn-sm" onclick="mlDisconnect()">Desconectar</button>
+              </div>
 
-            <hr style="border:none; border-top:1px solid #f0f0f0; margin: 14px 0;">
-            <p style="font-size:12px; color:#888; margin-bottom:10px; font-weight:600;">Inspecionar pedido ML específico</p>
-            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-              <input type="text" id="mlInspectOrderId" placeholder="Nº pedido ML (ex: 2000013682785673)" style="width:280px; padding:6px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px; font-family:monospace;">
-              <button class="btn btn-secondary btn-sm" onclick="mlInspectOrder()" id="btnMLInspect">🔍 Inspecionar</button>
-            </div>
-            <div id="mlInspectResult" style="display:none; margin-top:10px;">
-              <pre id="mlInspectPre" style="background:#f8fafc; padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap; border:1px solid #e2e8f0; max-height:300px; overflow-y:auto;"></pre>
+              <p style="font-size:13px; color:#666; margin-bottom:14px;">
+                Gera NF para pedidos ML pela <strong>data de coleta</strong>. Apenas <strong>CPF</strong> (Pessoa Física), com desconto da <strong>lista de preço</strong>. Pedidos com NF existente são ignorados.
+              </p>
+
+              <div id="msgML" class="msg msg-ok"></div>
+
+              <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px;">
+                <button class="btn btn-primary btn-sm" onclick="mlQuickRun('hoje')" id="btnMLHoje">📅 Coleta Hoje</button>
+                <button class="btn btn-primary btn-sm" onclick="mlQuickRun('amanha')" id="btnMLAmanha">📅 Coleta Amanhã</button>
+                <button class="btn btn-secondary btn-sm" onclick="mlDebug()" id="btnMLDebug">🔍 Inspecionar API</button>
+                <button class="btn btn-secondary btn-sm" onclick="mlClearCache()" id="btnMLClearCache" style="background:#ef4444;color:#fff;border-color:#ef4444;">🗑 Limpar Cache</button>
+              </div>
+
+              <hr style="border:none; border-top:1px solid #f0f0f0; margin: 6px 0 14px;">
+              <p style="font-size:12px; color:#888; margin-bottom:10px; font-weight:600;">Ou escolha um dia específico de coleta</p>
+              <div class="inline-form">
+                <div class="form-sm">
+                  <label>Data de coleta</label>
+                  <input type="text" id="mlDate" placeholder="dd/mm/aaaa" maxlength="10">
+                </div>
+                <button class="btn btn-secondary btn-sm" id="btnML" onclick="processMLDay()">🏪 Gerar NFs</button>
+              </div>
+
+              <div id="mlLastResultBox" style="margin-top:16px; display:none;">
+                <p style="font-size:12px;color:#888;font-weight:600;margin-bottom:6px;">Último processamento ML:</p>
+                <pre id="mlLastResult" style="background:#f8fafc; padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap; border:1px solid #e2e8f0;"></pre>
+              </div>
+
+              <hr style="border:none; border-top:1px solid #f0f0f0; margin: 14px 0;">
+              <p style="font-size:12px; color:#888; margin-bottom:10px; font-weight:600;">Inspecionar pedido ML específico</p>
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <input type="text" id="mlInspectOrderId" placeholder="Nº pedido ML (ex: 2000013682785673)" style="width:280px; padding:6px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px; font-family:monospace;">
+                <button class="btn btn-secondary btn-sm" onclick="mlInspectOrder()" id="btnMLInspect">🔍 Inspecionar</button>
+              </div>
+              <div id="mlInspectResult" style="display:none; margin-top:10px;">
+                <pre id="mlInspectPre" style="background:#f8fafc; padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap; border:1px solid #e2e8f0; max-height:300px; overflow-y:auto;"></pre>
+              </div>
             </div>
           </div>
+
+          <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
+          <button class="btn btn-primary" onclick="openProcessarPedido()" style="background:#3b82f6;">🎯 Processar Pedido Individual (Shopee)</button>
+          <span style="font-size:12px; color:#999; margin-left:8px;">Busca no Tiny + gera NF + envia para Shopee</span>
         </div>
       </div>
 
-      <!-- ML Labels Section -->
-      <div class="card" id="ml-labels">
-        <div class="card-header">🏷️ Etiquetas Mercado Livre</div>
+      <!-- ===== PASSO 2: EMITIR NOTAS ===== -->
+      <div class="card" id="step-emitir">
+        <div class="card-header"><span class="step-number">2</span> Emitir Notas Fiscais</div>
         <div class="card-body">
-          <div id="mlLabelsNotConnected" style="display:none; padding:16px; background:#fffbeb; border-radius:8px; border:1px solid #fde68a; margin-bottom:16px;">
-            <strong style="font-size:14px;">⚠ Conta ML não conectada</strong>
-            <div style="font-size:12px;color:#888;margin:6px 0 12px;">Conecte a conta ML acima para baixar etiquetas.</div>
+          <p style="font-size:13px; color:#64748b; margin-bottom:16px;">NFs são emitidas automaticamente ao sincronizar pedidos no Passo 1. O desconto é aplicado pela lista de preço do Tiny.</p>
+
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:20px;">
+            <div style="padding:14px 18px; background:#fff1ee; border-radius:10px; border:1px solid #fed7aa;">
+              <div style="font-size:14px; font-weight:700; margin-bottom:4px;">🛒 Shopee</div>
+              <div style="font-size:12px; color:#666;">Desconto: <strong>${config.shopeeDiscountPercent}%</strong> (Lista de Preço SHOPEE)</div>
+              <div style="font-size:11px; color:#999; margin-top:2px;">Emissão automática ao sincronizar no Passo 1</div>
+            </div>
+            <div style="padding:14px 18px; background:#fff8e1; border-radius:10px; border:1px solid #fde68a;">
+              <div style="font-size:14px; font-weight:700; margin-bottom:4px;">🏪 Mercado Livre</div>
+              <div style="font-size:12px; color:#666;">Desconto: <strong>${config.mlDiscountPercent}%</strong> (CPF, Lista de Preço ML)</div>
+              <div style="font-size:11px; color:#999; margin-top:2px;">Emissão via Coleta Hoje/Amanhã no Passo 1</div>
+            </div>
           </div>
-          <div id="mlLabelsConnected" style="display:none;">
-            <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Baixe etiquetas de envio dos pedidos do Mercado Livre.</p>
-            <div id="msgMLLabel" class="msg msg-ok"></div>
 
-            <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:12px; padding:12px 16px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0;">
-              <label style="font-size:12px; color:#666;">Pedido:</label>
-              <input type="text" id="mlLabelOrderId" placeholder="Nº do pedido ML" style="width:180px; padding:4px 8px; border:1px solid #e2e8f0; border-radius:4px; font-size:12px;">
-              <button class="btn btn-primary btn-sm" id="btnMLLabelByOrder" onclick="downloadMLLabelByOrder()">📦 Baixar Etiqueta</button>
-              <span style="color:#ccc; font-size:12px;">|</span>
-              <label style="font-size:12px; color:#666;">Período:</label>
-              <select id="mlDaysBack" style="padding:4px 8px; border:1px solid #e2e8f0; border-radius:4px; font-size:12px;">
-                <option value="1">1 dia</option>
-                <option value="3" selected>3 dias</option>
-                <option value="7">7 dias</option>
+          <hr style="border:none; border-top:1px solid #f0f0f0; margin: 16px 0;">
+          <p style="font-size:13px; color:#888; margin-bottom:10px; font-weight:600;">Emitir NF Manual (por pedido)</p>
+          <p style="font-size:12px; color:#aaa; margin-bottom:10px;">Cria NF via nota.fiscal.incluir com valores reduzidos pela lista de preço. Preview mostra valores antes/depois.</p>
+          <div id="msgTestLP" class="msg msg-ok"></div>
+          <div style="display:flex; gap:8px; align-items:end; flex-wrap:wrap;">
+            <div class="form-sm">
+              <label>Nº Pedido (Tiny ou Ecommerce)</label>
+              <input type="text" id="testLPPedidoId" placeholder="ex: 243787 ou 58466..." style="width:200px;">
+            </div>
+            <div class="form-sm">
+              <label>Lista de Preço</label>
+              <select id="testLPListaId" style="padding:6px 8px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;">
+                <option value="0">Padrão (0)</option>
+                <option value="418">SHOPEE (418)</option>
+                <option value="419">ML (419)</option>
               </select>
-              <button class="btn btn-primary btn-sm" id="btnListMLLabels" onclick="listMLLabels()">📋 Listar Pedidos</button>
-              <button class="btn btn-primary btn-sm" id="btnBatchML" onclick="batchDownloadML()" style="background:#16a34a;">📥 Baixar Todas</button>
-              <span id="mlLabelsInfo" style="font-size:12px; color:#888;"></span>
+            </div>
+            <button class="btn btn-secondary btn-sm" onclick="testListaPreco(false)" id="btnTestLP">🔍 Preview</button>
+            <button class="btn btn-secondary btn-sm" onclick="testListaPreco(true)" id="btnCriarNF" style="background:#16a34a;">📄 Criar NF</button>
+          </div>
+          <div id="testLPResult" style="display:none; margin-top:10px;">
+            <div id="testLPPreview"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== PASSO 3: ENVIAR NOTAS ===== -->
+      <div class="card" id="step-enviar">
+        <div class="card-header"><span class="step-number">3</span> Enviar Notas para Marketplaces</div>
+        <div class="card-body">
+          <p style="font-size:13px; color:#64748b; margin-bottom:16px;">Envie as NFs emitidas para os marketplaces via API ou planilha.</p>
+
+          <div class="tab-bar">
+            <button class="tab-btn active" onclick="switchTab('enviar','shopee')">🛒 Shopee</button>
+            <button class="tab-btn" onclick="switchTab('enviar','ml')">🏪 Mercado Livre</button>
+          </div>
+
+          <!-- Shopee Send Tab -->
+          <div class="tab-pane active" id="enviar-shopee">
+            <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Enviar NFs para a Shopee (retroativo)</p>
+            <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Busca pedidos Shopee que já possuem NF emitida no Tiny e envia a chave de acesso via API.</p>
+            <div id="msgShopeeNF" class="msg msg-ok"></div>
+            <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin-bottom:16px;">
+              <button class="btn btn-primary btn-sm" id="btnShopeeNF" onclick="sendNFsToShopee()">📤 Enviar NFs para Shopee</button>
+              <div class="form-sm">
+                <label>De (opcional)</label>
+                <input type="text" id="shopeeNfDe" placeholder="dd/mm/aaaa" maxlength="10">
+              </div>
+              <div class="form-sm">
+                <label>Até (opcional)</label>
+                <input type="text" id="shopeeNfAte" placeholder="dd/mm/aaaa" maxlength="10">
+              </div>
             </div>
 
-            <div id="mlLabelsListBox" style="display:none; margin-top:8px; max-height:300px; overflow-y:auto;">
-              <table id="mlLabelsTable"><thead><tr><th>Pedido</th><th>Shipment</th><th>Status</th><th>Valor</th><th>Ação</th></tr></thead><tbody id="mlLabelsTableBody"></tbody></table>
+            <hr style="border:none; border-top:1px solid #f0f0f0; margin: 16px 0;">
+            <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Planilha para Upload em Massa</p>
+            <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Baixe a planilha com "ID do pedido" + "Chave de Acesso" para upload na aba "Enviar nota em massa" da Shopee.</p>
+            <div id="msgCSV" class="msg msg-ok"></div>
+            <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+              <button class="btn btn-primary btn-sm" onclick="downloadXLSX()" style="background:#16a34a;">📥 Baixar Planilha (.xlsx)</button>
+              <button class="btn btn-secondary btn-sm" onclick="downloadCSV()">📥 Baixar CSV</button>
+              <button class="btn btn-secondary btn-sm" onclick="clearCSV()">🗑 Limpar</button>
+              <span id="csvInfo" style="font-size:12px; color:#888;"></span>
             </div>
+          </div>
 
-            <div id="mlLabelResult" style="display:none; margin-top:8px;">
-              <pre id="mlLabelResultPre" style="background:#f8fafc; padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap; border:1px solid #e2e8f0; max-height:250px; overflow-y:auto;"></pre>
+          <!-- ML Send Tab -->
+          <div class="tab-pane" id="enviar-ml">
+            <div style="padding:14px 18px; background:#f8fafc; border-radius:10px; border:1px solid #e2e8f0;">
+              <p style="font-size:13px; color:#555;">O Tiny envia automaticamente a NF para o Mercado Livre quando o campo <strong>"Ecommerce"</strong> da nota está preenchido.</p>
+              <p style="font-size:12px; color:#888; margin-top:6px;">A NF criada pelo SyncHub já inclui o campo ecommerce. Verifique no painel do Tiny se a integração com ML está ativa.</p>
             </div>
           </div>
         </div>
       </div>
+
+      <!-- ===== PASSO 4: ETIQUETAS & SEPARAÇÃO ===== -->
+      <div class="card" id="step-etiquetas">
+        <div class="card-header"><span class="step-number">4</span> Etiquetas & Separação</div>
+        <div class="card-body">
+          <div class="tab-bar">
+            <button class="tab-btn active" onclick="switchTab('etiquetas','shopee')">🛒 Shopee</button>
+            <button class="tab-btn" onclick="switchTab('etiquetas','ml')">🏪 Mercado Livre</button>
+            <button class="tab-btn" onclick="switchTab('etiquetas','separacao')">📋 Separação</button>
+          </div>
+
+          <!-- Shopee Labels Tab -->
+          <div class="tab-pane active" id="etiquetas-shopee">
+            <span id="shopee-labels"></span>
+            <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Gere e baixe etiquetas de envio da Shopee.</p>
+            <div id="msgLabel" class="msg msg-ok"></div>
+
+            <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin-bottom:12px;">
+              <div class="form-sm">
+                <label>Order SN</label>
+                <input type="text" id="labelOrderSn" placeholder="Ex: 260519S0A4X2H9" style="width:180px;">
+              </div>
+              <button class="btn btn-primary btn-sm" id="btnDownloadLabel" onclick="downloadLabel()">📦 Baixar Etiqueta</button>
+              <button class="btn btn-secondary btn-sm" id="btnDiagnoseLabel" onclick="diagnoseLabel()">🔍 Diagnosticar</button>
+              <button class="btn btn-secondary btn-sm" id="btnTestLogistics" onclick="testLogistics()">🧪 Testar API</button>
+            </div>
+
+            <div style="padding:12px 16px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0; margin-bottom:12px;">
+              <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin-bottom:10px;">
+                <div class="form-sm">
+                  <label>De (Order SN)</label>
+                  <input type="text" id="labelFromSn" placeholder="Ex: 260621..." style="width:170px; text-transform:uppercase;">
+                </div>
+                <div class="form-sm">
+                  <label>Até (Order SN)</label>
+                  <input type="text" id="labelToSn" placeholder="Ex: 260623..." style="width:170px; text-transform:uppercase;">
+                </div>
+                <span style="font-size:11px; color:#94a3b8; align-self:center;">Vazio = todos</span>
+              </div>
+              <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+                <button class="btn btn-primary btn-sm" id="btnListLabels" onclick="listAvailableLabels()">📋 Listar Pedidos</button>
+                <button class="btn btn-primary btn-sm" id="btnBatchShopee" onclick="batchDownloadShopee()" style="background:#16a34a;">📥 Baixar Todas (PDF único)</button>
+                <span id="labelsAvailableInfo" style="font-size:12px; color:#888;"></span>
+              </div>
+            </div>
+
+            <div id="labelsListBox" style="display:none; margin-top:8px; max-height:300px; overflow-y:auto;">
+              <table id="labelsTable"><thead><tr><th>Order SN</th><th>Status</th><th>NF</th><th>Ação</th></tr></thead><tbody id="labelsTableBody"></tbody></table>
+            </div>
+
+            <div id="logisticsResult" style="display:none; margin-top:8px;">
+              <pre id="logisticsResultPre" style="background:#f8fafc; padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap; border:1px solid #e2e8f0; max-height:250px; overflow-y:auto;"></pre>
+            </div>
+          </div>
+
+          <!-- ML Labels Tab -->
+          <div class="tab-pane" id="etiquetas-ml">
+            <span id="ml-labels"></span>
+            <div id="mlLabelsNotConnected" style="display:none; padding:16px; background:#fffbeb; border-radius:8px; border:1px solid #fde68a; margin-bottom:16px;">
+              <strong style="font-size:14px;">⚠ Conta ML não conectada</strong>
+              <div style="font-size:12px;color:#888;margin:6px 0 12px;">Conecte a conta ML no Passo 1 para baixar etiquetas.</div>
+            </div>
+            <div id="mlLabelsConnected" style="display:none;">
+              <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Baixe etiquetas de envio dos pedidos do Mercado Livre.</p>
+              <div id="msgMLLabel" class="msg msg-ok"></div>
+
+              <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:12px; padding:12px 16px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0;">
+                <label style="font-size:12px; color:#666;">Pedido:</label>
+                <input type="text" id="mlLabelOrderId" placeholder="Nº do pedido ML" style="width:180px; padding:4px 8px; border:1px solid #e2e8f0; border-radius:4px; font-size:12px;">
+                <button class="btn btn-primary btn-sm" id="btnMLLabelByOrder" onclick="downloadMLLabelByOrder()">📦 Baixar Etiqueta</button>
+                <span style="color:#ccc; font-size:12px;">|</span>
+                <label style="font-size:12px; color:#666;">Período:</label>
+                <select id="mlDaysBack" style="padding:4px 8px; border:1px solid #e2e8f0; border-radius:4px; font-size:12px;">
+                  <option value="1">1 dia</option>
+                  <option value="3" selected>3 dias</option>
+                  <option value="7">7 dias</option>
+                </select>
+                <button class="btn btn-primary btn-sm" id="btnListMLLabels" onclick="listMLLabels()">📋 Listar</button>
+                <button class="btn btn-primary btn-sm" id="btnBatchML" onclick="batchDownloadML()" style="background:#16a34a;">📥 Baixar Todas</button>
+                <span id="mlLabelsInfo" style="font-size:12px; color:#888;"></span>
+              </div>
+
+              <div id="mlLabelsListBox" style="display:none; margin-top:8px; max-height:300px; overflow-y:auto;">
+                <table id="mlLabelsTable"><thead><tr><th>Pedido</th><th>Shipment</th><th>Status</th><th>Valor</th><th>Ação</th></tr></thead><tbody id="mlLabelsTableBody"></tbody></table>
+              </div>
+
+              <div id="mlLabelResult" style="display:none; margin-top:8px;">
+                <pre id="mlLabelResultPre" style="background:#f8fafc; padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap; border:1px solid #e2e8f0; max-height:250px; overflow-y:auto;"></pre>
+              </div>
+            </div>
+          </div>
+
+          <!-- Separação Tab -->
+          <div class="tab-pane" id="etiquetas-separacao">
+            <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Relatório de Separação (Picking List)</p>
+            <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Puxa da Shopee API todos os pedidos prontos para envio. Mostra SKU, produto e quantidade para separação no estoque.</p>
+            <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin-bottom:8px;">
+              <div class="form-sm">
+                <label>De (Order SN)</label>
+                <input type="text" id="pickFromSn" placeholder="Ex: 260621..." style="width:170px; text-transform:uppercase;">
+              </div>
+              <div class="form-sm">
+                <label>Até (Order SN)</label>
+                <input type="text" id="pickToSn" placeholder="Ex: 260623..." style="width:170px; text-transform:uppercase;">
+              </div>
+              <button class="btn btn-primary btn-sm" onclick="openPickingList()" style="background:#7c3aed;">📋 Gerar Relatório de Separação</button>
+              <span style="font-size:11px; color:#94a3b8; align-self:center;">Vazio = todos os pedidos</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== CONSULTAS ===== -->
 
       <!-- NFs Table -->
       <div class="card" id="nfs">
-        <div class="card-header">📋 Notas Fiscais Emitidas</div>
+        <div class="card-header">📋 Histórico de Notas Fiscais</div>
         <div class="card-body" style="padding: 12px 16px;">
           <div id="nfTable"><p class="empty">Nenhuma NF emitida ainda nesta sessão</p></div>
         </div>
@@ -3497,6 +3543,8 @@ function getDashboardHtml(): string {
         </div>
       </div>
 
+      <!-- ===== SISTEMA ===== -->
+
       <!-- Sync Logs -->
       <div class="card" id="logs">
         <div class="card-header">📄 Logs de Sincronização</div>
@@ -3504,41 +3552,6 @@ function getDashboardHtml(): string {
           <div class="log-container" id="logContainer">
             <div class="empty" style="color:#666;">Aguardando logs...</div>
           </div>
-        </div>
-      </div>
-
-      <!-- Last Result -->
-      <div class="card" id="test-lista-preco">
-        <div class="card-header">🧪 NF com Desconto (Lista de Preço)</div>
-        <div class="card-body">
-          <p style="font-size:12px; color:#888; margin-bottom:10px;">Cria NF via nota.fiscal.incluir com valores reduzidos pela lista de preço. Primeiro faz preview, depois pode criar a NF.</p>
-          <div id="msgTestLP" class="msg msg-ok"></div>
-          <div style="display:flex; gap:8px; align-items:end; flex-wrap:wrap;">
-            <div class="form-sm">
-              <label>Nº Pedido (Tiny ou Ecommerce)</label>
-              <input type="text" id="testLPPedidoId" placeholder="ex: 243787 ou 58466..." style="width:200px;">
-            </div>
-            <div class="form-sm">
-              <label>Lista de Preço</label>
-              <select id="testLPListaId" style="padding:6px 8px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px;">
-                <option value="0">Padrão (0)</option>
-                <option value="418">SHOPEE (418)</option>
-                <option value="419">ML (419)</option>
-              </select>
-            </div>
-            <button class="btn btn-secondary btn-sm" onclick="testListaPreco(false)" id="btnTestLP">🔍 Preview</button>
-            <button class="btn btn-secondary btn-sm" onclick="testListaPreco(true)" id="btnCriarNF" style="background:#16a34a;">📄 Criar NF</button>
-          </div>
-          <div id="testLPResult" style="display:none; margin-top:10px;">
-            <div id="testLPPreview"></div>
-          </div>
-        </div>
-      </div>
-
-      <div class="card" id="config">
-        <div class="card-header">📊 Último Resultado Detalhado</div>
-        <div class="card-body">
-          <pre id="result" style="background:#f8fafc; padding:15px; border-radius:8px; font-size:12px; overflow-x:auto; white-space:pre-wrap; border:1px solid #e2e8f0;">${lastResult ? JSON.stringify(lastResult, null, 2) : 'Nenhum resultado ainda'}</pre>
         </div>
       </div>
     </div>
@@ -3608,6 +3621,21 @@ function getDashboardHtml(): string {
       });
     }
 
+    function switchTab(group, tab) {
+      var panes = document.querySelectorAll('[id^="' + group + '-"]');
+      for (var i = 0; i < panes.length; i++) {
+        if (panes[i].classList.contains('tab-pane')) panes[i].classList.remove('active');
+      }
+      var target = document.getElementById(group + '-' + tab);
+      if (target) target.classList.add('active');
+      var card = target ? target.closest('.card') : null;
+      if (card) {
+        var btns = card.querySelectorAll('.tab-bar .tab-btn');
+        for (var j = 0; j < btns.length; j++) btns[j].classList.remove('active');
+      }
+      if (event && event.target) event.target.classList.add('active');
+    }
+
     // Sidebar nav scroll
     document.querySelectorAll('.sidebar nav a[href^="#"]').forEach(function(a) {
       a.addEventListener('click', function(e) {
@@ -3630,7 +3658,7 @@ function getDashboardHtml(): string {
         document.getElementById('totalOrders').textContent = d.totalOrdersSynced || '0';
         document.getElementById('totalNFs').textContent = d.totalNFsEmitted || '0';
         document.getElementById('autoStatus').textContent = d.automationPaused ? '⏸ Pausada' : 'Auto a cada ${config.pollIntervalMinutes} min';
-        if (d.lastResult) document.getElementById('result').textContent = JSON.stringify(d.lastResult, null, 2);
+        if (d.lastResult) { var rEl = document.getElementById('result'); if (rEl) rEl.textContent = JSON.stringify(d.lastResult, null, 2); }
         var csvEl = document.getElementById('csvInfo');
         if (csvEl) csvEl.textContent = (d.csvCount || 0) + ' NFs no CSV';
         renderNFTable(d.nfHistory);
