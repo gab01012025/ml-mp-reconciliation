@@ -231,14 +231,14 @@ const server = http.createServer(async (req, res) => {
   // Public: health
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.94', uptime: process.uptime() }));
+    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.95', uptime: process.uptime() }));
     return;
   }
 
   // Public: version check (for debugging deploys)
   if (url.pathname === '/version') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ version: 'v3.94', deployed: startTime.toISOString() }));
+    res.end(JSON.stringify({ version: 'v3.95', deployed: startTime.toISOString() }));
     return;
   }
 
@@ -445,6 +445,85 @@ const server = http.createServer(async (req, res) => {
       csvCount,
       logs: getLogs().slice(0, 50),
     }));
+  } else if (url.pathname === '/api/list-orders' && req.method === 'GET') {
+    // Lista pedidos do Tiny por período SEM processar — apenas consulta
+    const dataInicial = url.searchParams.get('de') || '';
+    const dataFinal = url.searchParams.get('ate') || '';
+    const marketplace = (url.searchParams.get('marketplace') || '').toLowerCase(); // 'shopee' | 'ml' | ''
+    const dateRegex = /^\d{2}\/\d{2}\/\d{4}$/;
+
+    if (!dataInicial || !dateRegex.test(dataInicial)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Data inicial (de) inválida. Use dd/mm/aaaa' }));
+      return;
+    }
+    if (!dataFinal || !dateRegex.test(dataFinal)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Data final (ate) inválida. Use dd/mm/aaaa' }));
+      return;
+    }
+
+    try {
+      // Busca todas as páginas de pedidos no Tiny
+      let page = 1;
+      let totalPages = 1;
+      const allOrders: Array<{ id: string; numero: string; numero_ecommerce: string; data_pedido: string; nome: string; valor: string; situacao: string }> = [];
+
+      while (page <= totalPages) {
+        const result = await tinyClient.searchOrders({ dataInicial, dataFinal, pagina: page });
+        totalPages = result.totalPages;
+        allOrders.push(...result.orders);
+        page++;
+        if (page <= totalPages) await new Promise(r => setTimeout(r, 1100));
+      }
+
+      // Regex Shopee: 6 dígitos (YYMMDD) + 8-10 alfanuméricos maiúsculos com pelo menos 1 letra
+      const SHOPEE_SN = /^\d{6}(?=[A-Z0-9]*[A-Z])[A-Z0-9]{8,10}$/;
+      const statusIgnorados = new Set(['Cancelado']);
+
+      // Classifica cada pedido
+      type OrderRow = {
+        id: string; numero: string; numero_ecommerce: string; data_pedido: string;
+        nome: string; valor: string; situacao: string; canal: string;
+        temNF: boolean;
+      };
+      const orders: OrderRow[] = [];
+
+      for (const o of allOrders) {
+        if (statusIgnorados.has(o.situacao)) continue;
+
+        const ne = o.numero_ecommerce;
+        let canal = 'Outro';
+        if (SHOPEE_SN.test(ne)) canal = 'Shopee';
+        else if (/^\d{10,}$/.test(ne)) canal = 'Mercado Livre';
+
+        if (marketplace === 'shopee' && canal !== 'Shopee') continue;
+        if (marketplace === 'ml' && canal !== 'Mercado Livre') continue;
+
+        const statusComNF = new Set(['Faturado', 'Atendido', 'Entregue', 'Pronto para envio']);
+        const temNF = statusComNF.has(o.situacao) || o.situacao === 'Enviado';
+
+        orders.push({ ...o, canal, temNF });
+      }
+
+      // Resumo
+      const totalShopee = orders.filter(o => o.canal === 'Shopee').length;
+      const totalML = orders.filter(o => o.canal === 'Mercado Livre').length;
+      const totalOutro = orders.filter(o => o.canal === 'Outro').length;
+      const pendentes = orders.filter(o => !o.temNF).length;
+      const comNF = orders.filter(o => o.temNF).length;
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        periodo: { de: dataInicial, ate: dataFinal },
+        resumo: { total: orders.length, shopee: totalShopee, ml: totalML, outro: totalOutro, pendentes, comNF },
+        pedidos: orders,
+      }));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
   } else if (url.pathname === '/run' && req.method === 'POST') {
     if (isRunning) {
       res.writeHead(409, { 'Content-Type': 'application/json' });
@@ -2832,7 +2911,7 @@ function getLoginHtml(error?: string): string {
       <div class="int-badge"><span class="dot"></span> Mercado Livre</div>
       <div class="int-badge"><span class="dot"></span> Tiny ERP</div>
     </div>
-    <div class="footer">SyncHub v3.94 — Integrador de Marketplaces e ERPs</div>
+    <div class="footer">SyncHub v3.95 — Integrador de Marketplaces e ERPs</div>
   </div>
   <script>
     if (localStorage.getItem('auth_token')) { window.location.href = '/'; }
@@ -3035,7 +3114,7 @@ function getDashboardHtml(): string {
       <div class="section-label">Sistema</div>
       <a href="#logs"><span class="icon">📄</span> Logs</a>
     </nav>
-    <div class="sidebar-footer">SyncHub v3.94<br>Integrador ERP/HUB</div>
+    <div class="sidebar-footer">SyncHub v3.95<br>Integrador ERP/HUB</div>
   </div>
 
   <!-- Main -->
@@ -3164,130 +3243,182 @@ function getDashboardHtml(): string {
       <div class="card" id="step-pedidos">
         <div class="card-header"><span class="step-number">1</span> Listar Pedidos <span class="card-badge badge-blue">Shopee + ML</span></div>
         <div class="card-body">
-          <p style="font-size:13px; color:#64748b; margin-bottom:16px;">Sincronize pedidos dos marketplaces, gere NFs automaticamente e acompanhe o status.</p>
+          <span id="sync"></span>
+          <span id="ml-sync"></span>
+          <p style="font-size:13px; color:#64748b; margin-bottom:16px;">Consulte os pedidos do período antes de processar. Visualize o status de cada pedido e decida quando gerar as NFs.</p>
 
-          <div class="tab-bar">
-            <button class="tab-btn active" onclick="switchTab('pedidos','shopee')">🛒 Shopee</button>
-            <button class="tab-btn" onclick="switchTab('pedidos','ml')">🏪 Mercado Livre</button>
-          </div>
-
-          <!-- Shopee Tab -->
-          <div class="tab-pane active" id="pedidos-shopee">
-            <span id="sync"></span>
-            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; padding:12px 16px; background:${automationPaused ? '#fffbeb' : '#f0fdf4'}; border-radius:8px; border:1px solid ${automationPaused ? '#fde68a' : '#bbf7d0'};">
-              <div>
-                <strong style="font-size:14px;">${automationPaused ? '⏸ Automação Pausada' : '▶ Automação Ativa'}</strong>
-                <div style="font-size:12px;color:#888;margin-top:2px;" id="autoLabel">${automationPaused ? 'Apenas sincronização manual funciona' : 'Sincronizando automaticamente a cada ' + config.pollIntervalMinutes + ' min'}</div>
-              </div>
-              <button class="btn ${automationPaused ? 'btn-primary' : 'btn-secondary'} btn-sm" id="btnToggle" onclick="toggleAuto()">${automationPaused ? '▶ Ativar' : '⏸ Pausar'}</button>
-            </div>
-
-            <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px;">
-              <div style="font-size:13px;color:#666;">Última execução:</div>
-              <div style="font-size:13px;font-weight:600;" id="lastSync">${lastRunText}</div>
-              <div style="font-size:11px;color:#999;" id="autoStatus">${automationPaused ? '⏸ Pausada' : 'Auto a cada ' + config.pollIntervalMinutes + ' min'}</div>
-            </div>
-
-            <div id="msgToggle" class="msg msg-ok"></div>
-            <div id="msgRun" class="msg msg-ok"></div>
-            <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin: 16px 0;">
-              <button class="btn btn-primary" id="btnSync" onclick="syncNow()">▶ Sincronizar Shopee Agora</button>
-              <span style="font-size:13px; color:#999;">Busca pedidos de ontem/hoje e emite NF com desconto da lista de preço</span>
-            </div>
-
-            <div style="padding:12px 16px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0; margin-bottom:16px;">
-              <p style="font-size:12px; color:#64748b; margin-bottom:8px; font-weight:600;">Filtro por N° do Pedido (opcional)</p>
-              <div class="inline-form" style="margin-bottom:0;">
-                <div class="form-sm">
-                  <label>De (Order SN)</label>
-                  <input type="text" id="syncFromSn" placeholder="Ex: 260621MFN2GF8A" style="width:180px; text-transform:uppercase;">
-                </div>
-                <div class="form-sm">
-                  <label>Até (Order SN)</label>
-                  <input type="text" id="syncToSn" placeholder="Ex: 260623NNQ35E3G" style="width:180px; text-transform:uppercase;">
-                </div>
-                <span style="font-size:11px; color:#94a3b8; align-self:center;">Deixe vazio para processar todos</span>
-              </div>
-            </div>
-
-            <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
-            <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Reprocessar Período Específico</p>
-            <div id="msgReprocess" class="msg msg-ok"></div>
-            <div class="inline-form">
+          <!-- Filtros de data -->
+          <div style="padding:14px 18px; background:#f8fafc; border-radius:10px; border:1px solid #e2e8f0; margin-bottom:16px;">
+            <p style="font-size:13px; color:#475569; margin-bottom:10px; font-weight:600;">Período de Consulta</p>
+            <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end;">
               <div class="form-sm">
                 <label>Data Inicial</label>
-                <input type="text" id="de" placeholder="dd/mm/aaaa" maxlength="10">
+                <input type="text" id="listDe" placeholder="dd/mm/aaaa" maxlength="10">
               </div>
               <div class="form-sm">
                 <label>Data Final</label>
-                <input type="text" id="ate" placeholder="dd/mm/aaaa" maxlength="10">
+                <input type="text" id="listAte" placeholder="dd/mm/aaaa" maxlength="10">
               </div>
-              <button class="btn btn-secondary btn-sm" id="btnReprocess" onclick="reprocessar()">🔄 Reprocessar</button>
+              <div class="form-sm">
+                <label>Marketplace</label>
+                <select id="listMarketplace" style="padding:6px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px; background:#fff;">
+                  <option value="">Todos</option>
+                  <option value="shopee">Shopee</option>
+                  <option value="ml">Mercado Livre</option>
+                </select>
+              </div>
+              <button class="btn btn-primary" id="btnListOrders" onclick="listarPedidos()">📋 Listar Pedidos</button>
             </div>
-            <div id="shopeeConnStatus" style="margin-top:12px; font-size:12px; color:#888;"></div>
+            <div style="font-size:11px; color:#94a3b8; margin-top:8px;">Dica: deixe as datas em branco para listar pedidos de ontem e hoje</div>
           </div>
 
-          <!-- ML Tab -->
-          <div class="tab-pane" id="pedidos-ml">
-            <span id="ml-sync"></span>
-            <span id="mlHeaderBadge" style="display:none;"></span>
-            <div id="mlNotConnected" style="display:none; padding:16px; background:#fffbeb; border-radius:8px; border:1px solid #fde68a; margin-bottom:16px;">
-              <strong style="font-size:14px;">⚠ Conta Mercado Livre não conectada</strong>
-              <div style="font-size:12px;color:#888;margin:6px 0 12px;">Autorize o SyncHub a acessar sua conta ML antes de processar pedidos.</div>
-              <a href="/ml/connect" class="btn btn-primary btn-sm" style="text-decoration:none;">🔗 Conectar conta Mercado Livre</a>
+          <div id="msgListOrders" class="msg msg-ok"></div>
+
+          <!-- Resumo (aparece após listar) -->
+          <div id="listOrdersResumo" style="display:none; margin-bottom:16px;">
+            <div style="display:flex; gap:12px; flex-wrap:wrap;" id="listResumoCards"></div>
+          </div>
+
+          <!-- Tabela de pedidos -->
+          <div id="listOrdersTableWrap" style="display:none; margin-bottom:16px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+              <div style="display:flex; gap:6px;">
+                <button class="tab-btn active" onclick="filtrarTabelaPedidos('todos')" id="filtroTodos">Todos</button>
+                <button class="tab-btn" onclick="filtrarTabelaPedidos('shopee')" id="filtroShopee">🛒 Shopee</button>
+                <button class="tab-btn" onclick="filtrarTabelaPedidos('ml')" id="filtroML">🏪 ML</button>
+                <button class="tab-btn" onclick="filtrarTabelaPedidos('pendentes')" id="filtroPendentes">Pendentes</button>
+              </div>
+              <span style="font-size:12px; color:#94a3b8;" id="listOrdersCount"></span>
             </div>
-            <div id="mlConnected" style="display:none;">
-              <div style="padding:12px 16px; background:#f0fdf4; border-radius:8px; border:1px solid #bbf7d0; margin-bottom:16px; display:flex; justify-content:space-between; align-items:center;">
+            <div style="max-height:500px; overflow-y:auto; border:1px solid #e2e8f0; border-radius:8px;">
+              <table style="width:100%; border-collapse:collapse; font-size:13px;">
+                <thead style="position:sticky; top:0; background:#f8fafc; z-index:1;">
+                  <tr>
+                    <th style="padding:10px 12px; text-align:left; border-bottom:2px solid #e2e8f0; font-weight:600; color:#475569;">Canal</th>
+                    <th style="padding:10px 12px; text-align:left; border-bottom:2px solid #e2e8f0; font-weight:600; color:#475569;">Pedido Ecommerce</th>
+                    <th style="padding:10px 12px; text-align:left; border-bottom:2px solid #e2e8f0; font-weight:600; color:#475569;">N° Tiny</th>
+                    <th style="padding:10px 12px; text-align:left; border-bottom:2px solid #e2e8f0; font-weight:600; color:#475569;">Data</th>
+                    <th style="padding:10px 12px; text-align:left; border-bottom:2px solid #e2e8f0; font-weight:600; color:#475569;">Cliente</th>
+                    <th style="padding:10px 12px; text-align:right; border-bottom:2px solid #e2e8f0; font-weight:600; color:#475569;">Valor</th>
+                    <th style="padding:10px 12px; text-align:center; border-bottom:2px solid #e2e8f0; font-weight:600; color:#475569;">Status</th>
+                    <th style="padding:10px 12px; text-align:center; border-bottom:2px solid #e2e8f0; font-weight:600; color:#475569;">NF</th>
+                  </tr>
+                </thead>
+                <tbody id="listOrdersBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Ações após listar (aparecem após listar) -->
+          <div id="listOrdersActions" style="display:none;">
+            <hr style="border:none; border-top:1px solid #e2e8f0; margin: 16px 0;">
+            <p style="font-size:13px; color:#475569; font-weight:600; margin-bottom:12px;">Processar Pedidos Listados</p>
+
+            <div class="tab-bar" style="margin-bottom:14px;">
+              <button class="tab-btn active" onclick="switchTab('processar','shopee')">🛒 Shopee</button>
+              <button class="tab-btn" onclick="switchTab('processar','ml')">🏪 Mercado Livre</button>
+            </div>
+
+            <!-- Processar Shopee -->
+            <div class="tab-pane active" id="processar-shopee">
+              <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; padding:10px 14px; background:${automationPaused ? '#fffbeb' : '#f0fdf4'}; border-radius:8px; border:1px solid ${automationPaused ? '#fde68a' : '#bbf7d0'};">
                 <div>
-                  <strong style="font-size:14px;">✓ Conta ML conectada</strong>
-                  <div style="font-size:12px;color:#666;margin-top:2px;">Seller ID: <span id="mlSellerId" style="font-family:monospace;">...</span></div>
+                  <strong style="font-size:13px;">${automationPaused ? '⏸ Automação Pausada' : '▶ Automação Ativa'}</strong>
+                  <div style="font-size:11px;color:#888;margin-top:2px;" id="autoLabel">${automationPaused ? 'Apenas sincronização manual' : 'Auto a cada ' + config.pollIntervalMinutes + ' min'}</div>
                 </div>
-                <button class="btn btn-secondary btn-sm" onclick="mlDisconnect()">Desconectar</button>
+                <button class="btn ${automationPaused ? 'btn-primary' : 'btn-secondary'} btn-sm" id="btnToggle" onclick="toggleAuto()" style="font-size:12px;">${automationPaused ? '▶ Ativar' : '⏸ Pausar'}</button>
               </div>
-
-              <p style="font-size:13px; color:#666; margin-bottom:14px;">
-                Gera NF para pedidos ML pela <strong>data de coleta</strong>. Apenas <strong>CPF</strong> (Pessoa Física), com desconto da <strong>lista de preço</strong>. Pedidos com NF existente são ignorados.
-              </p>
-
-              <div id="msgML" class="msg msg-ok"></div>
-
-              <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px;">
-                <button class="btn btn-primary btn-sm" onclick="mlQuickRun('hoje')" id="btnMLHoje">📅 Coleta Hoje</button>
-                <button class="btn btn-primary btn-sm" onclick="mlQuickRun('amanha')" id="btnMLAmanha">📅 Coleta Amanhã</button>
-                <button class="btn btn-secondary btn-sm" onclick="mlDebug()" id="btnMLDebug">🔍 Inspecionar API</button>
-                <button class="btn btn-secondary btn-sm" onclick="mlClearCache()" id="btnMLClearCache" style="background:#ef4444;color:#fff;border-color:#ef4444;">🗑 Limpar Cache</button>
+              <div id="msgToggle" class="msg msg-ok"></div>
+              <div id="msgRun" class="msg msg-ok"></div>
+              <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
+                <button class="btn btn-primary" id="btnSync" onclick="syncNow()">▶ Gerar NFs Shopee</button>
+                <span style="font-size:12px; color:#999;">Processa pedidos pendentes do período e emite NF com desconto da lista de preço</span>
               </div>
-
-              <hr style="border:none; border-top:1px solid #f0f0f0; margin: 6px 0 14px;">
-              <p style="font-size:12px; color:#888; margin-bottom:10px; font-weight:600;">Ou escolha um dia específico de coleta</p>
-              <div class="inline-form">
-                <div class="form-sm">
-                  <label>Data de coleta</label>
-                  <input type="text" id="mlDate" placeholder="dd/mm/aaaa" maxlength="10">
+              <div style="padding:10px 14px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0; margin-bottom:10px;">
+                <p style="font-size:11px; color:#64748b; margin-bottom:6px; font-weight:600;">Filtro por N° do Pedido (opcional)</p>
+                <div class="inline-form" style="margin-bottom:0;">
+                  <div class="form-sm">
+                    <label>De (Order SN)</label>
+                    <input type="text" id="syncFromSn" placeholder="Ex: 260621MFN2GF8A" style="width:170px; text-transform:uppercase;">
+                  </div>
+                  <div class="form-sm">
+                    <label>Até (Order SN)</label>
+                    <input type="text" id="syncToSn" placeholder="Ex: 260623NNQ35E3G" style="width:170px; text-transform:uppercase;">
+                  </div>
                 </div>
-                <button class="btn btn-secondary btn-sm" id="btnML" onclick="processMLDay()">🏪 Gerar NFs</button>
               </div>
+              <div id="msgReprocess" class="msg msg-ok"></div>
+              <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+                <button class="btn btn-secondary btn-sm" id="btnReprocess" onclick="reprocessar()">🔄 Reprocessar Período</button>
+                <div class="form-sm" style="margin:0;">
+                  <input type="text" id="de" placeholder="De dd/mm/aaaa" maxlength="10" style="width:120px;">
+                </div>
+                <div class="form-sm" style="margin:0;">
+                  <input type="text" id="ate" placeholder="Até dd/mm/aaaa" maxlength="10" style="width:120px;">
+                </div>
+              </div>
+              <div id="shopeeConnStatus" style="margin-top:10px; font-size:12px; color:#888;"></div>
+            </div>
 
-              <div id="mlLastResultBox" style="margin-top:16px; display:none;">
-                <p style="font-size:12px;color:#888;font-weight:600;margin-bottom:6px;">Último processamento ML:</p>
-                <pre id="mlLastResult" style="background:#f8fafc; padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap; border:1px solid #e2e8f0;"></pre>
+            <!-- Processar ML -->
+            <div class="tab-pane" id="processar-ml">
+              <span id="mlHeaderBadge" style="display:none;"></span>
+              <div id="mlNotConnected" style="display:none; padding:14px; background:#fffbeb; border-radius:8px; border:1px solid #fde68a; margin-bottom:14px;">
+                <strong style="font-size:13px;">⚠ Conta ML não conectada</strong>
+                <div style="font-size:11px;color:#888;margin:4px 0 10px;">Autorize o SyncHub a acessar sua conta ML.</div>
+                <a href="/ml/connect" class="btn btn-primary btn-sm" style="text-decoration:none;">🔗 Conectar</a>
               </div>
-
-              <hr style="border:none; border-top:1px solid #f0f0f0; margin: 14px 0;">
-              <p style="font-size:12px; color:#888; margin-bottom:10px; font-weight:600;">Inspecionar pedido ML específico</p>
-              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-                <input type="text" id="mlInspectOrderId" placeholder="Nº pedido ML (ex: 2000013682785673)" style="width:280px; padding:6px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:13px; font-family:monospace;">
-                <button class="btn btn-secondary btn-sm" onclick="mlInspectOrder()" id="btnMLInspect">🔍 Inspecionar</button>
-              </div>
-              <div id="mlInspectResult" style="display:none; margin-top:10px;">
-                <pre id="mlInspectPre" style="background:#f8fafc; padding:12px; border-radius:8px; font-size:12px; white-space:pre-wrap; border:1px solid #e2e8f0; max-height:300px; overflow-y:auto;"></pre>
+              <div id="mlConnected" style="display:none;">
+                <div style="padding:10px 14px; background:#f0fdf4; border-radius:8px; border:1px solid #bbf7d0; margin-bottom:12px; display:flex; justify-content:space-between; align-items:center;">
+                  <div>
+                    <strong style="font-size:13px;">✓ Conta ML conectada</strong>
+                    <div style="font-size:11px;color:#666;margin-top:2px;">Seller ID: <span id="mlSellerId" style="font-family:monospace;">...</span></div>
+                  </div>
+                  <button class="btn btn-secondary btn-sm" onclick="mlDisconnect()" style="font-size:12px;">Desconectar</button>
+                </div>
+                <p style="font-size:12px; color:#666; margin-bottom:12px;">
+                  Gera NF por <strong>data de coleta</strong>. Apenas <strong>CPF</strong> (Pessoa Física), desconto da <strong>lista de preço</strong>.
+                </p>
+                <div id="msgML" class="msg msg-ok"></div>
+                <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;">
+                  <button class="btn btn-primary btn-sm" onclick="mlQuickRun('hoje')" id="btnMLHoje">📅 Coleta Hoje</button>
+                  <button class="btn btn-primary btn-sm" onclick="mlQuickRun('amanha')" id="btnMLAmanha">📅 Coleta Amanhã</button>
+                </div>
+                <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px;">
+                  <div class="form-sm" style="margin:0;">
+                    <label>Data de coleta</label>
+                    <input type="text" id="mlDate" placeholder="dd/mm/aaaa" maxlength="10">
+                  </div>
+                  <button class="btn btn-secondary btn-sm" id="btnML" onclick="processMLDay()">🏪 Gerar NFs</button>
+                  <button class="btn btn-secondary btn-sm" onclick="mlDebug()" id="btnMLDebug">🔍 Inspecionar API</button>
+                </div>
+                <div id="mlLastResultBox" style="margin-top:12px; display:none;">
+                  <p style="font-size:11px;color:#888;font-weight:600;margin-bottom:4px;">Último processamento ML:</p>
+                  <pre id="mlLastResult" style="background:#f8fafc; padding:10px; border-radius:8px; font-size:11px; white-space:pre-wrap; border:1px solid #e2e8f0;"></pre>
+                </div>
+                <hr style="border:none; border-top:1px solid #f0f0f0; margin: 12px 0;">
+                <p style="font-size:11px; color:#888; margin-bottom:8px; font-weight:600;">Inspecionar pedido ML</p>
+                <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                  <input type="text" id="mlInspectOrderId" placeholder="Nº pedido ML" style="width:220px; padding:6px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:12px; font-family:monospace;">
+                  <button class="btn btn-secondary btn-sm" onclick="mlInspectOrder()" id="btnMLInspect">🔍 Inspecionar</button>
+                </div>
+                <div id="mlInspectResult" style="display:none; margin-top:8px;">
+                  <pre id="mlInspectPre" style="background:#f8fafc; padding:10px; border-radius:8px; font-size:11px; white-space:pre-wrap; border:1px solid #e2e8f0; max-height:250px; overflow-y:auto;"></pre>
+                </div>
               </div>
             </div>
+
+            <hr style="border:none; border-top:1px solid #f0f0f0; margin: 16px 0;">
+            <button class="btn btn-primary" onclick="openProcessarPedido()" style="background:#3b82f6;">🎯 Processar Pedido Individual (Shopee)</button>
+            <span style="font-size:11px; color:#999; margin-left:8px;">Busca no Tiny + gera NF + envia para Shopee</span>
           </div>
 
-          <hr style="border:none; border-top:1px solid #f0f0f0; margin: 20px 0;">
-          <button class="btn btn-primary" onclick="openProcessarPedido()" style="background:#3b82f6;">🎯 Processar Pedido Individual (Shopee)</button>
-          <span style="font-size:12px; color:#999; margin-left:8px;">Busca no Tiny + gera NF + envia para Shopee</span>
+          <!-- Última execução -->
+          <div style="display:flex; align-items:center; gap:12px; margin-top:12px; font-size:12px; color:#94a3b8;">
+            <span>Última execução:</span>
+            <span style="font-weight:600;" id="lastSync">${lastRunText}</span>
+            <span id="autoStatus">${automationPaused ? '⏸ Pausada' : 'Auto a cada ' + config.pollIntervalMinutes + ' min'}</span>
+          </div>
         </div>
       </div>
 
@@ -3634,6 +3765,112 @@ function getDashboardHtml(): string {
         for (var j = 0; j < btns.length; j++) btns[j].classList.remove('active');
       }
       if (event && event.target) event.target.classList.add('active');
+    }
+
+    // ===== LISTAR PEDIDOS (Passo 1) =====
+    var _listOrdersData = []; // cache dos pedidos listados
+    var _listOrdersFilter = 'todos';
+
+    function _todayStr() {
+      var d = new Date(); return String(d.getDate()).padStart(2,'0') + '/' + String(d.getMonth()+1).padStart(2,'0') + '/' + d.getFullYear();
+    }
+    function _yesterdayStr() {
+      var d = new Date(); d.setDate(d.getDate()-1); return String(d.getDate()).padStart(2,'0') + '/' + String(d.getMonth()+1).padStart(2,'0') + '/' + d.getFullYear();
+    }
+
+    async function listarPedidos() {
+      var de = (document.getElementById('listDe').value || '').trim() || _yesterdayStr();
+      var ate = (document.getElementById('listAte').value || '').trim() || _todayStr();
+      var mkt = document.getElementById('listMarketplace').value;
+      if (!/^\\d{2}\\/\\d{2}\\/\\d{4}$/.test(de) || !/^\\d{2}\\/\\d{2}\\/\\d{4}$/.test(ate)) {
+        showMsg('msgListOrders', 'Formato de data inválido. Use dd/mm/aaaa', false); return;
+      }
+      var btn = document.getElementById('btnListOrders');
+      btn.disabled = true; btn.textContent = '⏳ Consultando Tiny...';
+      try {
+        var qs = '?de=' + encodeURIComponent(de) + '&ate=' + encodeURIComponent(ate);
+        if (mkt) qs += '&marketplace=' + mkt;
+        var r = await fetch('/api/list-orders' + qs, { headers: authHeaders });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
+        if (!r.ok) { showMsg('msgListOrders', d.error || 'Erro ao listar', false); return; }
+
+        _listOrdersData = d.pedidos || [];
+        var s = d.resumo;
+
+        // Resumo cards
+        var resumoHtml = '<div style="padding:10px 16px;background:#f0fdf4;border-radius:8px;border:1px solid #bbf7d0;min-width:100px;text-align:center;">'
+          + '<div style="font-size:22px;font-weight:700;color:#16a34a;">' + s.total + '</div><div style="font-size:11px;color:#666;">Total</div></div>'
+          + '<div style="padding:10px 16px;background:#fff1ee;border-radius:8px;border:1px solid #fed7aa;min-width:100px;text-align:center;">'
+          + '<div style="font-size:22px;font-weight:700;color:#ea580c;">' + s.shopee + '</div><div style="font-size:11px;color:#666;">Shopee</div></div>'
+          + '<div style="padding:10px 16px;background:#fff8e1;border-radius:8px;border:1px solid #fde68a;min-width:100px;text-align:center;">'
+          + '<div style="font-size:22px;font-weight:700;color:#d97706;">' + s.ml + '</div><div style="font-size:11px;color:#666;">Mercado Livre</div></div>'
+          + '<div style="padding:10px 16px;background:#eff6ff;border-radius:8px;border:1px solid #bfdbfe;min-width:100px;text-align:center;">'
+          + '<div style="font-size:22px;font-weight:700;color:#2563eb;">' + s.pendentes + '</div><div style="font-size:11px;color:#666;">Pendentes (sem NF)</div></div>'
+          + '<div style="padding:10px 16px;background:#f0fdf4;border-radius:8px;border:1px solid #bbf7d0;min-width:100px;text-align:center;">'
+          + '<div style="font-size:22px;font-weight:700;color:#16a34a;">' + s.comNF + '</div><div style="font-size:11px;color:#666;">Com NF</div></div>';
+        document.getElementById('listResumoCards').innerHTML = resumoHtml;
+        document.getElementById('listOrdersResumo').style.display = 'block';
+
+        // Renderizar tabela
+        _listOrdersFilter = 'todos';
+        renderTabelaPedidos();
+        document.getElementById('listOrdersTableWrap').style.display = 'block';
+        document.getElementById('listOrdersActions').style.display = 'block';
+
+        // Atualizar filtro buttons active
+        document.querySelectorAll('#listOrdersTableWrap .tab-btn').forEach(function(b) { b.classList.remove('active'); });
+        document.getElementById('filtroTodos').classList.add('active');
+
+        showMsg('msgListOrders', 'Período ' + d.periodo.de + ' a ' + d.periodo.ate + ' — ' + s.total + ' pedidos encontrados (' + s.pendentes + ' pendentes)', true);
+      } catch(e) { showMsg('msgListOrders', 'Erro: ' + e.message, false); }
+      btn.disabled = false; btn.textContent = '📋 Listar Pedidos';
+    }
+
+    function filtrarTabelaPedidos(filtro) {
+      _listOrdersFilter = filtro;
+      renderTabelaPedidos();
+      document.querySelectorAll('#listOrdersTableWrap .tab-btn').forEach(function(b) { b.classList.remove('active'); });
+      var btnId = { todos: 'filtroTodos', shopee: 'filtroShopee', ml: 'filtroML', pendentes: 'filtroPendentes' }[filtro];
+      if (btnId) document.getElementById(btnId).classList.add('active');
+    }
+
+    function renderTabelaPedidos() {
+      var data = _listOrdersData;
+      if (_listOrdersFilter === 'shopee') data = data.filter(function(o) { return o.canal === 'Shopee'; });
+      else if (_listOrdersFilter === 'ml') data = data.filter(function(o) { return o.canal === 'Mercado Livre'; });
+      else if (_listOrdersFilter === 'pendentes') data = data.filter(function(o) { return !o.temNF; });
+
+      document.getElementById('listOrdersCount').textContent = data.length + ' pedidos';
+
+      var html = '';
+      for (var i = 0; i < data.length; i++) {
+        var o = data[i];
+        var canalBadge = o.canal === 'Shopee'
+          ? '<span style="background:#fff1ee;color:#ea580c;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">🛒 Shopee</span>'
+          : o.canal === 'Mercado Livre'
+          ? '<span style="background:#fff8e1;color:#d97706;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">🏪 ML</span>'
+          : '<span style="background:#f1f5f9;color:#64748b;padding:2px 8px;border-radius:4px;font-size:11px;">Outro</span>';
+        var statusColor = o.temNF ? '#16a34a' : (o.situacao === 'Pendente' ? '#d97706' : '#64748b');
+        var nfBadge = o.temNF
+          ? '<span style="color:#16a34a;font-weight:600;">✓ Sim</span>'
+          : '<span style="color:#94a3b8;">—</span>';
+        var rowBg = i % 2 === 0 ? '#fff' : '#fafbfc';
+        html += '<tr style="background:' + rowBg + ';">'
+          + '<td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;">' + canalBadge + '</td>'
+          + '<td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;font-family:monospace;font-size:12px;">' + (o.numero_ecommerce || '—') + '</td>'
+          + '<td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;font-family:monospace;font-size:12px;">' + o.numero + '</td>'
+          + '<td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;">' + o.data_pedido + '</td>'
+          + '<td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + o.nome + '</td>'
+          + '<td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;text-align:right;font-family:monospace;">R$ ' + parseFloat(o.valor).toFixed(2) + '</td>'
+          + '<td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;text-align:center;color:' + statusColor + ';font-size:12px;">' + o.situacao + '</td>'
+          + '<td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;text-align:center;">' + nfBadge + '</td>'
+          + '</tr>';
+      }
+      if (data.length === 0) {
+        html = '<tr><td colspan="8" style="padding:24px;text-align:center;color:#94a3b8;">Nenhum pedido encontrado com esse filtro</td></tr>';
+      }
+      document.getElementById('listOrdersBody').innerHTML = html;
     }
 
     // Sidebar nav scroll
