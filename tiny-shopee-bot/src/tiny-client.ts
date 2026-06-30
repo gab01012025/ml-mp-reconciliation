@@ -713,6 +713,52 @@ export async function getPriceLists(): Promise<Array<{ id: number; descricao: st
   });
 }
 
+// --- Cache de Listas de Preço ---
+let priceListCache: Array<{ id: number; descricao: string; acrescimo_desconto: number }> | null = null;
+let priceListCacheTime = 0;
+const PRICE_LIST_CACHE_TTL = 60 * 60 * 1000; // 1 hora
+
+export function clearPriceListCache(): void {
+  priceListCache = null;
+  priceListCacheTime = 0;
+  console.log('[TINY] Cache de listas de preço limpo');
+}
+
+/**
+ * Retorna o percentual de desconto para um marketplace a partir das listas de preço do Tiny.
+ * Cache de 1 hora. Fallback para config se a API falhar ou a lista não for encontrada.
+ */
+export async function getMarketplaceDiscount(marketplace: 'Shopee' | 'ML'): Promise<number> {
+  const fallback = marketplace === 'Shopee'
+    ? config.shopeeDiscountPercent
+    : config.mlDiscountPercent;
+
+  try {
+    const now = Date.now();
+    if (!priceListCache || (now - priceListCacheTime) > PRICE_LIST_CACHE_TTL) {
+      console.log('[TINY] Atualizando cache de listas de preço...');
+      priceListCache = await getPriceLists();
+      priceListCacheTime = now;
+      console.log(`[TINY] ${priceListCache.length} listas carregadas: ${priceListCache.map(l => `${l.descricao}(id=${l.id}, ${l.acrescimo_desconto}%)`).join(', ')}`);
+    }
+
+    const searchTerm = marketplace === 'Shopee' ? 'SHOPEE' : 'ML';
+    const lista = priceListCache.find(l => l.descricao.toUpperCase().includes(searchTerm));
+
+    if (!lista) {
+      console.warn(`[TINY] Lista de preço "${searchTerm}" não encontrada — usando config fallback: ${fallback}%`);
+      return fallback;
+    }
+
+    const discount = -lista.acrescimo_desconto;
+    console.log(`[TINY] Desconto ${marketplace}: lista "${lista.descricao}" (id=${lista.id}) = ${discount}%`);
+    return discount;
+  } catch (err) {
+    console.error(`[TINY] Erro ao buscar listas de preço — usando config fallback: ${fallback}%`, err);
+    return fallback;
+  }
+}
+
 /**
  * Aplica a Lista de Preço em um pedido Tiny.
  * Como pedido.alterar não suporta id_lista_preco, busca a % de desconto da lista

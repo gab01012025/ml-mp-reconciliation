@@ -12,8 +12,8 @@ import {
   getNFXml,
   hasMaskedClientData,
   NFResult,
+  getMarketplaceDiscount,
 } from './tiny-client';
-import { config } from './config';
 import * as ml from './ml-client';
 import * as shopee from './shopee-client';
 
@@ -159,6 +159,8 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
     }
     console.log(`[BOT] Status breakdown:`, statusCount);
 
+    const shopeeDiscount = await getMarketplaceDiscount('Shopee');
+
     for (const order of potentialShopee) {
       if (processedOrders.has(order.id)) continue;
 
@@ -210,7 +212,6 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
 
         // Cria NF com desconto e campos de vinculação ao ecommerce
         // (numero_pedido_ecommerce + ecommerce="Shopee" para o Tiny auto-enviar)
-        const shopeeDiscount = config.shopeeDiscountPercent;
         console.log(`[BOT] Criando NF Shopee para pedido ${order.id} (${detail.numero}) - total original: R$${detail.total_pedido} - desconto ${shopeeDiscount}%`);
         await sleep(1100);
 
@@ -253,7 +254,7 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
  */
 export async function processMercadoLivreOrdersForDate(dataDia: string): Promise<BotResult> {
   const stats: BotResult = { found: 0, altered: 0, nfGenerated: 0, skippedNF: 0, errors: 0, nfs: [] };
-  const discount = config.mlDiscountPercent;
+  const discount = await getMarketplaceDiscount('ML');
 
   console.log(`\n[BOT-ML] Buscando pedidos Mercado Livre de ${dataDia} (desconto ${discount}% apenas para CPF)...`);
 
@@ -398,7 +399,7 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
  */
 export async function processMercadoLivreByCollectionDate(dataColeta: string): Promise<BotResult> {
   const stats: BotResult = { found: 0, altered: 0, nfGenerated: 0, skippedNF: 0, errors: 0, nfs: [] };
-  const discount = config.mlDiscountPercent;
+  const discount = await getMarketplaceDiscount('ML');
   const isoTarget = ddmmyyyyToIsoDate(dataColeta);
   // pay_before geralmente é 1 dia após a coleta — extende a janela em +1 dia
   const targetDate = new Date(`${isoTarget}T00:00:00.000-03:00`);
@@ -866,8 +867,8 @@ export async function processSingleShopeeOrder(orderSn: string): Promise<SingleO
       result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF já vinculada (ID: ${nfId}) — detalhes indisponíveis` });
     }
   } else {
-    // Gerar NF com desconto
-    const discount = config.shopeeDiscountPercent;
+    // Gerar NF com desconto (usa lista de preço do Tiny)
+    const discount = await getMarketplaceDiscount('Shopee');
     console.log(`[SINGLE] Gerando NF com ${discount}% desconto para ${orderSn}...`);
     await sleep(1100);
 
