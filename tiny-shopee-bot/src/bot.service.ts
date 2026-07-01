@@ -874,7 +874,7 @@ export async function processSingleShopeeOrder(orderSn: string): Promise<SingleO
         };
         result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF ${nf.numero} emitida — R$ ${(nf.valorNota || 0).toFixed(2)} — Chave: ...${nf.chaveAcesso.slice(-8)}` });
       } else {
-        result.steps.push({ step: 'Nota Fiscal', ok: false, detail: 'Falha ao gerar/emitir NF. Verifique os logs do servidor.' });
+        result.steps.push({ step: 'Nota Fiscal', ok: false, detail: nf.error || 'Falha ao gerar/emitir NF. Verifique os logs do servidor.' });
         return result;
       }
     } catch (err: any) {

@@ -310,6 +310,7 @@ export interface NFResult {
   valorNota?: number;
   clienteNome?: string;
   numeroEcommerce?: string;
+  error?: string;
 }
 
 /**
@@ -430,7 +431,7 @@ export async function generateNFFromOrder(orderId: string, orderNumero?: string)
       const erros = retorno.erros;
       const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro desconhecido';
       console.error(`[ERRO] Falha ao gerar NF do pedido ${label}: ${errList}`);
-      return { success: false };
+      return { success: false, error: errList };
     }
 
     const registro = retorno.registros?.registro;
@@ -440,7 +441,7 @@ export async function generateNFFromOrder(orderId: string, orderNumero?: string)
       const erros = reg?.erros || retorno.erros;
       const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Registro sem status OK';
       console.error(`[ERRO] Gerar NF pedido ${label}: ${errList}`);
-      return { success: false };
+      return { success: false, error: errList };
     }
 
     const nfId = String(reg.id);
@@ -457,7 +458,7 @@ export async function generateNFFromOrder(orderId: string, orderNumero?: string)
       const erros = emitirRetorno.erros;
       const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro desconhecido';
       console.error(`[ERRO] NF ${nfId} gerada mas falhou ao emitir: ${errList}`);
-      return { success: false, nfId };
+      return { success: false, nfId, error: `NF gerada mas falhou ao emitir na SEFAZ: ${errList}` };
     }
 
     const situacao = emitirRetorno.nota_fiscal?.situacao;
@@ -488,7 +489,7 @@ export async function generateNFFromOrder(orderId: string, orderNumero?: string)
     };
   } catch (err: any) {
     console.error(`[ERRO] gerar.nota.fiscal.pedido para ${label}: ${err.message}`);
-    return { success: false };
+    return { success: false, error: err.message };
   }
 }
 

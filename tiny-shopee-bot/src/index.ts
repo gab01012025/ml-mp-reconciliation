@@ -2140,7 +2140,24 @@ const server = http.createServer(async (req, res) => {
       }
 
       console.log(`[MANUAL] Gerando NF para pedido ${orderId} (canal: ${canal})`);
-      const detail = await tinyClient.getOrder(orderId);
+
+      // Tenta obter pelo ID do Tiny; se falhar, busca pelo numero_ecommerce
+      let detail: Awaited<ReturnType<typeof tinyClient.getOrder>>;
+      let tinyOrderId = orderId;
+      try {
+        detail = await tinyClient.getOrder(orderId);
+      } catch {
+        // Não é um ID Tiny válido — tenta buscar pelo numero_ecommerce
+        console.log(`[MANUAL] Pedido ${orderId} não encontrado por ID, buscando por numero_ecommerce...`);
+        const matches = await tinyClient.searchByNumeroEcommerce(orderId);
+        if (matches.length === 0) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `Pedido "${orderId}" não encontrado no Tiny (nem por ID nem por nº ecommerce)` }));
+          return;
+        }
+        tinyOrderId = matches[0].id;
+        detail = await tinyClient.getOrder(tinyOrderId);
+      }
 
       if (detail.id_nota_fiscal) {
         const nf = await tinyClient.getNFDetails(detail.id_nota_fiscal);
@@ -2170,7 +2187,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       // Gera NF a partir do pedido (preserva selo ecommerce → Tiny auto-envia)
-      const nf = await tinyClient.generateNFFromOrder(orderId, detail.numero);
+      const nf = await tinyClient.generateNFFromOrder(tinyOrderId, detail.numero);
 
       if (nf.success) {
         // Adiciona ao histórico e CSV
@@ -2199,7 +2216,7 @@ const server = http.createServer(async (req, res) => {
         }));
       } else {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'Falha ao gerar NF. Verifique os logs.' }));
+        res.end(JSON.stringify({ ok: false, error: nf.error || 'Falha ao gerar NF. Verifique os logs.' }));
       }
     } catch (err: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -3474,7 +3491,7 @@ function getDashboardHtml(): string {
 
           <hr style="border:none; border-top:1px solid #f0f0f0; margin: 16px 0;">
           <p style="font-size:13px; color:#888; margin-bottom:10px; font-weight:600;">Emitir NF Manual (por pedido)</p>
-          <p style="font-size:12px; color:#aaa; margin-bottom:10px;">Cria NF via nota.fiscal.incluir com valores reduzidos pela lista de preço. Preview mostra valores antes/depois.</p>
+          <p style="font-size:12px; color:#aaa; margin-bottom:10px;">Gera NF a partir do pedido (preserva selo ecommerce). Aceita ID Tiny ou nº ecommerce (Shopee/ML).</p>
           <div id="msgTestLP" class="msg msg-ok"></div>
           <div style="display:flex; gap:8px; align-items:end; flex-wrap:wrap;">
             <div class="form-sm">
