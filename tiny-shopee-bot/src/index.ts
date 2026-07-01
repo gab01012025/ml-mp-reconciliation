@@ -231,14 +231,14 @@ const server = http.createServer(async (req, res) => {
   // Public: health
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.95', uptime: process.uptime() }));
+    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.96', uptime: process.uptime() }));
     return;
   }
 
   // Public: version check (for debugging deploys)
   if (url.pathname === '/version') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ version: 'v3.95', deployed: startTime.toISOString() }));
+    res.end(JSON.stringify({ version: 'v3.96', deployed: startTime.toISOString() }));
     return;
   }
 
@@ -2169,9 +2169,8 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const discount = canal === 'Shopee' ? config.shopeeDiscountPercent : config.mlDiscountPercent;
-      const ecommerceName = canal === 'Shopee' ? 'Shopee' : undefined;
-      const nf = await tinyClient.createAndEmitNFDiscounted(detail, discount, ecommerceName);
+      // Gera NF a partir do pedido (preserva selo ecommerce → Tiny auto-envia)
+      const nf = await tinyClient.generateNFFromOrder(orderId, detail.numero);
 
       if (nf.success) {
         // Adiciona ao histórico e CSV
@@ -2179,8 +2178,8 @@ const server = http.createServer(async (req, res) => {
           numero: nf.numero || '',
           nfId: nf.nfId || '',
           chaveAcesso: nf.chaveAcesso || '',
-          clienteNome: nf.clienteNome || '',
-          numeroEcommerce: nf.numeroEcommerce || '',
+          clienteNome: detail.cliente.nome || '',
+          numeroEcommerce: detail.numero_ecommerce || '',
           valorNota: nf.valorNota || 0,
           dataProcessamento: new Date().toLocaleDateString('pt-BR'),
         };
@@ -2197,7 +2196,6 @@ const server = http.createServer(async (req, res) => {
           numero: nf.numero,
           chaveAcesso: nf.chaveAcesso,
           valorNota: nf.valorNota,
-          desconto: discount + '%',
         }));
       } else {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -2944,7 +2942,7 @@ function getLoginHtml(error?: string): string {
       <div class="int-badge"><span class="dot"></span> Mercado Livre</div>
       <div class="int-badge"><span class="dot"></span> Tiny ERP</div>
     </div>
-    <div class="footer">SyncHub v3.95 — Integrador de Marketplaces e ERPs</div>
+    <div class="footer">SyncHub v3.96 — Integrador de Marketplaces e ERPs</div>
   </div>
   <script>
     if (localStorage.getItem('auth_token')) { window.location.href = '/'; }
@@ -3147,7 +3145,7 @@ function getDashboardHtml(): string {
       <div class="section-label">Sistema</div>
       <a href="#logs"><span class="icon">📄</span> Logs</a>
     </nav>
-    <div class="sidebar-footer">SyncHub v3.95<br>Integrador ERP/HUB</div>
+    <div class="sidebar-footer">SyncHub v3.96<br>Integrador ERP/HUB</div>
   </div>
 
   <!-- Main -->

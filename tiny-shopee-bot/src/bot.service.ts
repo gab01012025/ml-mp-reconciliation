@@ -6,13 +6,10 @@ import {
   isMercadoLivreOrder,
   isPessoaFisica,
   hasClientAddress,
-  createAndEmitNF,
-  createAndEmitNFDiscounted,
+  generateNFFromOrder,
   getNFDetails,
   getNFXml,
   hasMaskedClientData,
-  NFResult,
-  getMarketplaceDiscount,
 } from './tiny-client';
 import * as ml from './ml-client';
 import * as shopee from './shopee-client';
@@ -159,8 +156,6 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
     }
     console.log(`[BOT] Status breakdown:`, statusCount);
 
-    const shopeeDiscount = await getMarketplaceDiscount('Shopee');
-
     for (const order of potentialShopee) {
       if (processedOrders.has(order.id)) continue;
 
@@ -210,23 +205,22 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
           continue;
         }
 
-        // Cria NF com desconto e campos de vinculação ao ecommerce
-        // (numero_pedido_ecommerce + ecommerce="Shopee" para o Tiny auto-enviar)
-        console.log(`[BOT] Criando NF Shopee para pedido ${order.id} (${detail.numero}) - total original: R$${detail.total_pedido} - desconto ${shopeeDiscount}%`);
+        // Gera NF a partir do pedido (preserva selo do ecommerce → Tiny auto-envia para Shopee)
+        console.log(`[BOT] Gerando NF do pedido ${order.id} (${detail.numero}) via gerar.nota.fiscal.pedido — total: R$${detail.total_pedido}`);
         await sleep(1100);
 
-        const nf = await createAndEmitNFDiscounted(detail, shopeeDiscount, 'Shopee');
+        const nf = await generateNFFromOrder(order.id, detail.numero);
         if (nf.success) {
           stats.altered++;
           stats.nfGenerated++;
-          console.log(`[OK] NF ${nf.numero || nf.nfId} emitida para pedido ${detail.numero_ecommerce} — chave: ${nf.chaveAcesso || 'N/A'} — aguardando Tiny auto-enviar para Shopee`);
+          console.log(`[OK] NF ${nf.numero || nf.nfId} emitida para pedido ${detail.numero_ecommerce} — chave: ${nf.chaveAcesso || 'N/A'} — Tiny auto-envia para Shopee`);
           if (nf.chaveAcesso) {
             stats.nfs.push({
               numero: nf.numero || '',
               nfId: nf.nfId || '',
               chaveAcesso: nf.chaveAcesso,
-              clienteNome: nf.clienteNome || '',
-              numeroEcommerce: nf.numeroEcommerce || '',
+              clienteNome: detail.cliente.nome || '',
+              numeroEcommerce: detail.numero_ecommerce || '',
               valorNota: nf.valorNota || 0,
               dataProcessamento: new Date().toLocaleString('pt-BR'),
             });
@@ -254,9 +248,8 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
  */
 export async function processMercadoLivreOrdersForDate(dataDia: string): Promise<BotResult> {
   const stats: BotResult = { found: 0, altered: 0, nfGenerated: 0, skippedNF: 0, errors: 0, nfs: [] };
-  const discount = await getMarketplaceDiscount('ML');
 
-  console.log(`\n[BOT-ML] Buscando pedidos Mercado Livre de ${dataDia} (desconto ${discount}% apenas para CPF)...`);
+  console.log(`\n[BOT-ML] Buscando pedidos Mercado Livre de ${dataDia} (apenas CPF)...`);
 
   try {
     let page = 1;
@@ -350,28 +343,27 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
           continue;
         }
 
-        console.log(`[BOT-ML] Criando NF para ML ${detail.numero_ecommerce} (pedido Tiny ${detail.numero}) - total: R$${detail.total_pedido} - aplicando ${discount}% de desconto`);
+        console.log(`[BOT-ML] Gerando NF do pedido ML ${detail.numero_ecommerce} (Tiny ${detail.numero}) via gerar.nota.fiscal.pedido — total R$${detail.total_pedido}`);
         await sleep(1100);
 
-        const nf = await createAndEmitNFDiscounted(detail, discount);
+        const nf = await generateNFFromOrder(order.id, detail.numero);
         if (nf.success) {
           stats.altered++;
           stats.nfGenerated++;
-          checkedMLOrders.add(order.id); // NF criada com sucesso, não precisa mais verificar
+          checkedMLOrders.add(order.id);
           if (nf.chaveAcesso) {
             stats.nfs.push({
               numero: nf.numero || '',
               nfId: nf.nfId || '',
               chaveAcesso: nf.chaveAcesso,
-              clienteNome: nf.clienteNome || '',
-              numeroEcommerce: nf.numeroEcommerce || '',
+              clienteNome: detail.cliente.nome || '',
+              numeroEcommerce: detail.numero_ecommerce || '',
               valorNota: nf.valorNota || 0,
               dataProcessamento: new Date().toLocaleString('pt-BR'),
             });
           }
         } else {
           stats.errors++;
-          // NÃO adiciona ao cache em caso de erro — tenta de novo na próxima execução
         }
       } catch (err) {
         console.error(`[BOT-ML] Falha ao processar pedido ${order.id}:`, err);
@@ -379,7 +371,7 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
       }
     }
 
-    console.log(`[BOT-ML] Resultado: ${stats.found} pedidos ML, ${stats.nfGenerated} NFs emitidas com ${discount}% desconto, ${stats.skippedNF} pulados, ${stats.errors} erros`);
+    console.log(`[BOT-ML] Resultado: ${stats.found} pedidos ML, ${stats.nfGenerated} NFs emitidas, ${stats.skippedNF} pulados, ${stats.errors} erros`);
     const reasons = Object.entries(skipReasons).filter(([, v]) => v > 0).map(([k, v]) => {
       const labels: Record<string, string> = { naoML: 'não é ML', naoCPF: 'CNPJ (não CPF)', mascarado: 'dados mascarados', jaTemNF: 'já tem NF', semEndereco: 'sem endereço', semNumEcommerce: 'sem nº ecommerce', cacheAntes: 'já verificado (cache)', jaFaturado: 'já faturado/atendido' };
       return `${labels[k] || k}: ${v}`;
@@ -399,7 +391,6 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
  */
 export async function processMercadoLivreByCollectionDate(dataColeta: string): Promise<BotResult> {
   const stats: BotResult = { found: 0, altered: 0, nfGenerated: 0, skippedNF: 0, errors: 0, nfs: [] };
-  const discount = await getMarketplaceDiscount('ML');
   const isoTarget = ddmmyyyyToIsoDate(dataColeta);
   // pay_before geralmente é 1 dia após a coleta — extende a janela em +1 dia
   const targetDate = new Date(`${isoTarget}T00:00:00.000-03:00`);
@@ -407,7 +398,7 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
   const targetEnd = new Date(`${targetDate.toISOString().slice(0, 10)}T23:59:59.999-03:00`).getTime();
   const targetEndLabel = targetDate.toISOString().slice(0, 10);
 
-  console.log(`\n[BOT-ML] Buscando pedidos com deadline NF (pay_before) até ${targetEndLabel} 23:59 (coleta=${dataColeta}) — desconto ${discount}% para CPF`);
+  console.log(`\n[BOT-ML] Buscando pedidos com deadline NF (pay_before) até ${targetEndLabel} 23:59 (coleta=${dataColeta}) — apenas CPF`);
 
   if (!ml.isConnected()) {
     console.error('[BOT-ML] Conta Mercado Livre não conectada — abortando.');
@@ -554,9 +545,9 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
           continue;
         }
 
-        console.log(`[BOT-ML] Criando NF p/ ML ${detail.numero_ecommerce} (Tiny ${detail.numero}) total R$${detail.total_pedido} desconto ${discount}%`);
+        console.log(`[BOT-ML] Gerando NF do pedido ML ${detail.numero_ecommerce} (Tiny ${detail.numero}) via gerar.nota.fiscal.pedido — total R$${detail.total_pedido}`);
         await sleep(1100);
-        const nf = await createAndEmitNFDiscounted(detail, discount);
+        const nf = await generateNFFromOrder(summary.id, detail.numero);
         if (nf.success) {
           stats.altered++;
           stats.nfGenerated++;
@@ -566,8 +557,8 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
               numero: nf.numero || '',
               nfId: nf.nfId || '',
               chaveAcesso: nf.chaveAcesso,
-              clienteNome: nf.clienteNome || '',
-              numeroEcommerce: nf.numeroEcommerce || '',
+              clienteNome: detail.cliente.nome || '',
+              numeroEcommerce: detail.numero_ecommerce || '',
               valorNota: nf.valorNota || 0,
               dataProcessamento: new Date().toLocaleString('pt-BR'),
             });
@@ -582,7 +573,7 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
     }
   }
 
-  console.log(`[BOT-ML] Resultado coleta=${dataColeta}: ${stats.found} pedidos, ${stats.nfGenerated} NFs com ${discount}%, ${stats.skippedNF} pulados, ${stats.errors} erros`);
+  console.log(`[BOT-ML] Resultado coleta=${dataColeta}: ${stats.found} pedidos, ${stats.nfGenerated} NFs emitidas, ${stats.skippedNF} pulados, ${stats.errors} erros`);
   const reasons = Object.entries(skipReasons).filter(([, v]) => v > 0).map(([k, v]) => {
     const labels: Record<string, string> = { naoNoTiny: 'não encontrado no Tiny', naoML: 'não é ML', naoCPF: 'CNPJ (não CPF)', mascarado: 'dados mascarados', jaTemNF: 'já tem NF', semEndereco: 'sem endereço', semNumEcommerce: 'sem nº ecommerce', cacheAntes: 'já verificado (cache)' };
     return `${labels[k] || k}: ${v}`;
@@ -867,13 +858,12 @@ export async function processSingleShopeeOrder(orderSn: string): Promise<SingleO
       result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF já vinculada (ID: ${nfId}) — detalhes indisponíveis` });
     }
   } else {
-    // Gerar NF com desconto (usa lista de preço do Tiny)
-    const discount = await getMarketplaceDiscount('Shopee');
-    console.log(`[SINGLE] Gerando NF com ${discount}% desconto para ${orderSn}...`);
+    // Gera NF a partir do pedido (preserva selo ecommerce → Tiny auto-envia para Shopee)
+    console.log(`[SINGLE] Gerando NF do pedido ${orderSn} via gerar.nota.fiscal.pedido...`);
     await sleep(1100);
 
     try {
-      const nf = await createAndEmitNFDiscounted(detail, discount, 'Shopee');
+      const nf = await generateNFFromOrder(tinyOrder.id, tinyOrder.numero);
       if (nf.success && nf.chaveAcesso) {
         nfId = nf.nfId;
         result.nf = {
@@ -893,45 +883,12 @@ export async function processSingleShopeeOrder(orderSn: string): Promise<SingleO
     }
   }
 
-  // --- Step 5: Enviar NF (XML) para a Shopee ---
-  if (!nfId) {
-    result.steps.push({ step: 'Enviar NF para Shopee', ok: false, detail: 'Sem ID da NF — impossível enviar.' });
-    return result;
-  }
-
-  // Verifica se já foi enviada
-  let alreadySent = false;
-  try {
-    await sleep(1100);
-    const check = await shopee.checkOrderInvoice(orderSn);
-    alreadySent = check.hasInvoice;
-  } catch {}
-
-  if (alreadySent) {
-    result.steps.push({ step: 'Enviar NF para Shopee', ok: true, detail: 'NF já registrada na Shopee — nada a fazer.' });
-    result.nfSent = true;
-  } else {
-    // Busca XML e envia
-    try {
-      await sleep(1100);
-      const xml = await getNFXml(nfId);
-      if (!xml) {
-        result.steps.push({ step: 'Enviar NF para Shopee', ok: false, detail: 'XML da NF não disponível no Tiny ainda. Tente novamente em alguns segundos.' });
-        return result;
-      }
-
-      await sleep(1100);
-      const upload = await shopee.uploadInvoiceDoc(orderSn, xml);
-      if (upload.success) {
-        result.steps.push({ step: 'Enviar NF para Shopee', ok: true, detail: 'XML da NF enviado com sucesso para a Shopee.' });
-        result.nfSent = true;
-      } else {
-        result.steps.push({ step: 'Enviar NF para Shopee', ok: false, detail: `Falha no upload: ${upload.error}` });
-      }
-    } catch (err: any) {
-      result.steps.push({ step: 'Enviar NF para Shopee', ok: false, detail: `Erro: ${err.message}` });
-    }
-  }
+  // --- Step 5: Envio da NF para Shopee (automático pelo Tiny) ---
+  // Como a NF foi gerada a partir do pedido (gerar.nota.fiscal.pedido), ela mantém
+  // o selo do ecommerce. Com o envio automático ativado no Tiny, a NF será enviada
+  // automaticamente para a Shopee — não precisa de upload manual.
+  result.steps.push({ step: 'Enviar NF para Shopee', ok: true, detail: 'NF gerada com selo do ecommerce — o Tiny envia automaticamente para a Shopee.' });
+  result.nfSent = true;
 
   result.success = result.steps.every(s => s.ok);
   console.log(`[SINGLE] ========== Resultado: ${result.success ? 'SUCESSO' : 'COM ERROS'} — ${result.steps.length} etapas ==========`);

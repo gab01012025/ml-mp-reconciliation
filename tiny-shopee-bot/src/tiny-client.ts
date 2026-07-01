@@ -413,10 +413,93 @@ export async function createAndEmitNF(order: TinyOrderDetail): Promise<NFResult>
 }
 
 /**
+ * Gera NF a partir de um pedido existente no Tiny via gerar.nota.fiscal.pedido.php.
+ * Mantém o vínculo completo com o marketplace (selo do ecommerce), permitindo
+ * que o Tiny envie a NF automaticamente para Shopee/ML.
+ * O desconto é aplicado pela lista de preço configurada na integração do Tiny.
+ */
+export async function generateNFFromOrder(orderId: string, orderNumero?: string): Promise<NFResult> {
+  const label = orderNumero || orderId;
+  console.log(`[TINY] Gerando NF do pedido ${label} via gerar.nota.fiscal.pedido.php...`);
+
+  try {
+    const result = await tinyPost('gerar.nota.fiscal.pedido.php', { id: orderId });
+    const retorno = result.retorno;
+
+    if (retorno.status !== 'OK') {
+      const erros = retorno.erros;
+      const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro desconhecido';
+      console.error(`[ERRO] Falha ao gerar NF do pedido ${label}: ${errList}`);
+      return { success: false };
+    }
+
+    const registro = retorno.registros?.registro;
+    const reg = Array.isArray(registro) ? registro[0] : registro;
+
+    if (!reg || reg.status !== 'OK') {
+      const erros = reg?.erros || retorno.erros;
+      const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Registro sem status OK';
+      console.error(`[ERRO] Gerar NF pedido ${label}: ${errList}`);
+      return { success: false };
+    }
+
+    const nfId = String(reg.id);
+    const nfNumero = String(reg.numero || '');
+    const nfSerie = String(reg.serie || '');
+    console.log(`[OK] NF ${nfNumero} (série ${nfSerie}) gerada para pedido ${label} (NF ID: ${nfId})`);
+
+    // Emitir na SEFAZ
+    await sleep(1500);
+    const emitirResult = await tinyPost('nota.fiscal.emitir.php', { id: nfId });
+    const emitirRetorno = emitirResult.retorno;
+
+    if (emitirRetorno.status !== 'OK') {
+      const erros = emitirRetorno.erros;
+      const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro desconhecido';
+      console.error(`[ERRO] NF ${nfId} gerada mas falhou ao emitir: ${errList}`);
+      return { success: false, nfId };
+    }
+
+    const situacao = emitirRetorno.nota_fiscal?.situacao;
+    console.log(`[OK] NF ${nfId} emitida na SEFAZ — situação: ${situacao}`);
+
+    // Obter chave de acesso
+    let chaveAcesso: string | undefined;
+    let valorNota: number | undefined;
+    try {
+      await sleep(1500);
+      const obterResult = await tinyPost('nota.fiscal.obter.php', { id: nfId });
+      const nfData = obterResult.retorno?.nota_fiscal;
+      if (nfData) {
+        chaveAcesso = nfData.chave_acesso || undefined;
+        valorNota = nfData.valor_nota ? parseFloat(nfData.valor_nota) : undefined;
+        console.log(`[OK] NF ${nfId}: chave=${chaveAcesso || 'N/A'} valor=R$${valorNota?.toFixed(2) || 'N/A'}`);
+      }
+    } catch (err) {
+      console.error(`[AVISO] NF ${nfId} emitida mas falha ao obter detalhes:`, err);
+    }
+
+    return {
+      success: true,
+      nfId,
+      numero: nfNumero,
+      chaveAcesso,
+      valorNota,
+    };
+  } catch (err: any) {
+    console.error(`[ERRO] gerar.nota.fiscal.pedido para ${label}: ${err.message}`);
+    return { success: false };
+  }
+}
+
+/**
  * Cria NF via nota.fiscal.incluir com valor unitário reduzido por percentual de desconto.
  * Ex: discountPercent=30 → NF emitida com 70% do valor unitário original de cada item.
  * Se ecommerceName for informado, seta os campos numero_pedido_ecommerce + ecommerce
  * para vincular a NF ao pedido do marketplace (permite auto-envio pelo Tiny).
+ *
+ * NOTA: Prefira generateNFFromOrder() que mantém o selo do ecommerce no Tiny.
+ * Esta função é mantida como fallback.
  */
 export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discountPercent: number, ecommerceName?: string): Promise<NFResult> {
   const factor = (100 - discountPercent) / 100;
