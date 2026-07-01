@@ -2505,9 +2505,13 @@ async function processarAuto() {
         h += '<span style="color:#dc2626;">CSV N\u00c3O atualizado (verifique logs)</span> &mdash; ';
       }
       if (d.checklistAdded) {
-        h += 'Checklist atualizado &mdash; ';
+        h += 'Checklist atualizado';
       }
-      h += 'Relat\u00f3rio de separa\u00e7\u00e3o dispon\u00edvel';
+      if (d.nfSent) {
+        h += ' &mdash; Relat\u00f3rio de separa\u00e7\u00e3o dispon\u00edvel';
+      } else {
+        h += ' &mdash; <span style="color:#dc2626;">NF n\u00e3o enviada para Shopee \u2014 envie antes de gerar etiqueta/separa\u00e7\u00e3o</span>';
+      }
       h += '</div>';
     }
 

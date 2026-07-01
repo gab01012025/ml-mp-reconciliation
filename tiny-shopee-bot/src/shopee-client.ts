@@ -392,13 +392,29 @@ export async function uploadInvoiceDoc(
     return { success: false, error: `status_invalido: ${msg}` };
   }
 
-  // Diagnóstico: mostra preview do XML e dados extraídos
+  // Diagnóstico: extrai dados da NF do XML
   const nfeData = extractNFeData(xml);
-  const xmlPreview = xml.slice(0, 150).replace(/\n/g, '\\n');
-  console.log(`[SHOPEE] XML preview: ${xmlPreview}...`);
   console.log(`[SHOPEE] NF-e dados: chave=${nfeData.chaveAcesso || 'N/A'} num=${nfeData.numero || 'N/A'} serie=${nfeData.serie || 'N/A'}`);
-  console.log(`[SHOPEE] Enviando XML NF para pedido ${orderSn} (${xml.length} bytes) status=${invoiceCheck.orderStatus || 'N/A'}`);
+  console.log(`[SHOPEE] Enviando NF para pedido ${orderSn} (${xml.length} bytes XML) status=${invoiceCheck.orderStatus || 'N/A'}`);
 
+  // === Estratégia: add_invoice_data (JSON) primeiro, upload de arquivo como fallback ===
+  // O add_invoice_data é mais confiável pois envia apenas os dados estruturados da NF
+  // sem depender do upload de arquivo XML (que falha com "File error" frequentemente).
+
+  // Tentativa 1: add_invoice_data (dados estruturados via JSON — mais confiável)
+  if (nfeData.chaveAcesso && nfeData.numero && nfeData.serie) {
+    console.log(`[SHOPEE] Tentativa 1: add_invoice_data (JSON) — num=${nfeData.numero} serie=${nfeData.serie} chave=...${nfeData.chaveAcesso.slice(-8)}`);
+    const jsonResult = await addInvoiceData(orderSn, nfeData.numero, nfeData.serie, nfeData.chaveAcesso);
+    if (jsonResult.success) {
+      console.log(`[SHOPEE] NF registrada com sucesso via add_invoice_data (JSON)`);
+      return { success: true };
+    }
+    console.warn(`[SHOPEE] add_invoice_data falhou: ${jsonResult.error}`);
+  } else {
+    console.warn(`[SHOPEE] Dados NF incompletos no XML — chave=${!!nfeData.chaveAcesso} num=${!!nfeData.numero} serie=${!!nfeData.serie}`);
+  }
+
+  // Tentativa 2+: upload de arquivo XML (fallback)
   const accessToken = await ensureValidToken();
   if (!accessToken) {
     return { success: false, error: 'no_token: Token não disponível. Re-autorize a loja.' };
@@ -406,7 +422,6 @@ export async function uploadInvoiceDoc(
 
   const shopId = currentTokens?.shop_id || String(SHOP_ID);
 
-  // Monta URL base (gera novo timestamp/sign para cada tentativa)
   function buildUrl(): string {
     const ts = Math.floor(Date.now() / 1000);
     const path = '/api/v2/order/upload_invoice_doc';
@@ -414,50 +429,29 @@ export async function uploadInvoiceDoc(
     return `${BASE_URL}${path}?partner_id=${PARTNER_ID}&timestamp=${ts}&sign=${sign}&access_token=${accessToken}&shop_id=${shopId}`;
   }
 
-  // XML com declaração
+  // Tentativa 2: File + text/xml
+  const rawBuf = Buffer.from(xml, 'utf-8');
+  console.log(`[SHOPEE] Tentativa 2: upload_invoice_doc text/xml (${rawBuf.length} bytes)`);
+  let result = await tryUpload(buildUrl(), orderSn, rawBuf, 'text/xml', `${orderSn}.xml`, 'tentativa2');
+  if (!result.error) {
+    console.log(`[SHOPEE] NF enviada via upload de arquivo (text/xml)`);
+    return { success: true };
+  }
+  console.warn(`[SHOPEE] Upload text/xml falhou: ${result.error} — ${result.message || ''}`);
+
+  // Tentativa 3: File + application/xml com declaração
   let xmlWithDecl = xml;
   if (!xml.startsWith('<?xml')) {
     xmlWithDecl = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml;
   }
-
-  // Tentativa 1: File + text/xml + XML cru (sem declaração adicionada)
-  const rawBuf = Buffer.from(xml, 'utf-8');
-  console.log(`[SHOPEE] Tentativa 1: File + text/xml + XML cru (${rawBuf.length} bytes)`);
-  let result = await tryUpload(buildUrl(), orderSn, rawBuf, 'text/xml', `${orderSn}.xml`, 'tentativa1');
-  if (!result.error) {
-    console.log(`[SHOPEE] NF enviada com sucesso via tentativa 1 (File+text/xml+raw)`);
-    return { success: true };
-  }
-  console.warn(`[SHOPEE] Tentativa 1 falhou: ${result.error} — ${result.message || ''}`);
-
-  // Tentativa 2: File + application/xml + XML com declaração
   const declBuf = Buffer.from(xmlWithDecl, 'utf-8');
-  console.log(`[SHOPEE] Tentativa 2: File + application/xml + XML com declaração (${declBuf.length} bytes)`);
-  result = await tryUpload(buildUrl(), orderSn, declBuf, 'application/xml', `nfe_${orderSn}.xml`, 'tentativa2');
+  console.log(`[SHOPEE] Tentativa 3: upload_invoice_doc application/xml (${declBuf.length} bytes)`);
+  result = await tryUpload(buildUrl(), orderSn, declBuf, 'application/xml', `nfe_${orderSn}.xml`, 'tentativa3');
   if (!result.error) {
-    console.log(`[SHOPEE] NF enviada com sucesso via tentativa 2 (File+application/xml+decl)`);
+    console.log(`[SHOPEE] NF enviada via upload de arquivo (application/xml)`);
     return { success: true };
   }
-  console.warn(`[SHOPEE] Tentativa 2 falhou: ${result.error} — ${result.message || ''}`);
-
-  // Tentativa 3: File + application/octet-stream (binary genérico)
-  console.log(`[SHOPEE] Tentativa 3: File + application/octet-stream`);
-  result = await tryUpload(buildUrl(), orderSn, declBuf, 'application/octet-stream', `nfe_${orderSn}.xml`, 'tentativa3');
-  if (!result.error) {
-    console.log(`[SHOPEE] NF enviada com sucesso via tentativa 3 (octet-stream)`);
-    return { success: true };
-  }
-  console.warn(`[SHOPEE] Tentativa 3 falhou: ${result.error} — ${result.message || ''}`);
-
-  // Fallback: add_invoice_data com dados estruturados
-  if (nfeData.chaveAcesso && nfeData.numero && nfeData.serie) {
-    console.log(`[SHOPEE] Tentativa 4 (fallback): add_invoice_data para ${orderSn}...`);
-    const fallbackResult = await addInvoiceData(orderSn, nfeData.numero, nfeData.serie, nfeData.chaveAcesso);
-    if (fallbackResult.success) {
-      return fallbackResult;
-    }
-    console.warn(`[SHOPEE] add_invoice_data também falhou: ${fallbackResult.error}`);
-  }
+  console.warn(`[SHOPEE] Upload application/xml falhou: ${result.error} — ${result.message || ''}`);
 
   return { success: false, error: `${result.error}: ${result.message || ''}` };
 }
