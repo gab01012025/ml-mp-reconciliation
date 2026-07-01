@@ -428,8 +428,9 @@ export async function generateNFFromOrder(orderId: string, orderNumero?: string)
     const retorno = result.retorno;
 
     if (retorno.status !== 'OK') {
+      console.error(`[DEBUG] gerar.nota.fiscal.pedido ERRO for ${label}:`, JSON.stringify(retorno, null, 2));
       const erros = retorno.erros;
-      const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro desconhecido';
+      const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || `Status: ${retorno.status}`;
       console.error(`[ERRO] Falha ao gerar NF do pedido ${label}: ${errList}`);
       return { success: false, error: errList };
     }
@@ -438,8 +439,23 @@ export async function generateNFFromOrder(orderId: string, orderNumero?: string)
     const reg = Array.isArray(registro) ? registro[0] : registro;
 
     if (!reg || reg.status !== 'OK') {
+      // Log full response for debugging
+      console.error(`[DEBUG] gerar.nota.fiscal.pedido response for ${label}:`, JSON.stringify(retorno, null, 2));
       const erros = reg?.erros || retorno.erros;
-      const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Registro sem status OK';
+      let errList: string;
+      if (Array.isArray(erros)) {
+        errList = erros.map((e: any) => e.erro).join('; ');
+      } else if (erros?.erro) {
+        errList = erros.erro;
+      } else if (reg?.descricao_status) {
+        errList = reg.descricao_status;
+      } else if (reg?.status) {
+        errList = `Status: ${reg.status}`;
+      } else if (!reg) {
+        errList = 'Tiny não retornou registro na resposta';
+      } else {
+        errList = `Registro sem status OK (keys: ${Object.keys(reg).join(', ')})`;
+      }
       console.error(`[ERRO] Gerar NF pedido ${label}: ${errList}`);
       return { success: false, error: errList };
     }
@@ -455,8 +471,9 @@ export async function generateNFFromOrder(orderId: string, orderNumero?: string)
     const emitirRetorno = emitirResult.retorno;
 
     if (emitirRetorno.status !== 'OK') {
+      console.error(`[DEBUG] nota.fiscal.emitir ERRO for NF ${nfId}:`, JSON.stringify(emitirRetorno, null, 2));
       const erros = emitirRetorno.erros;
-      const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro desconhecido';
+      const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || `Status: ${emitirRetorno.status}`;
       console.error(`[ERRO] NF ${nfId} gerada mas falhou ao emitir: ${errList}`);
       return { success: false, nfId, error: `NF gerada mas falhou ao emitir na SEFAZ: ${errList}` };
     }
