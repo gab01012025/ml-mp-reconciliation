@@ -438,8 +438,10 @@ export async function generateNFFromOrder(orderId: string, orderNumero?: string)
     const registro = retorno.registros?.registro;
     const reg = Array.isArray(registro) ? registro[0] : registro;
 
-    if (!reg || reg.status !== 'OK') {
-      // Log full response for debugging
+    // gerar.nota.fiscal.pedido returns idNotaFiscal (not id) and has no per-registro status field.
+    // Success = retorno.status OK + registro with idNotaFiscal.
+    const hasNfId = reg && (reg.idNotaFiscal || reg.id);
+    if (!hasNfId) {
       console.error(`[DEBUG] gerar.nota.fiscal.pedido response for ${label}:`, JSON.stringify(retorno, null, 2));
       const erros = reg?.erros || retorno.erros;
       let errList: string;
@@ -449,18 +451,16 @@ export async function generateNFFromOrder(orderId: string, orderNumero?: string)
         errList = erros.erro;
       } else if (reg?.descricao_status) {
         errList = reg.descricao_status;
-      } else if (reg?.status) {
-        errList = `Status: ${reg.status}`;
       } else if (!reg) {
         errList = 'Tiny não retornou registro na resposta';
       } else {
-        errList = `Registro sem status OK (keys: ${Object.keys(reg).join(', ')})`;
+        errList = `Registro sem NF ID (keys: ${Object.keys(reg).join(', ')})`;
       }
       console.error(`[ERRO] Gerar NF pedido ${label}: ${errList}`);
       return { success: false, error: errList };
     }
 
-    const nfId = String(reg.id);
+    const nfId = String(reg.idNotaFiscal || reg.id);
     const nfNumero = String(reg.numero || '');
     const nfSerie = String(reg.serie || '');
     console.log(`[OK] NF ${nfNumero} (série ${nfSerie}) gerada para pedido ${label} (NF ID: ${nfId})`);
