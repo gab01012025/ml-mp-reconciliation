@@ -2393,16 +2393,16 @@ const server = http.createServer(async (req, res) => {
 </style></head><body>
 <a href="/?token=${tokenParam}" class="back-link">\u2190 Voltar ao Dashboard</a>
 <h1>Processar Pedido</h1>
-<p class="subtitle">Insira o Order SN da Shopee e processe automaticamente (NF + envio), ou busque manualmente.</p>
+<p class="subtitle">Insira o Order SN (Shopee) ou n\u00ba do pedido (ML/Tiny) para buscar e gerar NF.</p>
 
 <div class="card">
-  <h2>Processar Pedido Shopee</h2>
+  <h2>Processar Pedido Individual</h2>
   <div class="search-row">
-    <input type="text" id="inputNumero" placeholder="Order SN da Shopee (ex: 260621KV4AKGJ8)" onkeydown="if(event.key==='Enter')processarAuto()">
+    <input type="text" id="inputNumero" placeholder="Order SN Shopee ou n\u00ba pedido ML/Tiny" onkeydown="if(event.key==='Enter')processarAuto()">
     <button class="btn btn-green" id="btnProcessar" onclick="processarAuto()" style="min-width:180px;">Processar Pedido</button>
     <button class="btn btn-blue btn-sm" id="btnBuscar" onclick="buscar()" title="Buscar sem processar (modo manual)">Buscar</button>
   </div>
-  <p style="margin-top:8px;font-size:12px;color:#94a3b8;">Processar = busca no Tiny + gera NF + envia para Shopee (tudo autom\u00e1tico)</p>
+  <p style="margin-top:8px;font-size:12px;color:#94a3b8;">Processar = busca no Tiny + gera NF (Tiny envia automaticamente para o marketplace)</p>
   <div id="msgBusca" class="msg" style="margin-top:12px;"></div>
 </div>
 
@@ -2644,11 +2644,10 @@ function renderSteps(p) {
     steps[2].detail = 'NF j\u00e1 registrada no marketplace';
   } else if (!p.temNF) {
     steps[2].detail = 'Gere a NF primeiro (etapa 2)';
-  } else if (p.canal === 'Mercado Livre') {
-    steps[2].detail = 'ML: NF vinculada automaticamente pelo Tiny';
-    steps[2].done = p.temNF; // ML auto-links
   } else {
-    steps[2].detail = 'Pendente — enviar XML da NF para a Shopee';
+    // NF gerada via gerar.nota.fiscal.pedido preserva o selo — Tiny auto-envia
+    steps[2].detail = 'Tiny envia NF automaticamente para ' + p.canal;
+    steps[2].done = true;
   }
 
   // Step 4
@@ -2703,25 +2702,50 @@ function setStepError(stepId, detail) {
 
 async function gerarNF() {
   if (!pedidoAtual) return;
-  // Se não tem ID do Tiny, tenta pipeline completo via processar-unico
-  if (!pedidoAtual.id && pedidoAtual.canal === 'Shopee' && pedidoAtual.numero_ecommerce) {
-    setStepLoading('step2', 'Buscando no Tiny + gerando NF...');
-    try {
-      var r2 = await fetch('/pedido/processar-unico', { method: 'POST', headers: authHeaders, body: JSON.stringify({ orderSn: pedidoAtual.numero_ecommerce }) });
-      var d2 = await r2.json();
-      if (d2.result && d2.result.nf) {
-        var nfMsg = 'NF ' + (d2.result.nf.numero || '') + ' — Chave: ...' + (d2.result.nf.chaveAcesso || '').slice(-8) + (d2.result.nf.valorNota ? ' — R$ ' + d2.result.nf.valorNota.toFixed(2) : '');
-        setStepDone('step2', nfMsg);
-        pedidoAtual.temNF = true;
-        pedidoAtual.id = d2.result.tinyId || '';
-        pedidoAtual.nf = d2.result.nf;
-      } else {
-        var errDetail = 'Falha ao gerar NF';
-        if (d2.result && d2.result.steps) {
-          var failedStep = d2.result.steps.filter(function(s) { return !s.ok; });
-          if (failedStep.length > 0) errDetail = failedStep[failedStep.length - 1].detail;
+  // Se não tem ID do Tiny mas tem numero_ecommerce
+  if (!pedidoAtual.id && pedidoAtual.numero_ecommerce) {
+    // Shopee: pipeline completo via processar-unico (busca no Tiny por data + gera NF)
+    if (pedidoAtual.canal === 'Shopee') {
+      setStepLoading('step2', 'Buscando no Tiny + gerando NF...');
+      try {
+        var r2 = await fetch('/pedido/processar-unico', { method: 'POST', headers: authHeaders, body: JSON.stringify({ orderSn: pedidoAtual.numero_ecommerce }) });
+        var d2 = await r2.json();
+        if (d2.nf) {
+          var nfMsg = 'NF ' + (d2.nf.numero || '') + ' — Chave: ...' + (d2.nf.chaveAcesso || '').slice(-8) + (d2.nf.valorNota ? ' — R$ ' + d2.nf.valorNota.toFixed(2) : '');
+          setStepDone('step2', nfMsg);
+          pedidoAtual.temNF = true;
+          pedidoAtual.id = d2.tinyId || '';
+          pedidoAtual.nf = d2.nf;
+          // Step 3: Tiny auto-envia
+          setStepDone('step3', 'NF gerada com selo ecommerce — Tiny envia automaticamente.');
+        } else {
+          var errDetail = 'Falha ao gerar NF';
+          if (d2.steps) {
+            var failedStep = d2.steps.filter(function(s) { return !s.ok; });
+            if (failedStep.length > 0) errDetail = failedStep[failedStep.length - 1].detail;
+          } else if (d2.error) {
+            errDetail = d2.error;
+          }
+          setStepError('step2', errDetail);
         }
-        setStepError('step2', errDetail);
+      } catch(e) { setStepError('step2', 'Erro: ' + e.message); }
+      return;
+    }
+    // ML e outros: tenta gerar-nf com numero_ecommerce (busca por ecommerce no backend)
+    setStepLoading('step2', 'Gerando NF...');
+    try {
+      var r3 = await fetch('/pedido/gerar-nf', { method: 'POST', headers: authHeaders, body: JSON.stringify({ orderId: pedidoAtual.numero_ecommerce, canal: pedidoAtual.canal }) });
+      var d3 = await r3.json();
+      if (d3.ok) {
+        var msg3 = 'NF ' + (d3.numero || '') + (d3.jaExistia ? ' (j\u00e1 existia)' : ' gerada') + (d3.chaveAcesso ? ' — Chave: ...' + d3.chaveAcesso.slice(-8) : '') + (d3.valorNota ? ' — R$ ' + d3.valorNota.toFixed(2) : '');
+        setStepDone('step2', msg3);
+        pedidoAtual.temNF = true;
+        pedidoAtual.nf = { nfId: d3.nfId, numero: d3.numero, chaveAcesso: d3.chaveAcesso, valorNota: d3.valorNota };
+        if (pedidoAtual.canal === 'Mercado Livre') {
+          setStepDone('step3', 'ML: Tiny envia NF automaticamente.');
+        }
+      } else {
+        setStepError('step2', d3.error || 'Erro ao gerar NF');
       }
     } catch(e) { setStepError('step2', 'Erro: ' + e.message); }
     return;
@@ -2739,10 +2763,8 @@ async function gerarNF() {
       setStepDone('step2', msg);
       pedidoAtual.temNF = true;
       pedidoAtual.nf = { nfId: d.nfId, numero: d.numero, chaveAcesso: d.chaveAcesso, situacao: d.situacao || 'Autorizada', valorNota: d.valorNota };
-      // Habilita etapa 3
-      var btn3 = document.getElementById('btn-step3');
-      if (btn3) btn3.disabled = false;
-      document.getElementById('step3-detail').textContent = 'NF pronta para envio ao marketplace';
+      // NF gerada via gerar.nota.fiscal.pedido → Tiny auto-envia
+      setStepDone('step3', 'NF gerada com selo ecommerce — Tiny envia automaticamente.');
     } else {
       setStepError('step2', d.error || 'Erro ao gerar NF');
     }
@@ -3457,7 +3479,7 @@ function getDashboardHtml(): string {
             </div>
 
             <hr style="border:none; border-top:1px solid #f0f0f0; margin: 16px 0;">
-            <button class="btn btn-primary" onclick="openProcessarPedido()" style="background:#3b82f6;">🎯 Processar Pedido Individual (Shopee)</button>
+            <button class="btn btn-primary" onclick="openProcessarPedido()" style="background:#3b82f6;">Processar Pedido Individual</button>
             <span style="font-size:11px; color:#999; margin-left:8px;">Busca no Tiny + gera NF + envia para Shopee</span>
           </div>
 
