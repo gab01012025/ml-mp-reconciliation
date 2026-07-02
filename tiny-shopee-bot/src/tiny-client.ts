@@ -471,15 +471,22 @@ export async function generateNFFromOrder(orderId: string, orderNumero?: string)
     const emitirRetorno = emitirResult.retorno;
 
     if (emitirRetorno.status !== 'OK') {
-      console.error(`[DEBUG] nota.fiscal.emitir ERRO for NF ${nfId}:`, JSON.stringify(emitirRetorno, null, 2));
       const erros = emitirRetorno.erros;
       const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || `Status: ${emitirRetorno.status}`;
-      console.error(`[ERRO] NF ${nfId} gerada mas falhou ao emitir: ${errList}`);
-      return { success: false, nfId, error: `NF gerada mas falhou ao emitir na SEFAZ: ${errList}` };
-    }
 
-    const situacao = emitirRetorno.nota_fiscal?.situacao;
-    console.log(`[OK] NF ${nfId} emitida na SEFAZ — situação: ${situacao}`);
+      // "apenas notas pendentes ou rejeitadas podem ser enviadas" = NF já foi emitida/autorizada
+      const jaEmitida = errList.toLowerCase().includes('apenas notas pendentes') || errList.toLowerCase().includes('já autorizada');
+      if (jaEmitida) {
+        console.log(`[OK] NF ${nfId} já estava emitida na SEFAZ — prosseguindo para obter detalhes`);
+      } else {
+        console.error(`[DEBUG] nota.fiscal.emitir ERRO for NF ${nfId}:`, JSON.stringify(emitirRetorno, null, 2));
+        console.error(`[ERRO] NF ${nfId} gerada mas falhou ao emitir: ${errList}`);
+        return { success: false, nfId, error: `NF gerada mas falhou ao emitir na SEFAZ: ${errList}` };
+      }
+    } else {
+      const situacao = emitirRetorno.nota_fiscal?.situacao;
+      console.log(`[OK] NF ${nfId} emitida na SEFAZ — situação: ${situacao}`);
+    }
 
     // Obter chave de acesso
     let chaveAcesso: string | undefined;
