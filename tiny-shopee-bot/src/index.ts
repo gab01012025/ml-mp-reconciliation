@@ -2492,25 +2492,25 @@ async function processarAuto() {
     }
   }
 
+  // Renderizar resultado (d foi definido em ambos os paths acima)
+  try {
     if (d.error && !d.steps) {
       contentDiv.innerHTML = '<div class="msg msg-err" style="display:block;">' + d.error + '</div>';
       return;
     }
 
     var h = '';
-    // Verifica se a NF foi gerada mas o envio para Shopee falhou
     var nfGerada = d.nf && (d.nf.chaveAcesso || d.nf.nfId);
     var envioFalhou = !d.nfSent && nfGerada;
 
     if (d.success) {
-      h += '<div class="msg msg-ok" style="display:block;margin-bottom:14px;">Pedido ' + orderSn + ' processado com sucesso!</div>';
+      h += '<div class="msg msg-ok" style="display:block;margin-bottom:14px;">Pedido processado com sucesso!</div>';
     } else if (nfGerada && envioFalhou) {
-      h += '<div class="msg msg-info" style="display:block;margin-bottom:14px;">NF gerada com sucesso, mas o envio autom\u00e1tico para a Shopee falhou. Use a planilha XLSX no dashboard para enviar em lote.</div>';
+      h += '<div class="msg msg-info" style="display:block;margin-bottom:14px;">NF gerada com sucesso, mas o envio autom\u00e1tico para o marketplace falhou. Use a planilha XLSX no dashboard para enviar em lote.</div>';
     } else {
       h += '<div class="msg msg-err" style="display:block;margin-bottom:14px;">Processamento parou com erro. Veja os detalhes abaixo.</div>';
     }
 
-    // Info resumo
     if (d.tinyNumero || d.clienteNome) {
       h += '<div style="margin-bottom:12px;font-size:13px;color:#64748b;">';
       if (d.tinyNumero) h += 'Pedido Tiny: <strong>#' + d.tinyNumero + '</strong> (ID ' + d.tinyId + ')';
@@ -2518,7 +2518,6 @@ async function processarAuto() {
       h += '</div>';
     }
 
-    // Steps timeline
     h += '<div class="steps">';
     (d.steps || []).forEach(function(s, i) {
       var cls = s.ok ? 'step-done' : 'step-error';
@@ -2530,7 +2529,6 @@ async function processarAuto() {
     });
     h += '</div>';
 
-    // NF info
     if (nfGerada) {
       h += '<div style="margin-top:14px;padding:12px;background:#f0fdf4;border-radius:8px;border:1px solid #bbf7d0;font-size:13px;">';
       h += '<strong>NF:</strong> ' + (d.nf.numero || d.nf.nfId) + ' &mdash; R$ ' + (d.nf.valorNota || 0).toFixed(2);
@@ -2540,7 +2538,6 @@ async function processarAuto() {
       h += '</div>';
     }
 
-    // Status do CSV/checklist
     if (nfGerada) {
       h += '<div style="margin-top:10px;padding:10px 12px;background:#eff6ff;border-radius:8px;border:1px solid #bfdbfe;font-size:12px;color:#1e40af;">';
       h += '<strong>Integra\u00e7\u00e3o:</strong> ';
@@ -2555,14 +2552,14 @@ async function processarAuto() {
       if (d.nfSent) {
         h += ' &mdash; Relat\u00f3rio de separa\u00e7\u00e3o dispon\u00edvel';
       } else {
-        h += ' &mdash; <span style="color:#dc2626;">NF n\u00e3o enviada para Shopee \u2014 envie antes de gerar etiqueta/separa\u00e7\u00e3o</span>';
+        h += ' &mdash; <span style="color:#dc2626;">NF n\u00e3o enviada para marketplace \u2014 envie antes de gerar etiqueta</span>';
       }
       h += '</div>';
     }
 
     contentDiv.innerHTML = h;
   } catch(e) {
-    contentDiv.innerHTML = '<div class="msg msg-err" style="display:block;">Erro de conex\u00e3o: ' + e.message + '</div>';
+    contentDiv.innerHTML = '<div class="msg msg-err" style="display:block;">Erro: ' + e.message + '</div>';
   } finally {
     btn.disabled = false;
     btn.innerHTML = 'Processar Pedido';
