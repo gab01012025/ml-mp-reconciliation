@@ -1040,12 +1040,16 @@ const server = http.createServer(async (req, res) => {
       console.log(`[SHOPEE] Baixando etiqueta para pedido ${orderSn}...`);
       const result = await shopeeClient.getShippingLabel(orderSn);
       if (result.success && result.pdf) {
+        const buf = result.pdf;
+        const isZip = buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4B;
+        const contentType = isZip ? 'application/zip' : 'application/pdf';
+        const ext = isZip ? 'zip' : 'pdf';
         res.writeHead(200, {
-          'Content-Type': 'application/pdf',
-          'Content-Disposition': `attachment; filename="etiqueta_${orderSn}.pdf"`,
-          'Content-Length': String(result.pdf.length),
+          'Content-Type': contentType,
+          'Content-Disposition': `attachment; filename="etiqueta_${orderSn}.${ext}"`,
+          'Content-Length': String(buf.length),
         });
-        res.end(result.pdf);
+        res.end(buf);
       } else {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: result.error, orderSn, steps: result.steps }, null, 2));
@@ -2297,11 +2301,15 @@ const server = http.createServer(async (req, res) => {
         }
         const result = await shopeeClient.getShippingLabel(orderSn);
         if (result.success && result.pdf) {
+          const buf = result.pdf;
+          const isZip = buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4B;
+          const contentType = isZip ? 'application/zip' : 'application/pdf';
+          const ext = isZip ? 'zip' : 'pdf';
           res.writeHead(200, {
-            'Content-Type': 'application/pdf',
-            'Content-Disposition': `attachment; filename="etiqueta_${orderSn}.pdf"`,
+            'Content-Type': contentType,
+            'Content-Disposition': `attachment; filename="etiqueta_${orderSn}.${ext}"`,
           });
-          res.end(result.pdf);
+          res.end(buf);
         } else {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
@@ -2727,8 +2735,20 @@ function setStepError(stepId, detail) {
   setStepState(stepId, 'error', detail);
 }
 
+var _nfBusy = false;
 async function gerarNF() {
+  if (_nfBusy) return;
   if (!pedidoAtual) return;
+  if (pedidoAtual.temNF) {
+    setStepDone('step2', 'NF já gerada — ' + (pedidoAtual.nf ? pedidoAtual.nf.numero : ''));
+    return;
+  }
+  _nfBusy = true;
+  var btn2 = document.getElementById('btn-step2');
+  if (btn2) btn2.disabled = true;
+  try { await _gerarNFInternal(); } finally { _nfBusy = false; }
+}
+async function _gerarNFInternal() {
   // Se não tem ID do Tiny mas tem numero_ecommerce
   if (!pedidoAtual.id && pedidoAtual.numero_ecommerce) {
     // Shopee: pipeline completo via processar-unico (busca no Tiny por data + gera NF)

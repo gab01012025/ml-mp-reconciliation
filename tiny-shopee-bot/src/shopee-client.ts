@@ -720,6 +720,7 @@ export async function downloadShippingDocument(orderSn: string, docTypeHint?: st
     : ALL_SHIPPING_DOC_TYPES;
 
   let lastError = '';
+  let zipFallback: Buffer | undefined;
   for (const docType of typesToTry) {
     const shopId = currentTokens?.shop_id || String(SHOP_ID);
     const timestamp = Math.floor(Date.now() / 1000);
@@ -759,8 +760,9 @@ export async function downloadShippingDocument(orderSn: string, docTypeHint?: st
         }
 
         if (isZip) {
-          // ZIP with thermal/ZPL label — skip and try next doc type (NORMAL gives PDF)
+          // ZIP with thermal/ZPL label — save as fallback, try next type for PDF
           console.log(`[SHOPEE] download_shipping_document (${docType}): ZIP/ZPL detectado (${buf.length} bytes), tentando próximo tipo...`);
+          if (!zipFallback) zipFallback = buf;
           lastError = `${docType} retornou formato ZPL (etiqueta térmica), não PDF`;
           continue;
         }
@@ -782,6 +784,11 @@ export async function downloadShippingDocument(orderSn: string, docTypeHint?: st
     } catch (err: any) {
       lastError = err.message || String(err);
     }
+  }
+  // Se nenhum tipo retornou PDF mas temos ZIP/ZPL como fallback, retorna ele
+  if (zipFallback) {
+    console.log(`[SHOPEE] download_shipping_document: nenhum PDF disponível, usando fallback ZIP/ZPL (${zipFallback.length} bytes)`);
+    return { success: true, pdf: zipFallback };
   }
   return { success: false, error: lastError };
 }
