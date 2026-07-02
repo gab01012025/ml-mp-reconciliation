@@ -2285,6 +2285,81 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: err.message || String(err) }));
     }
 
+  } else if (url.pathname === '/pedido/enviar-nf-individual' && req.method === 'POST') {
+    // Envio individual de NF — busca pedido no Tiny, encontra NF, envia ao marketplace
+    try {
+      const body = await parseBody(req);
+      const { orderNumber } = JSON.parse(body);
+      if (!orderNumber || !orderNumber.trim()) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Número do pedido é obrigatório' }));
+        return;
+      }
+      const num = orderNumber.trim();
+      console.log(`[ENVIO-INDIVIDUAL] Enviando NF do pedido ${num}...`);
+
+      // Busca pedido no Tiny por ecommerce number
+      const matches = await tinyClient.searchByNumeroEcommerce(num);
+      if (matches.length === 0) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: `Pedido "${num}" não encontrado no Tiny` }));
+        return;
+      }
+      const tinyOrder = matches[0];
+      const tinyOrderId = tinyOrder.id;
+      console.log(`[ENVIO-INDIVIDUAL] Pedido Tiny #${tinyOrder.numero} (ID ${tinyOrderId})`);
+
+      // Busca detalhes do pedido para pegar id_nota_fiscal
+      const detail = await tinyClient.getOrder(tinyOrderId);
+      if (!detail.id_nota_fiscal) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: `Pedido ${num} encontrado no Tiny (#${detail.numero}) mas sem NF vinculada. Gere a NF primeiro.` }));
+        return;
+      }
+      const nfId = detail.id_nota_fiscal;
+      const nfDetail = await tinyClient.getNFDetails(nfId);
+      const nfNumero = nfDetail.numero || nfId;
+      console.log(`[ENVIO-INDIVIDUAL] NF encontrada: ${nfNumero} (ID ${nfId})`);
+
+      // Determina canal pelo formato
+      const isShopeeFormat = /^\d{6}(?=[A-Z0-9]*[A-Z])[A-Z0-9]{8,10}$/.test(num.toUpperCase());
+
+      if (isShopeeFormat) {
+        // Verifica se já enviada
+        const check = await shopeeClient.checkOrderInvoice(num);
+        if (check.hasInvoice) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, message: `NF já estava registrada na Shopee (pedido ${num})` }));
+          return;
+        }
+        // Busca XML e envia
+        const xml = await tinyClient.getNFXml(nfId);
+        if (!xml) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Não foi possível obter o XML da NF no Tiny' }));
+          return;
+        }
+        const result = await shopeeClient.uploadInvoiceDoc(num, xml);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: result.success,
+          message: result.success ? `NF ${nfNumero} enviada com sucesso para a Shopee (pedido ${num})` : undefined,
+          error: result.success ? undefined : result.error,
+        }));
+      } else {
+        // ML: Tiny envia automaticamente
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: true,
+          message: `Pedido ML ${num} — NF ${nfNumero} encontrada. O Tiny envia automaticamente para o Mercado Livre quando a NF tem o selo ecommerce.`,
+        }));
+      }
+    } catch (err: any) {
+      console.error(`[ENVIO-INDIVIDUAL] Erro: ${err.message}`);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: err.message || String(err) }));
+    }
+
   } else if (url.pathname === '/pedido/etiqueta' && req.method === 'POST') {
     // Gera etiqueta de envio
     try {
@@ -3597,7 +3672,19 @@ function getDashboardHtml(): string {
 
           <!-- Shopee Send Tab -->
           <div class="tab-pane active" id="enviar-shopee">
-            <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Enviar NFs para a Shopee (retroativo)</p>
+            <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Enviar NF Individual</p>
+            <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Insira o Order SN da Shopee para enviar a NF desse pedido.</p>
+            <div id="msgEnvioIndividual" class="msg msg-ok"></div>
+            <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin-bottom:16px;">
+              <div class="form-sm">
+                <label>Order SN / Nº Ecommerce</label>
+                <input type="text" id="inputEnvioIndividual" placeholder="Ex: 260703MKBQ194J" style="min-width:200px;">
+              </div>
+              <button class="btn btn-primary btn-sm" id="btnEnvioIndividual" onclick="enviarNFIndividual()">📤 Enviar NF</button>
+            </div>
+
+            <hr style="border:none; border-top:1px solid #f0f0f0; margin: 16px 0;">
+            <p style="font-size:13px; color:#888; margin-bottom:12px; font-weight:600;">Enviar NFs para a Shopee (retroativo / lote)</p>
             <p style="font-size:12px; color:#aaa; margin-bottom:12px;">Busca pedidos Shopee que já possuem NF emitida no Tiny e envia a chave de acesso via API.</p>
             <div id="msgShopeeNF" class="msg msg-ok"></div>
             <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin-bottom:16px;">
@@ -4054,6 +4141,21 @@ function getDashboardHtml(): string {
         setTimeout(function() { location.reload(); }, 1000);
       } catch(e) { showMsg('msgToggle', 'Erro: ' + e.message, false); }
       btn.disabled = false;
+    }
+
+    async function enviarNFIndividual() {
+      var input = document.getElementById('inputEnvioIndividual').value.trim();
+      if (!input) { showMsg('msgEnvioIndividual', 'Insira o Order SN ou nº do pedido', false); return; }
+      var btn = document.getElementById('btnEnvioIndividual');
+      btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Enviando...';
+      hideMsg('msgEnvioIndividual');
+      try {
+        var r = await fetch('/pedido/enviar-nf-individual', { method: 'POST', headers: authHeaders, body: JSON.stringify({ orderNumber: input }) });
+        if (r.status === 401) { handleAuthError(); return; }
+        var d = await r.json();
+        showMsg('msgEnvioIndividual', d.message || d.error || 'Resposta inesperada', d.ok);
+      } catch(e) { showMsg('msgEnvioIndividual', 'Erro: ' + e.message, false); }
+      finally { btn.disabled = false; btn.innerHTML = '📤 Enviar NF'; }
     }
 
     async function sendNFsToShopee() {
