@@ -2438,12 +2438,8 @@ var searchCache = {};
 var autoRetryTimer = null;
 
 async function processarAuto() {
-  var orderSn = document.getElementById('inputNumero').value.trim().toUpperCase();
-  if (!orderSn) { showMsg('msgBusca', 'Insira o Order SN da Shopee', 'err'); return; }
-  if (!/^\\d{6}[A-Z0-9]{8,10}$/.test(orderSn)) {
-    showMsg('msgBusca', 'Formato inv\u00e1lido. Use o Order SN da Shopee (ex: 260621KV4AKGJ8)', 'err');
-    return;
-  }
+  var input = document.getElementById('inputNumero').value.trim();
+  if (!input) { showMsg('msgBusca', 'Insira o Order SN (Shopee) ou nº do pedido (ML/Tiny)', 'err'); return; }
   hideMsg('msgBusca');
   document.getElementById('pedidoInfo').classList.add('hidden');
   document.getElementById('pedidoSteps').classList.add('hidden');
@@ -2455,12 +2451,46 @@ async function processarAuto() {
 
   var resultDiv = document.getElementById('autoResult');
   var contentDiv = document.getElementById('autoResultContent');
-  contentDiv.innerHTML = '<div style="text-align:center;padding:20px;"><span class="spinner" style="width:24px;height:24px;"></span><p style="margin-top:8px;color:#64748b;font-size:13px;">Processando pedido ' + orderSn + '...<br>Buscando no Tiny, gerando NF, enviando para Shopee...</p></div>';
-  resultDiv.classList.remove('hidden');
 
-  try {
-    var r = await fetch('/pedido/processar-unico', { method: 'POST', headers: authHeaders, body: JSON.stringify({ orderSn: orderSn }) });
-    var d = await r.json();
+  var isShopee = /^\\d{6}[A-Z0-9]{8,10}$/.test(input.toUpperCase());
+
+  if (isShopee) {
+    // Shopee: pipeline completo via processar-unico
+    var orderSn = input.toUpperCase();
+    contentDiv.innerHTML = '<div style="text-align:center;padding:20px;"><span class="spinner" style="width:24px;height:24px;"></span><p style="margin-top:8px;color:#64748b;font-size:13px;">Processando pedido ' + orderSn + '...<br>Buscando no Tiny, gerando NF, enviando para Shopee...</p></div>';
+    resultDiv.classList.remove('hidden');
+    try {
+      var r = await fetch('/pedido/processar-unico', { method: 'POST', headers: authHeaders, body: JSON.stringify({ orderSn: orderSn }) });
+      var d = await r.json();
+    } catch(e) {
+      contentDiv.innerHTML = '<div class="msg msg-err" style="display:block;">Erro de conexão: ' + e.message + '</div>';
+      btn.disabled = false; btn.innerHTML = 'Processar Pedido'; document.getElementById('btnBuscar').disabled = false;
+      return;
+    }
+  } else {
+    // ML / Tiny ID: busca no Tiny + gera NF via gerar-nf
+    contentDiv.innerHTML = '<div style="text-align:center;padding:20px;"><span class="spinner" style="width:24px;height:24px;"></span><p style="margin-top:8px;color:#64748b;font-size:13px;">Processando pedido ' + input + '...<br>Buscando no Tiny e gerando NF...</p></div>';
+    resultDiv.classList.remove('hidden');
+    try {
+      var r2 = await fetch('/pedido/gerar-nf', { method: 'POST', headers: authHeaders, body: JSON.stringify({ orderId: input }) });
+      var d2 = await r2.json();
+      // Adapta resposta de /pedido/gerar-nf para o formato de steps
+      var d = { steps: [], success: false, nf: null };
+      d.steps.push({ step: 'Buscar no Tiny', ok: d2.ok || d2.nf, detail: d2.ok ? 'Pedido encontrado' : (d2.error || 'Não encontrado') });
+      if (d2.nf) {
+        d.success = true;
+        d.nf = d2.nf;
+        d.steps.push({ step: 'Nota Fiscal (NF-e)', ok: true, detail: 'NF ' + (d2.nf.numero || d2.nf.nfId) + ' gerada e emitida' });
+        d.steps.push({ step: 'Enviar NF ao Marketplace', ok: true, detail: 'Tiny envia automaticamente com selo ecommerce' });
+      } else if (d2.error) {
+        d.steps.push({ step: 'Nota Fiscal (NF-e)', ok: false, detail: d2.error });
+      }
+    } catch(e) {
+      contentDiv.innerHTML = '<div class="msg msg-err" style="display:block;">Erro de conexão: ' + e.message + '</div>';
+      btn.disabled = false; btn.innerHTML = 'Processar Pedido'; document.getElementById('btnBuscar').disabled = false;
+      return;
+    }
+  }
 
     if (d.error && !d.steps) {
       contentDiv.innerHTML = '<div class="msg msg-err" style="display:block;">' + d.error + '</div>';

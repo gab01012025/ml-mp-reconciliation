@@ -600,7 +600,8 @@ export async function shipOrder(orderSn: string, addressId?: number, pickupTimeI
 }
 
 // Todos os tipos de documento de envio suportados pela Shopee
-const ALL_SHIPPING_DOC_TYPES = ['THERMAL_AIR_WAYBILL', 'NORMAL_AIR_WAYBILL', 'THERMAL_JOB_AIR_WAYBILL', 'NORMAL_JOB_AIR_WAYBILL'];
+// Prioriza NORMAL (retorna PDF) antes de THERMAL (retorna ZIP com ZPL para impressora térmica)
+const ALL_SHIPPING_DOC_TYPES = ['NORMAL_AIR_WAYBILL', 'NORMAL_JOB_AIR_WAYBILL', 'THERMAL_AIR_WAYBILL', 'THERMAL_JOB_AIR_WAYBILL'];
 
 // === Public API: Get shipping document parameter (descobre o tipo correto de documento) ===
 export async function getShippingDocumentParameter(orderSn: string): Promise<{ success: boolean; suggestedType?: string; selectableTypes?: string[]; error?: string }> {
@@ -742,14 +743,34 @@ export async function downloadShippingDocument(orderSn: string, docTypeHint?: st
       const contentType = res.headers.get('content-type') || '';
       console.log(`[SHOPEE] download_shipping_document (${docType}): status=${res.status} content-type=${contentType}`);
 
-      // If response is PDF/binary, return the buffer
-      if (contentType.includes('application/pdf') || contentType.includes('application/octet-stream')) {
+      // If response is NOT JSON, treat as binary
+      if (!contentType.includes('application/json')) {
         const arrayBuffer = await res.arrayBuffer();
-        console.log(`[SHOPEE] download_shipping_document (${docType}): PDF OK`);
-        return { success: true, pdf: Buffer.from(arrayBuffer) };
+        const buf = Buffer.from(arrayBuffer);
+
+        // Check if it's actually a PDF (%PDF magic bytes)
+        const isPdf = buf.length > 4 && buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46;
+        // Check if it's a ZIP (PK magic bytes) — likely ZPL thermal label, not useful as PDF
+        const isZip = buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4B;
+
+        if (isPdf) {
+          console.log(`[SHOPEE] download_shipping_document (${docType}): PDF OK (${buf.length} bytes)`);
+          return { success: true, pdf: buf };
+        }
+
+        if (isZip) {
+          // ZIP with thermal/ZPL label — skip and try next doc type (NORMAL gives PDF)
+          console.log(`[SHOPEE] download_shipping_document (${docType}): ZIP/ZPL detectado (${buf.length} bytes), tentando próximo tipo...`);
+          lastError = `${docType} retornou formato ZPL (etiqueta térmica), não PDF`;
+          continue;
+        }
+
+        // Unknown binary — return as-is (might still work)
+        console.log(`[SHOPEE] download_shipping_document (${docType}): binário desconhecido (${buf.length} bytes), retornando`);
+        return { success: true, pdf: buf };
       }
 
-      // Otherwise it's a JSON error
+      // JSON error response
       const rawText = await res.text();
       try {
         const json = JSON.parse(rawText);
