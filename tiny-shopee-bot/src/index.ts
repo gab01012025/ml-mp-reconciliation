@@ -238,7 +238,7 @@ const server = http.createServer(async (req, res) => {
   // Public: version check (for debugging deploys)
   if (url.pathname === '/version') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ version: 'v3.96', deployed: startTime.toISOString() }));
+    res.end(JSON.stringify({ version: 'v3.96', build: '2026-07-03T03:00Z', deployed: startTime.toISOString() }));
     return;
   }
 
@@ -2145,22 +2145,87 @@ const server = http.createServer(async (req, res) => {
 
       console.log(`[MANUAL] Gerando NF para pedido ${orderId} (canal: ${canal})`);
 
-      // Tenta obter pelo ID do Tiny; se falhar, busca pelo numero_ecommerce
-      let detail: Awaited<ReturnType<typeof tinyClient.getOrder>>;
+      // Busca pedido no Tiny — tenta por ID direto primeiro (mais rápido), depois por número, depois por ecommerce
+      let detail: Awaited<ReturnType<typeof tinyClient.getOrder>> | null = null;
       let tinyOrderId = orderId;
-      try {
-        detail = await tinyClient.getOrder(orderId);
-      } catch {
-        // Não é um ID Tiny válido — tenta buscar pelo numero_ecommerce
-        console.log(`[MANUAL] Pedido ${orderId} não encontrado por ID, buscando por numero_ecommerce...`);
-        const matches = await tinyClient.searchByNumeroEcommerce(orderId);
-        if (matches.length === 0) {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: `Pedido "${orderId}" não encontrado no Tiny (nem por ID nem por nº ecommerce)` }));
-          return;
+      const isNumericOnly = /^\d+$/.test(orderId);
+      const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+      if (isNumericOnly) {
+        // Input numérico: provavelmente ID Tiny ou número Tiny
+        // 1) Tenta por ID direto (mais rápido, sem busca)
+        try {
+          detail = await tinyClient.getOrder(orderId);
+          tinyOrderId = orderId;
+        } catch {
+          console.log(`[MANUAL] getOrder(${orderId}) por ID direto falhou`);
         }
-        tinyOrderId = matches[0].id;
-        detail = await tinyClient.getOrder(tinyOrderId);
+
+        // 2) Tenta por numero Tiny
+        if (!detail) {
+          try {
+            await sleep(1200);
+            const results = await tinyClient.searchByNumero(orderId);
+            if (results.length > 0) {
+              const match = results.find(r => r.numero === orderId) || results[0];
+              tinyOrderId = match.id;
+              await sleep(1200);
+              detail = await tinyClient.getOrder(tinyOrderId);
+            }
+          } catch (e: any) {
+            console.log(`[MANUAL] searchByNumero(${orderId}) falhou: ${e.message}`);
+          }
+        }
+
+        // 3) Tenta por numero_ecommerce (ML usa IDs numéricos longos)
+        if (!detail) {
+          try {
+            await sleep(1200);
+            const matches = await tinyClient.searchByNumeroEcommerce(orderId);
+            if (matches.length > 0) {
+              tinyOrderId = matches[0].id;
+              await sleep(1200);
+              detail = await tinyClient.getOrder(tinyOrderId);
+            }
+          } catch (e: any) {
+            console.log(`[MANUAL] searchByNumeroEcommerce(${orderId}) falhou: ${e.message}`);
+          }
+        }
+      } else {
+        // Input não-numérico: provavelmente Order SN Shopee ou nº ecommerce
+        // 1) Tenta por numero_ecommerce
+        try {
+          const matches = await tinyClient.searchByNumeroEcommerce(orderId);
+          if (matches.length > 0) {
+            tinyOrderId = matches[0].id;
+            await sleep(1200);
+            detail = await tinyClient.getOrder(tinyOrderId);
+          }
+        } catch (e: any) {
+          console.log(`[MANUAL] searchByNumeroEcommerce(${orderId}) falhou: ${e.message}`);
+        }
+
+        // 2) Tenta por numero Tiny
+        if (!detail) {
+          try {
+            await sleep(1200);
+            const results = await tinyClient.searchByNumero(orderId);
+            if (results.length > 0) {
+              const match = results.find(r => r.numero === orderId) || results[0];
+              tinyOrderId = match.id;
+              await sleep(1200);
+              detail = await tinyClient.getOrder(tinyOrderId);
+            }
+          } catch (e: any) {
+            console.log(`[MANUAL] searchByNumero(${orderId}) falhou: ${e.message}`);
+          }
+        }
+      }
+
+      if (!detail) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, found: false, error: `Pedido "${orderId}" não encontrado no Tiny. Verifique se o número está correto.` }));
+        return;
       }
 
       if (detail.id_nota_fiscal) {
@@ -2168,7 +2233,11 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           ok: true,
+          found: true,
           jaExistia: true,
+          clienteNome: detail.cliente?.nome || '',
+          tinyNumero: detail.numero || '',
+          tinyId: tinyOrderId,
           nfId: detail.id_nota_fiscal,
           numero: nf.numero,
           chaveAcesso: nf.chaveAcesso,
@@ -2178,15 +2247,18 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      // Info do pedido para exibir no frontend
+      const pedidoInfo = { clienteNome: detail.cliente?.nome || '', tinyNumero: detail.numero || '', tinyId: tinyOrderId };
+
       // Validações
       if (!tinyClient.hasClientAddress(detail)) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'Pedido sem endereço completo do cliente' }));
+        res.end(JSON.stringify({ ok: false, found: true, ...pedidoInfo, error: 'Pedido sem endereço completo do cliente' }));
         return;
       }
       if (tinyClient.hasMaskedClientData(detail)) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'Dados do cliente mascarados (***). Atualize no Tiny antes.' }));
+        res.end(JSON.stringify({ ok: false, found: true, ...pedidoInfo, error: 'Dados do cliente mascarados (***). Atualize no Tiny antes.' }));
         return;
       }
 
@@ -2213,6 +2285,8 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           ok: true,
+          found: true,
+          ...pedidoInfo,
           nfId: nf.nfId,
           numero: nf.numero,
           chaveAcesso: nf.chaveAcesso,
@@ -2220,7 +2294,7 @@ const server = http.createServer(async (req, res) => {
         }));
       } else {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: nf.error || 'Falha ao gerar NF. Verifique os logs.' }));
+        res.end(JSON.stringify({ ok: false, found: true, ...pedidoInfo, error: nf.error || 'Falha ao gerar NF. Verifique os logs.' }));
       }
     } catch (err: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -2558,15 +2632,20 @@ async function processarAuto() {
       var r2 = await fetch('/pedido/gerar-nf', { method: 'POST', headers: authHeaders, body: JSON.stringify({ orderId: input }) });
       var d2 = await r2.json();
       // Adapta resposta de /pedido/gerar-nf para o formato de steps
-      var d = { steps: [], success: false, nf: null };
-      d.steps.push({ step: 'Buscar no Tiny', ok: d2.ok || d2.nf, detail: d2.ok ? 'Pedido encontrado' : (d2.error || 'Não encontrado') });
-      if (d2.nf) {
+      // Backend retorna { ok, found, nfId, numero, chaveAcesso, valorNota, clienteNome, tinyNumero } no nível raiz
+      var d = { steps: [], success: false, nf: null, tinyNumero: d2.tinyNumero, tinyId: d2.tinyId, clienteNome: d2.clienteNome };
+      var wasFound = d2.found || d2.ok || d2.nfId;
+      d.steps.push({ step: 'Buscar no Tiny', ok: !!wasFound, detail: wasFound ? ('Pedido encontrado' + (d2.tinyNumero ? ' — #' + d2.tinyNumero : '')) : (d2.error || 'Não encontrado') });
+      if (d2.ok && (d2.nfId || d2.numero)) {
         d.success = true;
-        d.nf = d2.nf;
-        d.steps.push({ step: 'Nota Fiscal (NF-e)', ok: true, detail: 'NF ' + (d2.nf.numero || d2.nf.nfId) + ' gerada e emitida' });
+        d.nf = { nfId: d2.nfId, numero: d2.numero, chaveAcesso: d2.chaveAcesso, valorNota: d2.valorNota };
+        var nfLabel = d2.numero || d2.nfId;
+        d.steps.push({ step: 'Nota Fiscal (NF-e)', ok: true, detail: 'NF ' + nfLabel + (d2.jaExistia ? ' (já existia)' : ' gerada e emitida') });
         d.steps.push({ step: 'Enviar NF ao Marketplace', ok: true, detail: 'Tiny envia automaticamente com selo ecommerce' });
-      } else if (d2.error) {
+      } else if (d2.error && wasFound) {
         d.steps.push({ step: 'Nota Fiscal (NF-e)', ok: false, detail: d2.error });
+      } else if (d2.error) {
+        // Não encontrou — o erro já aparece no step 1
       }
     } catch(e) {
       contentDiv.innerHTML = '<div class="msg msg-err" style="display:block;">Erro de conexão: ' + e.message + '</div>';
@@ -2800,7 +2879,7 @@ function setStepLoading(stepId, label) {
 
 function setStepDone(stepId, detail) {
   var btn = document.getElementById('btn-' + stepId);
-  if (btn) btn.disabled = true;
+  if (btn) { btn.disabled = true; btn.innerHTML = '\\u2705 Conclu\\u00eddo'; }
   setStepState(stepId, 'done', detail);
 }
 
