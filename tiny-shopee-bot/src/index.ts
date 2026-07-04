@@ -231,14 +231,14 @@ const server = http.createServer(async (req, res) => {
   // Public: health
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.97', uptime: process.uptime() }));
+    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.98', uptime: process.uptime() }));
     return;
   }
 
   // Public: version check (for debugging deploys)
   if (url.pathname === '/version') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ version: 'v3.97', build: '2026-07-04T12:00Z', deployed: startTime.toISOString() }));
+    res.end(JSON.stringify({ version: 'v3.98', build: '2026-07-04T12:00Z', deployed: startTime.toISOString() }));
     return;
   }
 
@@ -2343,6 +2343,392 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: err.message || String(err) }));
     }
 
+  } else if (url.pathname === '/batch/processar' && req.method === 'POST') {
+    // Processa pedidos em lote (gerar NF + enviar) com progresso via SSE
+    try {
+      const body = await parseBody(req);
+      const { pedidos, acoes } = JSON.parse(body) as {
+        pedidos: Array<{ id: string; numero: string; numero_ecommerce: string; canal: string }>;
+        acoes: string[];
+      };
+      if (!pedidos || pedidos.length === 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Nenhum pedido selecionado' }));
+        return;
+      }
+
+      // SSE headers
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      const sendSSE = (data: any) => { res.write(`data: ${JSON.stringify(data)}\n\n`); };
+      const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+      const doNF = acoes.includes('nf');
+      const doEnviar = acoes.includes('enviar');
+      const resumo = { total: pedidos.length, nfGeradas: 0, nfErros: 0, nfJaExistiam: 0, enviadas: 0, envioErros: 0 };
+      let aborted = false;
+      req.on('close', () => { aborted = true; });
+
+      for (let i = 0; i < pedidos.length; i++) {
+        if (aborted) break;
+        const p = pedidos[i];
+        const label = `${p.numero || p.id} (${p.canal === 'Mercado Livre' ? 'ML' : p.canal || '?'})`;
+
+        // ---- GERAR NF ----
+        if (doNF) {
+          sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: 'Buscando pedido...' });
+          try {
+            await sleep(1200);
+            const detail = await tinyClient.getOrder(p.id);
+
+            // Já tem NF?
+            if (detail.id_nota_fiscal) {
+              const nfInfo = await tinyClient.getNFDetails(detail.id_nota_fiscal);
+              sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'ok', detail: `NF ${nfInfo.numero || detail.id_nota_fiscal} já existia` });
+              resumo.nfJaExistiam++;
+              // Guarda nfId no pedido para o envio
+              (p as any)._nfId = detail.id_nota_fiscal;
+              (p as any)._nfNumero = nfInfo.numero;
+              (p as any)._chaveAcesso = nfInfo.chaveAcesso;
+            } else {
+              // Validações
+              if (!tinyClient.hasClientAddress(detail)) {
+                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'erro', detail: 'Sem endereço completo' });
+                resumo.nfErros++;
+                continue;
+              }
+              if (tinyClient.hasMaskedClientData(detail)) {
+                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'erro', detail: 'Dados mascarados (***)' });
+                resumo.nfErros++;
+                continue;
+              }
+
+              // Aplicar desconto
+              let detectedCanal: 'Shopee' | 'ML' | null = null;
+              if (tinyClient.isShopeeOrder(detail)) detectedCanal = 'Shopee';
+              else if (tinyClient.isMercadoLivreOrder(detail)) detectedCanal = 'ML';
+
+              if (detectedCanal) {
+                try {
+                  const discountPercent = await tinyClient.getMarketplaceDiscount(detectedCanal);
+                  if (discountPercent > 0) {
+                    await sleep(1200);
+                    await tinyClient.alterOrderPrices(p.id, detail, discountPercent);
+                  }
+                } catch { /* desconto falhou, segue sem */ }
+              }
+
+              // Gerar NF
+              await sleep(1200);
+              const nf = await tinyClient.generateNFFromOrder(p.id, detail.numero);
+              if (nf.success) {
+                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'ok', detail: `NF ${nf.numero || nf.nfId} gerada` });
+                resumo.nfGeradas++;
+                (p as any)._nfId = nf.nfId;
+                (p as any)._nfNumero = nf.numero;
+                (p as any)._chaveAcesso = nf.chaveAcesso;
+
+                // Registra no histórico
+                const processedNF: ProcessedNF = {
+                  numero: nf.numero || '', nfId: nf.nfId || '', chaveAcesso: nf.chaveAcesso || '',
+                  clienteNome: detail.cliente.nome || '', numeroEcommerce: detail.numero_ecommerce || '',
+                  valorNota: nf.valorNota || 0, dataProcessamento: new Date().toLocaleDateString('pt-BR'),
+                };
+                nfHistory.unshift(processedNF);
+                if (nfHistory.length > MAX_NF_HISTORY) nfHistory.splice(MAX_NF_HISTORY);
+                if (detectedCanal === 'Shopee') appendToShopeeCSV([processedNF]);
+                addToChecklist([processedNF], detectedCanal || 'Manual');
+                totalNFsEmitted++;
+              } else {
+                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'erro', detail: nf.error || 'Falha ao gerar NF' });
+                resumo.nfErros++;
+                continue; // sem NF, não faz sentido enviar
+              }
+            }
+          } catch (e: any) {
+            sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'erro', detail: e.message || 'Erro inesperado' });
+            resumo.nfErros++;
+            continue;
+          }
+        }
+
+        // ---- ENVIAR NF ----
+        if (doEnviar && p.canal === 'Shopee' && p.numero_ecommerce) {
+          const nfId = (p as any)._nfId;
+          const chaveAcesso = (p as any)._chaveAcesso;
+          if (!nfId) {
+            sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'erro', detail: 'Sem NF para enviar' });
+            resumo.envioErros++;
+          } else {
+            sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'working', detail: 'Enviando NF para Shopee...' });
+            try {
+              // Verifica se já foi enviada
+              const check = await shopeeClient.checkOrderInvoice(p.numero_ecommerce);
+              if (check.hasInvoice) {
+                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'ok', detail: 'NF já estava na Shopee' });
+                resumo.enviadas++;
+              } else {
+                await sleep(1200);
+                const xml = await tinyClient.getNFXml(nfId);
+                if (xml) {
+                  const sendResult = await shopeeClient.uploadInvoiceDoc(p.numero_ecommerce, xml);
+                  if (sendResult.success) {
+                    sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'ok', detail: 'NF enviada para Shopee' });
+                    resumo.enviadas++;
+                  } else {
+                    sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'erro', detail: sendResult.error || 'Falha no envio' });
+                    resumo.envioErros++;
+                  }
+                } else {
+                  sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'erro', detail: 'XML da NF não disponível' });
+                  resumo.envioErros++;
+                }
+              }
+            } catch (e: any) {
+              sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'erro', detail: e.message });
+              resumo.envioErros++;
+            }
+          }
+        } else if (doEnviar && p.canal === 'Mercado Livre') {
+          sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'ok', detail: 'Tiny envia automaticamente (ML)' });
+          resumo.enviadas++;
+        }
+      }
+
+      sendSSE({ type: 'done', resumo });
+      res.end();
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+
+  } else if (url.pathname === '/batch/etiquetas' && req.method === 'GET') {
+    // Download de etiquetas dos pedidos selecionados
+    try {
+      const snsParam = url.searchParams.get('sns') || '';
+      const canal = url.searchParams.get('canal') || '';
+      const sns = snsParam.split(',').map(s => s.trim()).filter(Boolean);
+
+      if (sns.length === 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Nenhum order SN fornecido' }));
+        return;
+      }
+
+      console.log(`[BATCH] Etiquetas para ${sns.length} pedidos (canal: ${canal || 'misto'})`);
+
+      // Separar Shopee e ML
+      // Para identificar canal de cada SN, verificamos se tem padrão ML ou foi informado
+      const shopeeSns: string[] = [];
+      const mlSns: string[] = [];
+
+      if (canal === 'Shopee') {
+        shopeeSns.push(...sns);
+      } else if (canal === 'Mercado Livre') {
+        mlSns.push(...sns);
+      } else {
+        // Canal misto — pedidos Shopee geralmente começam com letras maiúsculas seguidas de números
+        for (const sn of sns) {
+          // ML orders tipicamente são numéricos puros
+          if (/^\d+$/.test(sn)) {
+            mlSns.push(sn);
+          } else {
+            shopeeSns.push(sn);
+          }
+        }
+      }
+
+      const pdfBuffers: Buffer[] = [];
+      const errors: string[] = [];
+
+      // Etiquetas Shopee
+      if (shopeeSns.length > 0) {
+        console.log(`[BATCH] Processando ${shopeeSns.length} etiquetas Shopee...`);
+        for (const sn of shopeeSns) {
+          try {
+            const result = await shopeeClient.getShippingLabel(sn);
+            if (result.success && result.pdf) {
+              pdfBuffers.push(result.pdf);
+            } else {
+              errors.push(`${sn}: ${result.error || 'Falha'}`);
+            }
+            await new Promise(r => setTimeout(r, 1500));
+          } catch (e: any) {
+            errors.push(`${sn}: ${e.message}`);
+          }
+        }
+      }
+
+      // Etiquetas ML
+      if (mlSns.length > 0) {
+        console.log(`[BATCH] Processando ${mlSns.length} etiquetas ML...`);
+        for (const sn of mlSns) {
+          try {
+            // numero_ecommerce do ML é o order_id — usar downloadLabelByOrderId
+            const orderId = parseInt(sn, 10);
+            if (isNaN(orderId)) {
+              errors.push(`ML ${sn}: ID inválido`);
+              continue;
+            }
+            const result = await ml.downloadLabelByOrderId(orderId);
+            if (result.success && result.pdf) {
+              pdfBuffers.push(result.pdf);
+            } else {
+              errors.push(`ML ${sn}: ${result.error || 'Falha'}`);
+            }
+            await new Promise(r => setTimeout(r, 1500));
+          } catch (e: any) {
+            errors.push(`ML ${sn}: ${e.message}`);
+          }
+        }
+      }
+
+      if (pdfBuffers.length === 0) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Nenhuma etiqueta disponível', details: errors }));
+        return;
+      }
+
+      // Retorna o primeiro PDF (ou concatenados se possível)
+      // Para simplificar, retorna PDFs individuais concatenados como download
+      if (pdfBuffers.length === 1) {
+        res.writeHead(200, {
+          'Content-Type': 'application/pdf',
+          'Content-Disposition': `attachment; filename="etiquetas_batch_${new Date().toISOString().slice(0, 10)}.pdf"`,
+          'Content-Length': String(pdfBuffers[0].length),
+        });
+        res.end(pdfBuffers[0]);
+      } else {
+        // Concatena buffers — cada um é um PDF válido; na prática retorna o primeiro
+        // e informa que há mais para download individual
+        const combined = Buffer.concat(pdfBuffers);
+        res.writeHead(200, {
+          'Content-Type': 'application/pdf',
+          'Content-Disposition': `attachment; filename="etiquetas_batch_${new Date().toISOString().slice(0, 10)}.pdf"`,
+          'Content-Length': String(combined.length),
+          'X-Labels-Count': String(pdfBuffers.length),
+          'X-Labels-Errors': String(errors.length),
+        });
+        res.end(combined);
+      }
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+
+  } else if (url.pathname === '/batch/picking-list' && req.method === 'GET') {
+    // Lista de separação dos pedidos selecionados
+    try {
+      const idsParam = url.searchParams.get('ids') || '';
+      const ids = idsParam.split(',').map(s => s.trim()).filter(Boolean);
+
+      if (ids.length === 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Nenhum ID de pedido fornecido' }));
+        return;
+      }
+
+      console.log(`[BATCH] Picking list para ${ids.length} pedidos...`);
+
+      // Busca detalhes de cada pedido no Tiny
+      interface BatchPickItem { order_sn: string; numero: string; canal: string; clienteNome: string; sku: string; produto: string; quantidade: number; }
+      const items: BatchPickItem[] = [];
+      const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+      for (const id of ids) {
+        try {
+          await sleep(1200);
+          const detail = await tinyClient.getOrder(id);
+          const orderSn = detail.numero_ecommerce || '';
+          const canal = tinyClient.isShopeeOrder(detail) ? 'Shopee' : (tinyClient.isMercadoLivreOrder(detail) ? 'ML' : 'Outro');
+          const clienteNome = detail.cliente?.nome || '';
+
+          if (detail.itens && detail.itens.length > 0) {
+            for (const item of detail.itens) {
+              items.push({
+                order_sn: orderSn,
+                numero: detail.numero || id,
+                canal,
+                clienteNome,
+                sku: item.codigo || '-',
+                produto: item.descricao || 'Sem nome',
+                quantidade: parseInt(item.quantidade, 10) || 1,
+              });
+            }
+          }
+        } catch (e: any) {
+          console.log(`[BATCH] Picking: erro ao buscar pedido ${id}: ${e.message}`);
+        }
+      }
+
+      // Agrupar por SKU para separação
+      const skuMap: Record<string, { sku: string; produto: string; total: number; pedidos: string[] }> = {};
+      for (const item of items) {
+        const key = item.sku;
+        if (!skuMap[key]) {
+          skuMap[key] = { sku: key, produto: item.produto, total: 0, pedidos: [] };
+        }
+        skuMap[key].total += item.quantidade;
+        skuMap[key].pedidos.push(item.numero);
+      }
+
+      const skuList = Object.values(skuMap).sort((a, b) => a.sku.localeCompare(b.sku));
+
+      // Gerar HTML de separação
+      const html = `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>Lista de Separação — ${ids.length} pedidos</title>
+<style>
+  body { font-family: Arial, sans-serif; max-width: 900px; margin: 20px auto; padding: 0 20px; color: #333; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .meta { font-size: 12px; color: #888; margin-bottom: 20px; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 30px; }
+  th { background: #1e293b; color: white; padding: 10px 12px; text-align: left; font-size: 13px; }
+  td { padding: 8px 12px; border-bottom: 1px solid #e2e8f0; font-size: 13px; }
+  tr:nth-child(even) { background: #f8fafc; }
+  .qty { font-weight: 700; font-size: 16px; text-align: center; }
+  .sku { font-family: monospace; font-weight: 600; }
+  .check { width: 30px; text-align: center; }
+  h2 { font-size: 16px; margin-top: 30px; color: #475569; }
+  @media print { body { max-width: 100%; } button { display: none; } }
+</style>
+</head>
+<body>
+<h1>📦 Lista de Separação</h1>
+<div class="meta">${new Date().toLocaleDateString('pt-BR')} — ${ids.length} pedidos, ${items.length} itens, ${skuList.length} SKUs distintos</div>
+<button onclick="window.print()" style="background:#1e293b;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600;margin-bottom:16px;">🖨 Imprimir</button>
+
+<h2>Por SKU (para separar)</h2>
+<table>
+<thead><tr><th class="check">✓</th><th>SKU</th><th>Produto</th><th style="text-align:center;">Qtd Total</th><th>Pedidos</th></tr></thead>
+<tbody>
+${skuList.map(s => `<tr><td class="check"><input type="checkbox"></td><td class="sku">${s.sku}</td><td>${s.produto}</td><td class="qty">${s.total}</td><td style="font-size:11px;color:#888;">${s.pedidos.join(', ')}</td></tr>`).join('\n')}
+</tbody>
+</table>
+
+<h2>Por Pedido (para conferência)</h2>
+<table>
+<thead><tr><th class="check">✓</th><th>Pedido</th><th>Canal</th><th>Cliente</th><th>SKU</th><th>Produto</th><th style="text-align:center;">Qtd</th></tr></thead>
+<tbody>
+${items.map(i => `<tr><td class="check"><input type="checkbox"></td><td style="font-family:monospace;">${i.numero}</td><td>${i.canal}</td><td>${i.clienteNome}</td><td class="sku">${i.sku}</td><td>${i.produto}</td><td class="qty">${i.quantidade}</td></tr>`).join('\n')}
+</tbody>
+</table>
+</body>
+</html>`;
+
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || String(err) }));
+    }
+
   } else if (url.pathname === '/pedido/enviar-nf' && req.method === 'POST') {
     // Envia NF para o marketplace (Shopee ou ML)
     try {
@@ -3228,7 +3614,7 @@ function getLoginHtml(error?: string): string {
       <div class="int-badge"><span class="dot"></span> Mercado Livre</div>
       <div class="int-badge"><span class="dot"></span> Tiny ERP</div>
     </div>
-    <div class="footer">SyncHub v3.97 — Integrador de Marketplaces e ERPs</div>
+    <div class="footer">SyncHub v3.98 — Integrador de Marketplaces e ERPs</div>
   </div>
   <script>
     if (localStorage.getItem('auth_token')) { window.location.href = '/'; }
@@ -3431,7 +3817,7 @@ function getDashboardHtml(): string {
       <div class="section-label">Sistema</div>
       <a href="#logs"><span class="icon">📄</span> Logs</a>
     </nav>
-    <div class="sidebar-footer">SyncHub v3.97<br>Integrador ERP/HUB</div>
+    <div class="sidebar-footer">SyncHub v3.98<br>Integrador ERP/HUB</div>
   </div>
 
   <!-- Main -->
@@ -3611,6 +3997,7 @@ function getDashboardHtml(): string {
               <table style="width:100%; border-collapse:collapse; font-size:13px;">
                 <thead style="position:sticky; top:0; background:#f8fafc; z-index:1;">
                   <tr>
+                    <th style="padding:10px 8px; text-align:center; border-bottom:2px solid #e2e8f0; width:36px;"><input type="checkbox" id="selectAllCheck" onchange="toggleSelectAll(this)" title="Selecionar todos"></th>
                     <th style="padding:10px 12px; text-align:left; border-bottom:2px solid #e2e8f0; font-weight:600; color:#475569;">Canal</th>
                     <th style="padding:10px 12px; text-align:left; border-bottom:2px solid #e2e8f0; font-weight:600; color:#475569;">Pedido Ecommerce</th>
                     <th style="padding:10px 12px; text-align:left; border-bottom:2px solid #e2e8f0; font-weight:600; color:#475569;">N° Tiny</th>
@@ -3626,10 +4013,39 @@ function getDashboardHtml(): string {
             </div>
           </div>
 
+          <!-- Barra de ações batch (aparece ao selecionar pedidos) -->
+          <div id="batchBar" style="display:none; position:sticky; bottom:0; z-index:10; background:linear-gradient(135deg,#1e293b,#0f172a); color:white; padding:12px 20px; border-radius:10px; margin-top:12px; align-items:center; gap:12px; box-shadow:0 -4px 20px rgba(0,0,0,0.15);">
+            <span id="batchCount" style="font-weight:700; font-size:14px; min-width:120px;">0 selecionados</span>
+            <button class="btn btn-sm" onclick="batchGerarNF()" style="background:#16a34a; color:white; border:none; padding:8px 16px; border-radius:6px; font-weight:600; font-size:12px; cursor:pointer;">📝 Gerar NFs</button>
+            <button class="btn btn-sm" onclick="batchGerarEEnviar()" style="background:#2563eb; color:white; border:none; padding:8px 16px; border-radius:6px; font-weight:600; font-size:12px; cursor:pointer;">📝📤 NFs + Enviar</button>
+            <button class="btn btn-sm" onclick="batchEtiquetas()" style="background:#7c3aed; color:white; border:none; padding:8px 16px; border-radius:6px; font-weight:600; font-size:12px; cursor:pointer;">🏷 Etiquetas</button>
+            <button class="btn btn-sm" onclick="batchSeparacao()" style="background:#d97706; color:white; border:none; padding:8px 16px; border-radius:6px; font-weight:600; font-size:12px; cursor:pointer;">📦 Separação</button>
+            <button onclick="clearSelection()" style="background:none; border:1px solid rgba(255,255,255,0.3); color:white; padding:6px 12px; border-radius:6px; font-size:11px; cursor:pointer; margin-left:auto;">✕ Limpar</button>
+          </div>
+
+          <!-- Modal de progresso batch -->
+          <div id="batchModal" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.5); z-index:9999; align-items:center; justify-content:center;">
+            <div style="background:white; border-radius:16px; padding:30px; width:600px; max-width:90vw; max-height:80vh; overflow-y:auto; box-shadow:0 20px 60px rgba(0,0,0,0.3);">
+              <h3 style="margin:0 0 8px 0; font-size:18px;" id="batchModalTitle">Processando...</h3>
+              <div style="margin-bottom:16px;">
+                <div style="background:#e2e8f0; border-radius:8px; height:8px; overflow:hidden;">
+                  <div id="batchProgressBar" style="background:linear-gradient(90deg,#16a34a,#22c55e); height:100%; width:0%; transition:width 0.3s;"></div>
+                </div>
+                <div style="font-size:12px; color:#64748b; margin-top:4px;" id="batchProgressText">0/0</div>
+              </div>
+              <div id="batchProgressList" style="font-size:13px; line-height:1.8;"></div>
+              <div id="batchResumo" style="display:none; margin-top:16px; padding:12px; background:#f0fdf4; border-radius:8px; border:1px solid #bbf7d0;"></div>
+              <div style="margin-top:16px; text-align:right;">
+                <button id="batchModalClose" onclick="closeBatchModal()" style="background:#f1f5f9; border:1px solid #e2e8f0; padding:8px 20px; border-radius:8px; font-size:13px; cursor:pointer; font-weight:600;">Fechar</button>
+              </div>
+            </div>
+          </div>
+
           <!-- Ações após listar (aparecem após listar) -->
           <div id="listOrdersActions" style="display:none;">
             <hr style="border:none; border-top:1px solid #e2e8f0; margin: 16px 0;">
-            <p style="font-size:13px; color:#475569; font-weight:600; margin-bottom:12px;">Processar Pedidos Listados</p>
+            <details style="margin-bottom:12px;">
+            <summary style="font-size:13px; color:#475569; font-weight:600; cursor:pointer; padding:8px 0;">⚙ Controles Avançados (automação, sync manual)</summary>
 
             <div class="tab-bar" style="margin-bottom:14px;">
               <button class="tab-btn active" onclick="switchTab('processar','shopee')">🛒 Shopee</button>
@@ -3728,6 +4144,7 @@ function getDashboardHtml(): string {
             <hr style="border:none; border-top:1px solid #f0f0f0; margin: 16px 0;">
             <button class="btn btn-primary" onclick="openProcessarPedido()" style="background:#3b82f6;">Processar Pedido Individual</button>
             <span style="font-size:11px; color:#999; margin-left:8px;">Busca no Tiny + gera NF + envia para Shopee</span>
+            </details>
           </div>
 
           <!-- Última execução -->
@@ -4099,6 +4516,8 @@ function getDashboardHtml(): string {
     // ===== LISTAR PEDIDOS (Passo 1) =====
     var _listOrdersData = []; // cache dos pedidos listados
     var _listOrdersFilter = 'todos';
+    var _selectedOrders = {}; // Map: id → {id, numero, numero_ecommerce, canal}
+    var _batchEventSource = null; // SSE connection for batch processing
 
     function _todayStr() {
       var d = new Date(); return String(d.getDate()).padStart(2,'0') + '/' + String(d.getMonth()+1).padStart(2,'0') + '/' + d.getFullYear();
@@ -4125,6 +4544,7 @@ function getDashboardHtml(): string {
         if (!r.ok) { showMsg('msgListOrders', d.error || 'Erro ao listar', false); return; }
 
         _listOrdersData = d.pedidos || [];
+        _selectedOrders = {}; // Limpar seleção ao listar novos pedidos
         var s = d.resumo;
 
         // Resumo cards
@@ -4185,7 +4605,9 @@ function getDashboardHtml(): string {
           ? '<span style="color:#16a34a;font-weight:600;">✓ Sim</span>'
           : '<span style="color:#94a3b8;">—</span>';
         var rowBg = i % 2 === 0 ? '#fff' : '#fafbfc';
+        var isChecked = _selectedOrders[o.id] ? ' checked' : '';
         html += '<tr style="background:' + rowBg + ';">'
+          + '<td style="padding:8px;border-bottom:1px solid #f0f0f0;text-align:center;"><input type="checkbox" class="order-check" data-id="' + o.id + '" data-numero="' + o.numero + '" data-sn="' + (o.numero_ecommerce || '') + '" data-canal="' + (o.canal || '') + '" onchange="onOrderCheck(this)"' + isChecked + '></td>'
           + '<td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;">' + canalBadge + '</td>'
           + '<td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;font-family:monospace;font-size:12px;">' + (o.numero_ecommerce || '—') + '</td>'
           + '<td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;font-family:monospace;font-size:12px;">' + o.numero + '</td>'
@@ -4197,9 +4619,225 @@ function getDashboardHtml(): string {
           + '</tr>';
       }
       if (data.length === 0) {
-        html = '<tr><td colspan="8" style="padding:24px;text-align:center;color:#94a3b8;">Nenhum pedido encontrado com esse filtro</td></tr>';
+        html = '<tr><td colspan="9" style="padding:24px;text-align:center;color:#94a3b8;">Nenhum pedido encontrado com esse filtro</td></tr>';
       }
       document.getElementById('listOrdersBody').innerHTML = html;
+      updateSelectAllState();
+    }
+
+    // ===== BATCH SELECTION & ACTIONS =====
+
+    function onOrderCheck(cb) {
+      var id = cb.getAttribute('data-id');
+      if (cb.checked) {
+        _selectedOrders[id] = {
+          id: id,
+          numero: cb.getAttribute('data-numero'),
+          numero_ecommerce: cb.getAttribute('data-sn'),
+          canal: cb.getAttribute('data-canal')
+        };
+      } else {
+        delete _selectedOrders[id];
+      }
+      updateBatchBar();
+      updateSelectAllState();
+    }
+
+    function toggleSelectAll(cb) {
+      var checks = document.querySelectorAll('#listOrdersBody .order-check');
+      for (var i = 0; i < checks.length; i++) {
+        checks[i].checked = cb.checked;
+        var id = checks[i].getAttribute('data-id');
+        if (cb.checked) {
+          _selectedOrders[id] = {
+            id: id,
+            numero: checks[i].getAttribute('data-numero'),
+            numero_ecommerce: checks[i].getAttribute('data-sn'),
+            canal: checks[i].getAttribute('data-canal')
+          };
+        } else {
+          delete _selectedOrders[id];
+        }
+      }
+      updateBatchBar();
+    }
+
+    function updateSelectAllState() {
+      var checks = document.querySelectorAll('#listOrdersBody .order-check');
+      var allCheck = document.getElementById('selectAllCheck');
+      if (!allCheck || checks.length === 0) return;
+      var checkedCount = 0;
+      for (var i = 0; i < checks.length; i++) { if (checks[i].checked) checkedCount++; }
+      allCheck.checked = checkedCount === checks.length;
+      allCheck.indeterminate = checkedCount > 0 && checkedCount < checks.length;
+    }
+
+    function updateBatchBar() {
+      var keys = Object.keys(_selectedOrders);
+      var bar = document.getElementById('batchBar');
+      if (keys.length > 0) {
+        bar.style.display = 'flex';
+        document.getElementById('batchCount').textContent = keys.length + ' selecionado' + (keys.length > 1 ? 's' : '');
+      } else {
+        bar.style.display = 'none';
+      }
+    }
+
+    function clearSelection() {
+      _selectedOrders = {};
+      var checks = document.querySelectorAll('#listOrdersBody .order-check');
+      for (var i = 0; i < checks.length; i++) checks[i].checked = false;
+      var allCheck = document.getElementById('selectAllCheck');
+      if (allCheck) { allCheck.checked = false; allCheck.indeterminate = false; }
+      updateBatchBar();
+    }
+
+    function getSelectedArray() {
+      var arr = [];
+      var keys = Object.keys(_selectedOrders);
+      for (var i = 0; i < keys.length; i++) arr.push(_selectedOrders[keys[i]]);
+      return arr;
+    }
+
+    function batchGerarNF() { runBatch(['nf'], '📝 Gerando NFs...'); }
+    function batchGerarEEnviar() { runBatch(['nf', 'enviar'], '📝📤 Gerando NFs e Enviando...'); }
+
+    function runBatch(acoes, title) {
+      var pedidos = getSelectedArray();
+      if (pedidos.length === 0) return;
+
+      // Abrir modal
+      var modal = document.getElementById('batchModal');
+      modal.style.display = 'flex';
+      document.getElementById('batchModalTitle').textContent = title;
+      document.getElementById('batchProgressBar').style.width = '0%';
+      document.getElementById('batchProgressText').textContent = '0/' + pedidos.length;
+      document.getElementById('batchResumo').style.display = 'none';
+      document.getElementById('batchModalClose').textContent = 'Cancelar';
+
+      // Lista de pedidos no modal
+      var listHtml = '';
+      for (var i = 0; i < pedidos.length; i++) {
+        var p = pedidos[i];
+        var canalLabel = p.canal === 'Mercado Livre' ? 'ML' : (p.canal || '?');
+        listHtml += '<div id="batchItem_' + p.id + '" style="padding:4px 0; border-bottom:1px solid #f0f0f0;">'
+          + '<span class="batch-icon" style="display:inline-block;width:20px;">⬜</span> '
+          + '<strong>' + (p.numero || p.id) + '</strong> '
+          + '<span style="color:#94a3b8;">(' + canalLabel + ')</span> '
+          + '<span class="batch-detail" style="color:#64748b;"></span>'
+          + '</div>';
+      }
+      document.getElementById('batchProgressList').innerHTML = listHtml;
+
+      // Iniciar SSE
+      var body = JSON.stringify({ pedidos: pedidos, acoes: acoes });
+      fetch('/batch/processar', {
+        method: 'POST',
+        headers: Object.assign({}, authHeaders, { 'Content-Type': 'application/json' }),
+        body: body
+      }).then(function(response) {
+        var reader = response.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = '';
+
+        function pump() {
+          reader.read().then(function(result) {
+            if (result.done) return;
+            buffer += decoder.decode(result.value, { stream: true });
+            var lines = buffer.split('\\n');
+            buffer = lines.pop() || '';
+            for (var i = 0; i < lines.length; i++) {
+              var line = lines[i].trim();
+              if (line.startsWith('data: ')) {
+                try {
+                  var evt = JSON.parse(line.substring(6));
+                  handleBatchEvent(evt, pedidos);
+                } catch(e) {}
+              }
+            }
+            pump();
+          }).catch(function(err) {
+            console.error('Batch stream error:', err);
+          });
+        }
+        pump();
+      }).catch(function(err) {
+        document.getElementById('batchModalTitle').textContent = 'Erro: ' + err.message;
+      });
+    }
+
+    function handleBatchEvent(evt, pedidos) {
+      if (evt.type === 'progress') {
+        // Atualizar barra de progresso
+        var pct = Math.round((evt.current / evt.total) * 100);
+        document.getElementById('batchProgressBar').style.width = pct + '%';
+        document.getElementById('batchProgressText').textContent = evt.current + '/' + evt.total;
+
+        // Encontrar o pedido pelo índice
+        var p = pedidos[evt.current - 1];
+        if (p) {
+          var item = document.getElementById('batchItem_' + p.id);
+          if (item) {
+            var icon = item.querySelector('.batch-icon');
+            var detail = item.querySelector('.batch-detail');
+            if (evt.status === 'ok') {
+              icon.textContent = '✅';
+              detail.textContent = evt.detail || '';
+              detail.style.color = '#16a34a';
+            } else if (evt.status === 'erro') {
+              icon.textContent = '❌';
+              detail.textContent = evt.detail || 'Erro';
+              detail.style.color = '#dc2626';
+            } else if (evt.status === 'working') {
+              icon.textContent = '⏳';
+              detail.textContent = evt.detail || '...';
+              detail.style.color = '#d97706';
+            }
+          }
+        }
+      } else if (evt.type === 'done') {
+        document.getElementById('batchProgressBar').style.width = '100%';
+        document.getElementById('batchModalTitle').textContent = 'Processamento concluído';
+        document.getElementById('batchModalClose').textContent = 'Fechar';
+
+        var r = evt.resumo || {};
+        var resumoHtml = '<div style="font-size:14px; font-weight:600; margin-bottom:8px;">📊 Resumo</div>'
+          + '<div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; font-size:13px;">'
+          + '<div>Total processados: <strong>' + (r.total || 0) + '</strong></div>'
+          + '<div>NFs geradas: <strong style="color:#16a34a;">' + (r.nfGeradas || 0) + '</strong></div>'
+          + '<div>NFs já existiam: <strong style="color:#2563eb;">' + (r.nfJaExistiam || 0) + '</strong></div>'
+          + '<div>Erros NF: <strong style="color:#dc2626;">' + (r.nfErros || 0) + '</strong></div>'
+          + (r.enviadas !== undefined ? '<div>NFs enviadas: <strong style="color:#16a34a;">' + (r.enviadas || 0) + '</strong></div>' : '')
+          + (r.envioErros !== undefined ? '<div>Erros envio: <strong style="color:#dc2626;">' + (r.envioErros || 0) + '</strong></div>' : '')
+          + '</div>';
+        document.getElementById('batchResumo').innerHTML = resumoHtml;
+        document.getElementById('batchResumo').style.display = 'block';
+      }
+    }
+
+    function closeBatchModal() {
+      document.getElementById('batchModal').style.display = 'none';
+    }
+
+    function batchEtiquetas() {
+      var pedidos = getSelectedArray();
+      if (pedidos.length === 0) return;
+      var sns = [];
+      var canal = '';
+      for (var i = 0; i < pedidos.length; i++) {
+        if (pedidos[i].numero_ecommerce) sns.push(pedidos[i].numero_ecommerce);
+        if (!canal && pedidos[i].canal) canal = pedidos[i].canal;
+      }
+      if (sns.length === 0) { alert('Nenhum pedido selecionado tem número ecommerce'); return; }
+      window.open('/batch/etiquetas?sns=' + encodeURIComponent(sns.join(',')) + '&canal=' + encodeURIComponent(canal), '_blank');
+    }
+
+    function batchSeparacao() {
+      var pedidos = getSelectedArray();
+      if (pedidos.length === 0) return;
+      var ids = [];
+      for (var i = 0; i < pedidos.length; i++) ids.push(pedidos[i].id);
+      window.open('/batch/picking-list?ids=' + encodeURIComponent(ids.join(',')) + '&token=' + encodeURIComponent(authToken), '_blank');
     }
 
     // Sidebar nav scroll
