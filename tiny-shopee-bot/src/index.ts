@@ -2455,7 +2455,8 @@ const server = http.createServer(async (req, res) => {
               }
 
               // Gerar NF
-              sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: 'Gerando NF...' });
+              const canalDebug = detectedCanal ? `(${detectedCanal}, desc=${descontoAplicado}%)` : `(canal="${p.canal}", sem desconto)`;
+              sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Gerando NF... ${canalDebug}` });
               await sleep(1200);
               const nf = await tinyClient.generateNFFromOrder(p.id, detail.numero);
               if (nf.success) {
