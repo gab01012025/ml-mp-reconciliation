@@ -2369,7 +2369,7 @@ const server = http.createServer(async (req, res) => {
 
       const doNF = acoes.includes('nf');
       const doEnviar = acoes.includes('enviar');
-      const resumo = { total: pedidos.length, nfGeradas: 0, nfErros: 0, nfJaExistiam: 0, enviadas: 0, envioErros: 0 };
+      const resumo = { total: pedidos.length, nfGeradas: 0, nfErros: 0, nfJaExistiam: 0, descontosAplicados: 0, enviadas: 0, envioErros: 0 };
       let aborted = false;
       req.on('close', () => { aborted = true; });
 
@@ -2412,21 +2412,37 @@ const server = http.createServer(async (req, res) => {
               if (tinyClient.isShopeeOrder(detail)) detectedCanal = 'Shopee';
               else if (tinyClient.isMercadoLivreOrder(detail)) detectedCanal = 'ML';
 
+              let descontoAplicado = 0;
               if (detectedCanal) {
+                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Aplicando desconto ${detectedCanal}...` });
                 try {
                   const discountPercent = await tinyClient.getMarketplaceDiscount(detectedCanal);
+                  console.log(`[BATCH] Pedido ${label}: canal=${detectedCanal}, desconto=${discountPercent}%`);
                   if (discountPercent > 0) {
                     await sleep(1200);
-                    await tinyClient.alterOrderPrices(p.id, detail, discountPercent);
+                    const alterResult = await tinyClient.alterOrderPrices(p.id, detail, discountPercent);
+                    if (alterResult.success) {
+                      descontoAplicado = discountPercent;
+                      resumo.descontosAplicados++;
+                      console.log(`[BATCH] Pedido ${label}: desconto ${discountPercent}% aplicado OK`);
+                    } else {
+                      console.warn(`[BATCH] Pedido ${label}: alterOrderPrices FALHOU: ${alterResult.error}`);
+                      sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Desconto falhou: ${alterResult.error} — gerando NF sem desconto` });
+                    }
                   }
-                } catch { /* desconto falhou, segue sem */ }
+                } catch (discErr: any) {
+                  console.warn(`[BATCH] Pedido ${label}: erro desconto: ${discErr.message}`);
+                  sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Erro desconto: ${discErr.message} — gerando NF sem desconto` });
+                }
               }
 
               // Gerar NF
+              sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: 'Gerando NF...' });
               await sleep(1200);
               const nf = await tinyClient.generateNFFromOrder(p.id, detail.numero);
               if (nf.success) {
-                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'ok', detail: `NF ${nf.numero || nf.nfId} gerada` });
+                const descontoInfo = descontoAplicado > 0 ? ` (desconto ${descontoAplicado}% ${detectedCanal})` : '';
+                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'ok', detail: `NF ${nf.numero || nf.nfId} gerada — R$ ${(nf.valorNota || 0).toFixed(2)}${descontoInfo}` });
                 resumo.nfGeradas++;
                 (p as any)._nfId = nf.nfId;
                 (p as any)._nfNumero = nf.numero;
@@ -4805,6 +4821,7 @@ function getDashboardHtml(): string {
           + '<div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; font-size:13px;">'
           + '<div>Total processados: <strong>' + (r.total || 0) + '</strong></div>'
           + '<div>NFs geradas: <strong style="color:#16a34a;">' + (r.nfGeradas || 0) + '</strong></div>'
+          + '<div>Descontos aplicados: <strong style="color:#7c3aed;">' + (r.descontosAplicados || 0) + '</strong></div>'
           + '<div>NFs já existiam: <strong style="color:#2563eb;">' + (r.nfJaExistiam || 0) + '</strong></div>'
           + '<div>Erros NF: <strong style="color:#dc2626;">' + (r.nfErros || 0) + '</strong></div>'
           + (r.enviadas !== undefined ? '<div>NFs enviadas: <strong style="color:#16a34a;">' + (r.enviadas || 0) + '</strong></div>' : '')
@@ -4829,7 +4846,7 @@ function getDashboardHtml(): string {
         if (!canal && pedidos[i].canal) canal = pedidos[i].canal;
       }
       if (sns.length === 0) { alert('Nenhum pedido selecionado tem número ecommerce'); return; }
-      window.open('/batch/etiquetas?sns=' + encodeURIComponent(sns.join(',')) + '&canal=' + encodeURIComponent(canal), '_blank');
+      window.open('/batch/etiquetas?sns=' + encodeURIComponent(sns.join(',')) + '&canal=' + encodeURIComponent(canal) + '&token=' + encodeURIComponent(authToken), '_blank');
     }
 
     function batchSeparacao() {
