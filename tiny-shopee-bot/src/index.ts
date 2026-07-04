@@ -2268,27 +2268,35 @@ const server = http.createServer(async (req, res) => {
       else if (tinyClient.isMercadoLivreOrder(detail)) detectedCanal = 'ML';
 
       let descontoAplicado = 0;
+      const discountDebug: string[] = [`canal=${detectedCanal || 'nenhum'}`, `itens=${detail.itens?.length || 0}`, `total=${detail.total_pedido}`];
       if (detectedCanal) {
         try {
           const discountPercent = await tinyClient.getMarketplaceDiscount(detectedCanal);
+          discountDebug.push(`desconto=${discountPercent}%`);
           if (discountPercent > 0) {
             console.log(`[MANUAL] Aplicando desconto ${discountPercent}% (${detectedCanal}) ao pedido ${tinyOrderId}`);
             await sleep(1200);
             const alterResult = await tinyClient.alterOrderPrices(tinyOrderId, detail, discountPercent);
+            discountDebug.push(`alter=${alterResult.success ? 'OK' : 'FALHA: ' + (alterResult.error || '?')}`);
             if (alterResult.success) {
               descontoAplicado = discountPercent;
               console.log(`[MANUAL] Desconto ${discountPercent}% aplicado com sucesso`);
               // Re-fetch order para pegar preços atualizados
               await sleep(1200);
               detail = await tinyClient.getOrder(tinyOrderId);
+              discountDebug.push(`novoTotal=${detail.total_pedido}`);
             } else {
               console.warn(`[MANUAL] Falha ao aplicar desconto: ${alterResult.error} — gerando NF sem desconto`);
             }
+          } else {
+            discountDebug.push('desconto=0, nada a fazer');
           }
         } catch (e: any) {
+          discountDebug.push(`erro=${e.message}`);
           console.warn(`[MANUAL] Erro ao aplicar desconto: ${e.message} — gerando NF sem desconto`);
         }
       } else {
+        discountDebug.push('sem marketplace detectado');
         console.log(`[MANUAL] Pedido ${tinyOrderId} sem marketplace detectado — gerando NF sem desconto`);
       }
 
@@ -2324,10 +2332,11 @@ const server = http.createServer(async (req, res) => {
           valorNota: nf.valorNota,
           descontoAplicado,
           canal: detectedCanal,
+          discountDebug: discountDebug.join(' | '),
         }));
       } else {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, found: true, ...pedidoInfo, error: nf.error || 'Falha ao gerar NF. Verifique os logs.' }));
+        res.end(JSON.stringify({ ok: false, found: true, ...pedidoInfo, error: nf.error || 'Falha ao gerar NF. Verifique os logs.', discountDebug: discountDebug.join(' | ') }));
       }
     } catch (err: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -2678,6 +2687,7 @@ async function processarAuto() {
         if (d2.descontoAplicado > 0) nfDetail += ' (desconto ' + d2.descontoAplicado + '% ' + (d2.canal || '') + ')';
         d.steps.push({ step: 'Nota Fiscal (NF-e)', ok: true, detail: nfDetail });
         d.steps.push({ step: 'Enviar NF ao Marketplace', ok: true, detail: 'Tiny envia automaticamente com selo ecommerce' });
+        if (d2.discountDebug) d.steps.push({ step: 'Debug Desconto', ok: d2.descontoAplicado > 0, detail: d2.discountDebug });
       } else if (d2.error && wasFound) {
         d.steps.push({ step: 'Nota Fiscal (NF-e)', ok: false, detail: d2.error });
       } else if (d2.error) {

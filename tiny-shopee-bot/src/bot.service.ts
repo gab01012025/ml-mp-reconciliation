@@ -10,6 +10,8 @@ import {
   getNFDetails,
   getNFXml,
   hasMaskedClientData,
+  getMarketplaceDiscount,
+  alterOrderPrices,
 } from './tiny-client';
 import * as ml from './ml-client';
 import * as shopee from './shopee-client';
@@ -205,10 +207,24 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
           continue;
         }
 
-        // Gera NF a partir do pedido (preserva selo do ecommerce → Tiny auto-envia para Shopee)
+        // Aplica desconto Shopee antes de gerar NF
         console.log(`[BOT] Gerando NF do pedido ${order.id} (${detail.numero}) via gerar.nota.fiscal.pedido — total: R$${detail.total_pedido}`);
-        await sleep(1100);
+        try {
+          const discountPercent = await getMarketplaceDiscount('Shopee');
+          if (discountPercent > 0) {
+            await sleep(1100);
+            const alterResult = await alterOrderPrices(order.id, detail, discountPercent);
+            if (alterResult.success) {
+              console.log(`[BOT] Desconto ${discountPercent}% Shopee aplicado ao pedido ${detail.numero}`);
+            } else {
+              console.warn(`[BOT] Falha ao aplicar desconto Shopee: ${alterResult.error}`);
+            }
+          }
+        } catch (e: any) {
+          console.warn(`[BOT] Erro ao aplicar desconto Shopee: ${e.message} — gerando NF sem desconto`);
+        }
 
+        await sleep(1100);
         const nf = await generateNFFromOrder(order.id, detail.numero);
         if (nf.success) {
           stats.altered++;
@@ -344,8 +360,24 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
         }
 
         console.log(`[BOT-ML] Gerando NF do pedido ML ${detail.numero_ecommerce} (Tiny ${detail.numero}) via gerar.nota.fiscal.pedido — total R$${detail.total_pedido}`);
-        await sleep(1100);
 
+        // Aplica desconto ML antes de gerar NF
+        try {
+          const discountPercent = await getMarketplaceDiscount('ML');
+          if (discountPercent > 0) {
+            await sleep(1100);
+            const alterResult = await alterOrderPrices(order.id, detail, discountPercent);
+            if (alterResult.success) {
+              console.log(`[BOT-ML] Desconto ${discountPercent}% ML aplicado ao pedido ${detail.numero}`);
+            } else {
+              console.warn(`[BOT-ML] Falha ao aplicar desconto ML: ${alterResult.error}`);
+            }
+          }
+        } catch (e: any) {
+          console.warn(`[BOT-ML] Erro ao aplicar desconto ML: ${e.message} — gerando NF sem desconto`);
+        }
+
+        await sleep(1100);
         const nf = await generateNFFromOrder(order.id, detail.numero);
         if (nf.success) {
           stats.altered++;
@@ -546,6 +578,23 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
         }
 
         console.log(`[BOT-ML] Gerando NF do pedido ML ${detail.numero_ecommerce} (Tiny ${detail.numero}) via gerar.nota.fiscal.pedido — total R$${detail.total_pedido}`);
+
+        // Aplica desconto ML antes de gerar NF
+        try {
+          const discountPercent = await getMarketplaceDiscount('ML');
+          if (discountPercent > 0) {
+            await sleep(1100);
+            const alterResult = await alterOrderPrices(summary.id, detail, discountPercent);
+            if (alterResult.success) {
+              console.log(`[BOT-ML] Desconto ${discountPercent}% ML aplicado ao pedido ${detail.numero}`);
+            } else {
+              console.warn(`[BOT-ML] Falha ao aplicar desconto ML: ${alterResult.error}`);
+            }
+          }
+        } catch (e: any) {
+          console.warn(`[BOT-ML] Erro ao aplicar desconto ML: ${e.message} — gerando NF sem desconto`);
+        }
+
         await sleep(1100);
         const nf = await generateNFFromOrder(summary.id, detail.numero);
         if (nf.success) {
