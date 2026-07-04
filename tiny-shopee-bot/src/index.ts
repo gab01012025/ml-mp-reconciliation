@@ -231,14 +231,14 @@ const server = http.createServer(async (req, res) => {
   // Public: health
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.96', uptime: process.uptime() }));
+    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.97', uptime: process.uptime() }));
     return;
   }
 
   // Public: version check (for debugging deploys)
   if (url.pathname === '/version') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ version: 'v3.96', build: '2026-07-03T03:00Z', deployed: startTime.toISOString() }));
+    res.end(JSON.stringify({ version: 'v3.97', build: '2026-07-04T12:00Z', deployed: startTime.toISOString() }));
     return;
   }
 
@@ -2262,7 +2262,38 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      // Detecta marketplace e aplica desconto antes de gerar NF
+      let detectedCanal: 'Shopee' | 'ML' | null = null;
+      if (tinyClient.isShopeeOrder(detail)) detectedCanal = 'Shopee';
+      else if (tinyClient.isMercadoLivreOrder(detail)) detectedCanal = 'ML';
+
+      let descontoAplicado = 0;
+      if (detectedCanal) {
+        try {
+          const discountPercent = await tinyClient.getMarketplaceDiscount(detectedCanal);
+          if (discountPercent > 0) {
+            console.log(`[MANUAL] Aplicando desconto ${discountPercent}% (${detectedCanal}) ao pedido ${tinyOrderId}`);
+            await sleep(1200);
+            const alterResult = await tinyClient.alterOrderPrices(tinyOrderId, detail, discountPercent);
+            if (alterResult.success) {
+              descontoAplicado = discountPercent;
+              console.log(`[MANUAL] Desconto ${discountPercent}% aplicado com sucesso`);
+              // Re-fetch order para pegar preços atualizados
+              await sleep(1200);
+              detail = await tinyClient.getOrder(tinyOrderId);
+            } else {
+              console.warn(`[MANUAL] Falha ao aplicar desconto: ${alterResult.error} — gerando NF sem desconto`);
+            }
+          }
+        } catch (e: any) {
+          console.warn(`[MANUAL] Erro ao aplicar desconto: ${e.message} — gerando NF sem desconto`);
+        }
+      } else {
+        console.log(`[MANUAL] Pedido ${tinyOrderId} sem marketplace detectado — gerando NF sem desconto`);
+      }
+
       // Gera NF a partir do pedido (preserva selo ecommerce → Tiny auto-envia)
+      await sleep(1200);
       const nf = await tinyClient.generateNFFromOrder(tinyOrderId, detail.numero);
 
       if (nf.success) {
@@ -2278,8 +2309,8 @@ const server = http.createServer(async (req, res) => {
         };
         nfHistory.unshift(processedNF);
         if (nfHistory.length > MAX_NF_HISTORY) nfHistory.splice(MAX_NF_HISTORY);
-        if (canal === 'Shopee') appendToShopeeCSV([processedNF]);
-        addToChecklist([processedNF], canal || 'Manual');
+        if (canal === 'Shopee' || detectedCanal === 'Shopee') appendToShopeeCSV([processedNF]);
+        addToChecklist([processedNF], canal || detectedCanal || 'Manual');
         totalNFsEmitted++;
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -2291,6 +2322,8 @@ const server = http.createServer(async (req, res) => {
           numero: nf.numero,
           chaveAcesso: nf.chaveAcesso,
           valorNota: nf.valorNota,
+          descontoAplicado,
+          canal: detectedCanal,
         }));
       } else {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -2635,12 +2668,15 @@ async function processarAuto() {
       // Backend retorna { ok, found, nfId, numero, chaveAcesso, valorNota, clienteNome, tinyNumero } no nível raiz
       var d = { steps: [], success: false, nf: null, tinyNumero: d2.tinyNumero, tinyId: d2.tinyId, clienteNome: d2.clienteNome };
       var wasFound = d2.found || d2.ok || d2.nfId;
-      d.steps.push({ step: 'Buscar no Tiny', ok: !!wasFound, detail: wasFound ? ('Pedido encontrado' + (d2.tinyNumero ? ' — #' + d2.tinyNumero : '')) : (d2.error || 'Não encontrado') });
+      var foundDetail = 'Pedido encontrado' + (d2.tinyNumero ? ' — #' + d2.tinyNumero : '') + (d2.canal ? ' (' + d2.canal + ')' : '');
+      d.steps.push({ step: 'Buscar no Tiny', ok: !!wasFound, detail: wasFound ? foundDetail : (d2.error || 'Não encontrado') });
       if (d2.ok && (d2.nfId || d2.numero)) {
         d.success = true;
         d.nf = { nfId: d2.nfId, numero: d2.numero, chaveAcesso: d2.chaveAcesso, valorNota: d2.valorNota };
         var nfLabel = d2.numero || d2.nfId;
-        d.steps.push({ step: 'Nota Fiscal (NF-e)', ok: true, detail: 'NF ' + nfLabel + (d2.jaExistia ? ' (já existia)' : ' gerada e emitida') });
+        var nfDetail = 'NF ' + nfLabel + (d2.jaExistia ? ' (já existia)' : ' gerada e emitida');
+        if (d2.descontoAplicado > 0) nfDetail += ' (desconto ' + d2.descontoAplicado + '% ' + (d2.canal || '') + ')';
+        d.steps.push({ step: 'Nota Fiscal (NF-e)', ok: true, detail: nfDetail });
         d.steps.push({ step: 'Enviar NF ao Marketplace', ok: true, detail: 'Tiny envia automaticamente com selo ecommerce' });
       } else if (d2.error && wasFound) {
         d.steps.push({ step: 'Nota Fiscal (NF-e)', ok: false, detail: d2.error });
@@ -3182,7 +3218,7 @@ function getLoginHtml(error?: string): string {
       <div class="int-badge"><span class="dot"></span> Mercado Livre</div>
       <div class="int-badge"><span class="dot"></span> Tiny ERP</div>
     </div>
-    <div class="footer">SyncHub v3.96 — Integrador de Marketplaces e ERPs</div>
+    <div class="footer">SyncHub v3.97 — Integrador de Marketplaces e ERPs</div>
   </div>
   <script>
     if (localStorage.getItem('auth_token')) { window.location.href = '/'; }
@@ -3385,7 +3421,7 @@ function getDashboardHtml(): string {
       <div class="section-label">Sistema</div>
       <a href="#logs"><span class="icon">📄</span> Logs</a>
     </nav>
-    <div class="sidebar-footer">SyncHub v3.96<br>Integrador ERP/HUB</div>
+    <div class="sidebar-footer">SyncHub v3.97<br>Integrador ERP/HUB</div>
   </div>
 
   <!-- Main -->
