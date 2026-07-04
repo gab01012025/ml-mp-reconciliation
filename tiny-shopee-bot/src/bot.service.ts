@@ -907,6 +907,25 @@ export async function processSingleShopeeOrder(orderSn: string): Promise<SingleO
       result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF já vinculada (ID: ${nfId}) — detalhes indisponíveis` });
     }
   } else {
+    // Aplica desconto Shopee antes de gerar NF
+    console.log(`[SINGLE] Aplicando desconto Shopee no pedido ${orderSn}...`);
+    let descontoAplicado = 0;
+    try {
+      const discountPercent = await getMarketplaceDiscount('Shopee');
+      if (discountPercent > 0) {
+        await sleep(1100);
+        const alterResult = await alterOrderPrices(tinyOrder.id, detail, discountPercent);
+        if (alterResult.success) {
+          descontoAplicado = discountPercent;
+          console.log(`[SINGLE] Desconto ${discountPercent}% Shopee aplicado ao pedido ${orderSn}`);
+        } else {
+          console.warn(`[SINGLE] Falha ao aplicar desconto: ${alterResult.error}`);
+        }
+      }
+    } catch (e: any) {
+      console.warn(`[SINGLE] Erro ao aplicar desconto Shopee: ${e.message} — gerando NF sem desconto`);
+    }
+
     // Gera NF a partir do pedido (preserva selo ecommerce → Tiny auto-envia para Shopee)
     console.log(`[SINGLE] Gerando NF do pedido ${orderSn} via gerar.nota.fiscal.pedido...`);
     await sleep(1100);
@@ -921,7 +940,8 @@ export async function processSingleShopeeOrder(orderSn: string): Promise<SingleO
           chaveAcesso: nf.chaveAcesso || '',
           valorNota: nf.valorNota || 0,
         };
-        result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF ${nf.numero} emitida — R$ ${(nf.valorNota || 0).toFixed(2)} — Chave: ...${nf.chaveAcesso.slice(-8)}` });
+        const descontoInfo = descontoAplicado > 0 ? ` (desconto ${descontoAplicado}% Shopee)` : '';
+        result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF ${nf.numero} emitida — R$ ${(nf.valorNota || 0).toFixed(2)}${descontoInfo} — Chave: ...${nf.chaveAcesso.slice(-8)}` });
       } else {
         result.steps.push({ step: 'Nota Fiscal', ok: false, detail: nf.error || 'Falha ao gerar/emitir NF. Verifique os logs do servidor.' });
         return result;
