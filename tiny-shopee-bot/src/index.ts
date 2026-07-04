@@ -4000,7 +4000,7 @@ function getDashboardHtml(): string {
 
           <!-- Tabela de pedidos -->
           <div id="listOrdersTableWrap" style="display:none; margin-bottom:16px;">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:8px;">
               <div style="display:flex; gap:6px;">
                 <button class="tab-btn active" onclick="filtrarTabelaPedidos('todos')" id="filtroTodos">Todos</button>
                 <button class="tab-btn" onclick="filtrarTabelaPedidos('shopee')" id="filtroShopee">🛒 Shopee</button>
@@ -4008,6 +4008,11 @@ function getDashboardHtml(): string {
                 <button class="tab-btn" onclick="filtrarTabelaPedidos('pendentes')" id="filtroPendentes">Pendentes</button>
               </div>
               <span style="font-size:12px; color:#94a3b8;" id="listOrdersCount"></span>
+            </div>
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px; padding:8px 12px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0;">
+              <button id="btnSelectAll" onclick="selecionarTodosVisiveis()" style="background:#1e293b; color:white; border:none; padding:6px 14px; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer;">☑ Selecionar Todos</button>
+              <button onclick="clearSelection()" style="background:none; border:1px solid #cbd5e1; padding:6px 14px; border-radius:6px; font-size:12px; cursor:pointer; color:#64748b;">✕ Limpar</button>
+              <span id="selectionCount" style="font-size:12px; color:#64748b; margin-left:auto;"></span>
             </div>
             <div style="max-height:500px; overflow-y:auto; border:1px solid #e2e8f0; border-radius:8px;">
               <table style="width:100%; border-collapse:collapse; font-size:13px;">
@@ -4595,6 +4600,7 @@ function getDashboardHtml(): string {
     function filtrarTabelaPedidos(filtro) {
       _listOrdersFilter = filtro;
       renderTabelaPedidos();
+      updateBatchBar();
       document.querySelectorAll('#listOrdersTableWrap .tab-btn').forEach(function(b) { b.classList.remove('active'); });
       var btnId = { todos: 'filtroTodos', shopee: 'filtroShopee', ml: 'filtroML', pendentes: 'filtroPendentes' }[filtro];
       if (btnId) document.getElementById(btnId).classList.add('active');
@@ -4607,6 +4613,8 @@ function getDashboardHtml(): string {
       else if (_listOrdersFilter === 'pendentes') data = data.filter(function(o) { return !o.temNF; });
 
       document.getElementById('listOrdersCount').textContent = data.length + ' pedidos';
+      var selectBtn = document.getElementById('btnSelectAll');
+      if (selectBtn) selectBtn.textContent = '☑ Selecionar Todos (' + data.length + ')';
 
       var html = '';
       for (var i = 0; i < data.length; i++) {
@@ -4691,12 +4699,32 @@ function getDashboardHtml(): string {
     function updateBatchBar() {
       var keys = Object.keys(_selectedOrders);
       var bar = document.getElementById('batchBar');
+      var countEl = document.getElementById('selectionCount');
       if (keys.length > 0) {
         bar.style.display = 'flex';
         document.getElementById('batchCount').textContent = keys.length + ' selecionado' + (keys.length > 1 ? 's' : '');
+        if (countEl) countEl.textContent = keys.length + ' selecionado' + (keys.length > 1 ? 's' : '');
       } else {
         bar.style.display = 'none';
+        if (countEl) countEl.textContent = '';
       }
+    }
+
+    function selecionarTodosVisiveis() {
+      var checks = document.querySelectorAll('#listOrdersBody .order-check');
+      for (var i = 0; i < checks.length; i++) {
+        checks[i].checked = true;
+        var id = checks[i].getAttribute('data-id');
+        _selectedOrders[id] = {
+          id: id,
+          numero: checks[i].getAttribute('data-numero'),
+          numero_ecommerce: checks[i].getAttribute('data-sn'),
+          canal: checks[i].getAttribute('data-canal')
+        };
+      }
+      var allCheck = document.getElementById('selectAllCheck');
+      if (allCheck) { allCheck.checked = true; allCheck.indeterminate = false; }
+      updateBatchBar();
     }
 
     function clearSelection() {
