@@ -254,17 +254,27 @@ export async function getOrder(id: string): Promise<TinyOrderDetail> {
 
 /**
  * Verifica se o pedido é da Shopee
+ * Tenta pelo campo ecommerce.nomeEcommerce primeiro, depois por regex no numero_ecommerce
  */
 export function isShopeeOrder(order: TinyOrderDetail): boolean {
-  return order.ecommerce?.nomeEcommerce === 'Shopee';
+  // Campo ecommerce da API (pode não existir ou ter nome diferente)
+  const ecomName = (order.ecommerce?.nomeEcommerce || (order.ecommerce as any)?.nome_ecommerce || '').toLowerCase();
+  if (ecomName === 'shopee') return true;
+  // Fallback: regex no numero_ecommerce (6 dígitos de data + alfanumérico com pelo menos 1 letra)
+  if (order.numero_ecommerce && /^\d{6}(?=[A-Z0-9]*[A-Z])[A-Z0-9]{8,10}$/.test(order.numero_ecommerce)) return true;
+  return false;
 }
 
 /**
  * Verifica se o pedido é do Mercado Livre
+ * Tenta pelo campo ecommerce.nomeEcommerce primeiro, depois por regex no numero_ecommerce
  */
 export function isMercadoLivreOrder(order: TinyOrderDetail): boolean {
-  const nome = (order.ecommerce?.nomeEcommerce || '').toLowerCase();
-  return nome.includes('mercado livre') || nome.includes('mercadolivre') || nome === 'ml';
+  const ecomName = (order.ecommerce?.nomeEcommerce || (order.ecommerce as any)?.nome_ecommerce || '').toLowerCase();
+  if (ecomName.includes('mercado livre') || ecomName.includes('mercadolivre') || ecomName === 'ml') return true;
+  // Fallback: numero_ecommerce puramente numérico com 10+ dígitos
+  if (order.numero_ecommerce && /^\d{10,}$/.test(order.numero_ecommerce)) return true;
+  return false;
 }
 
 /**

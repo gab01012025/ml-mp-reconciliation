@@ -2262,10 +2262,22 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Detecta marketplace e aplica desconto antes de gerar NF
+      // Detecta marketplace — usa canal do request se disponível (mais confiável),
+      // senão tenta via ecommerce field da API Tiny, senão por regex do numero_ecommerce
       let detectedCanal: 'Shopee' | 'ML' | null = null;
-      if (tinyClient.isShopeeOrder(detail)) detectedCanal = 'Shopee';
-      else if (tinyClient.isMercadoLivreOrder(detail)) detectedCanal = 'ML';
+      if (canal === 'Shopee') detectedCanal = 'Shopee';
+      else if (canal === 'Mercado Livre' || canal === 'ML') detectedCanal = 'ML';
+      // Fallback: API Tiny
+      if (!detectedCanal) {
+        if (tinyClient.isShopeeOrder(detail)) detectedCanal = 'Shopee';
+        else if (tinyClient.isMercadoLivreOrder(detail)) detectedCanal = 'ML';
+      }
+      // Fallback: regex no numero_ecommerce
+      if (!detectedCanal && detail.numero_ecommerce) {
+        const ne = detail.numero_ecommerce;
+        if (/^\d{6}(?=[A-Z0-9]*[A-Z])[A-Z0-9]{8,10}$/.test(ne)) detectedCanal = 'Shopee';
+        else if (/^\d{10,}$/.test(ne)) detectedCanal = 'ML';
+      }
 
       let descontoAplicado = 0;
       const discountDebug: string[] = [`canal=${detectedCanal || 'nenhum'}`, `itens=${detail.itens?.length || 0}`, `total=${detail.total_pedido}`];
@@ -2407,10 +2419,16 @@ const server = http.createServer(async (req, res) => {
                 continue;
               }
 
-              // Aplicar desconto
+              // Aplicar desconto — usa canal do frontend (baseado em regex do numero_ecommerce)
+              // pois isShopeeOrder() depende de campo ecommerce que a API Tiny nem sempre retorna
               let detectedCanal: 'Shopee' | 'ML' | null = null;
-              if (tinyClient.isShopeeOrder(detail)) detectedCanal = 'Shopee';
-              else if (tinyClient.isMercadoLivreOrder(detail)) detectedCanal = 'ML';
+              if (p.canal === 'Shopee') detectedCanal = 'Shopee';
+              else if (p.canal === 'Mercado Livre') detectedCanal = 'ML';
+              // Fallback: tenta detectar pela API se canal não veio do frontend
+              if (!detectedCanal) {
+                if (tinyClient.isShopeeOrder(detail)) detectedCanal = 'Shopee';
+                else if (tinyClient.isMercadoLivreOrder(detail)) detectedCanal = 'ML';
+              }
 
               let descontoAplicado = 0;
               if (detectedCanal) {
