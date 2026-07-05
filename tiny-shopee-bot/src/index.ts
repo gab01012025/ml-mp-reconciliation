@@ -2451,6 +2451,12 @@ const server = http.createServer(async (req, res) => {
                       descontoAplicado = discountPercent;
                       resumo.descontosAplicados++;
                       console.log(`[BATCH] Pedido ${label}: NF criada com desconto ${discountPercent}% via nota.fiscal.incluir`);
+                    } else {
+                      // Fallback: gera NF sem desconto mas com link do ecommerce
+                      console.warn(`[BATCH] Pedido ${label}: createAndEmitNFDiscounted falhou (${nf.error}) — fallback para gerar.nota.fiscal.pedido`);
+                      sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Desconto falhou: ${nf.error || '?'} — gerando NF sem desconto (com link ecommerce)` });
+                      await sleep(1200);
+                      nf = await tinyClient.generateNFFromOrder(p.id, detail.numero);
                     }
                   } else {
                     // Desconto = 0, gera normalmente
