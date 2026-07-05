@@ -363,7 +363,7 @@ async function tryUpload(
   // Usa Blob em vez de File para melhor compatibilidade com Node.js fetch
   const formData = new _FormData();
   formData.append('order_sn', orderSn);
-  formData.append('file_type', '1');
+  formData.append('file_type', 'XML');
   const blob = new Blob([xmlBuffer], { type: mimeType });
   formData.append('file', blob, filename);
 
@@ -390,7 +390,7 @@ async function tryUploadManual(
   // order_sn field
   parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="order_sn"\r\n\r\n${orderSn}\r\n`));
   // file_type field
-  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file_type"\r\n\r\n1\r\n`));
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file_type"\r\n\r\nXML\r\n`));
   // file field
   parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${orderSn}.xml"\r\nContent-Type: application/xml\r\n\r\n`));
   parts.push(xmlBuffer);
@@ -492,7 +492,7 @@ export async function uploadInvoiceDoc(
   }
 
   console.log(`[SHOPEE] Tentativa 3: upload_invoice_doc fetch+FormData (${rawBuf.length} bytes)`);
-  let result = await tryUpload(buildUrl(), orderSn, rawBuf, 'text/xml', `${orderSn}.xml`, 'tentativa3');
+  let result = await tryUpload(buildUrl(), orderSn, rawBuf, 'application/xml', `${orderSn}.xml`, 'tentativa3');
   if (!result.error) {
     console.log(`[SHOPEE] NF enviada via fetch+FormData`);
     return { success: true };
@@ -537,8 +537,12 @@ async function uploadViaHttps(
     ``,
     orderSn,
     `--${boundary}`,
+    `Content-Disposition: form-data; name="file_type"`,
+    ``,
+    `XML`,
+    `--${boundary}`,
     `Content-Disposition: form-data; name="file"; filename="${filename}"`,
-    `Content-Type: text/xml`,
+    `Content-Type: application/xml`,
     ``,
     ``,
   ].join('\r\n');
