@@ -231,14 +231,14 @@ const server = http.createServer(async (req, res) => {
   // Public: health
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.98', uptime: process.uptime() }));
+    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v3.99', uptime: process.uptime() }));
     return;
   }
 
   // Public: version check (for debugging deploys)
   if (url.pathname === '/version') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ version: 'v3.98', build: '2026-07-04T12:00Z', deployed: startTime.toISOString() }));
+    res.end(JSON.stringify({ version: 'v3.99', build: '2026-07-05T02:20Z', deployed: startTime.toISOString() }));
     return;
   }
 
@@ -3660,7 +3660,7 @@ function getLoginHtml(error?: string): string {
       <div class="int-badge"><span class="dot"></span> Mercado Livre</div>
       <div class="int-badge"><span class="dot"></span> Tiny ERP</div>
     </div>
-    <div class="footer">SyncHub v3.98 — Integrador de Marketplaces e ERPs</div>
+    <div class="footer">SyncHub v3.99 — Integrador de Marketplaces e ERPs</div>
   </div>
   <script>
     if (localStorage.getItem('auth_token')) { window.location.href = '/'; }
@@ -3863,7 +3863,7 @@ function getDashboardHtml(): string {
       <div class="section-label">Sistema</div>
       <a href="#logs"><span class="icon">📄</span> Logs</a>
     </nav>
-    <div class="sidebar-footer">SyncHub v3.98<br>Integrador ERP/HUB</div>
+    <div class="sidebar-footer">SyncHub v3.99<br>Integrador ERP/HUB</div>
   </div>
 
   <!-- Main -->
