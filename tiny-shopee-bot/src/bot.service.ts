@@ -7,6 +7,7 @@ import {
   isPessoaFisica,
   hasClientAddress,
   generateNFFromOrder,
+  createAndEmitNFDiscounted,
   getNFDetails,
   getNFXml,
   hasMaskedClientData,
@@ -207,25 +208,31 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
           continue;
         }
 
-        // Aplica desconto Shopee antes de gerar NF
-        console.log(`[BOT] Gerando NF do pedido ${order.id} (${detail.numero}) via gerar.nota.fiscal.pedido — total: R$${detail.total_pedido}`);
+        // Gera NF com desconto via nota.fiscal.incluir.php (preços reduzidos direto no payload)
+        console.log(`[BOT] Gerando NF do pedido ${order.id} (${detail.numero}) — total: R$${detail.total_pedido}`);
+        let nf: any;
         try {
           const discountPercent = await getMarketplaceDiscount('Shopee');
           if (discountPercent > 0) {
             await sleep(1100);
-            const alterResult = await alterOrderPrices(order.id, detail, discountPercent);
-            if (alterResult.success) {
-              console.log(`[BOT] Desconto ${discountPercent}% Shopee aplicado ao pedido ${detail.numero}`);
+            nf = await createAndEmitNFDiscounted(detail, discountPercent, 'Shopee');
+            if (nf.success) {
+              console.log(`[BOT] NF criada com desconto ${discountPercent}% Shopee via nota.fiscal.incluir`);
             } else {
-              console.warn(`[BOT] Falha ao aplicar desconto Shopee: ${alterResult.error}`);
+              console.warn(`[BOT] createAndEmitNFDiscounted falhou: ${nf.error} — tentando sem desconto`);
+              await sleep(1100);
+              nf = await generateNFFromOrder(order.id, detail.numero);
             }
+          } else {
+            await sleep(1100);
+            nf = await generateNFFromOrder(order.id, detail.numero);
           }
         } catch (e: any) {
-          console.warn(`[BOT] Erro ao aplicar desconto Shopee: ${e.message} — gerando NF sem desconto`);
+          console.warn(`[BOT] Erro desconto Shopee: ${e.message} — gerando NF sem desconto`);
+          await sleep(1100);
+          nf = await generateNFFromOrder(order.id, detail.numero);
         }
 
-        await sleep(1100);
-        const nf = await generateNFFromOrder(order.id, detail.numero);
         if (nf.success) {
           stats.altered++;
           stats.nfGenerated++;
@@ -359,26 +366,32 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
           continue;
         }
 
-        console.log(`[BOT-ML] Gerando NF do pedido ML ${detail.numero_ecommerce} (Tiny ${detail.numero}) via gerar.nota.fiscal.pedido — total R$${detail.total_pedido}`);
+        console.log(`[BOT-ML] Gerando NF do pedido ML ${detail.numero_ecommerce} (Tiny ${detail.numero}) — total R$${detail.total_pedido}`);
 
-        // Aplica desconto ML antes de gerar NF
+        // Gera NF com desconto via nota.fiscal.incluir.php
+        let nf: any;
         try {
           const discountPercent = await getMarketplaceDiscount('ML');
           if (discountPercent > 0) {
             await sleep(1100);
-            const alterResult = await alterOrderPrices(order.id, detail, discountPercent);
-            if (alterResult.success) {
-              console.log(`[BOT-ML] Desconto ${discountPercent}% ML aplicado ao pedido ${detail.numero}`);
+            nf = await createAndEmitNFDiscounted(detail, discountPercent, 'Mercado Livre');
+            if (nf.success) {
+              console.log(`[BOT-ML] NF criada com desconto ${discountPercent}% ML via nota.fiscal.incluir`);
             } else {
-              console.warn(`[BOT-ML] Falha ao aplicar desconto ML: ${alterResult.error}`);
+              console.warn(`[BOT-ML] createAndEmitNFDiscounted falhou: ${nf.error} — tentando sem desconto`);
+              await sleep(1100);
+              nf = await generateNFFromOrder(order.id, detail.numero);
             }
+          } else {
+            await sleep(1100);
+            nf = await generateNFFromOrder(order.id, detail.numero);
           }
         } catch (e: any) {
-          console.warn(`[BOT-ML] Erro ao aplicar desconto ML: ${e.message} — gerando NF sem desconto`);
+          console.warn(`[BOT-ML] Erro desconto ML: ${e.message} — gerando NF sem desconto`);
+          await sleep(1100);
+          nf = await generateNFFromOrder(order.id, detail.numero);
         }
 
-        await sleep(1100);
-        const nf = await generateNFFromOrder(order.id, detail.numero);
         if (nf.success) {
           stats.altered++;
           stats.nfGenerated++;
@@ -577,26 +590,32 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
           continue;
         }
 
-        console.log(`[BOT-ML] Gerando NF do pedido ML ${detail.numero_ecommerce} (Tiny ${detail.numero}) via gerar.nota.fiscal.pedido — total R$${detail.total_pedido}`);
+        console.log(`[BOT-ML] Gerando NF do pedido ML ${detail.numero_ecommerce} (Tiny ${detail.numero}) — total R$${detail.total_pedido}`);
 
-        // Aplica desconto ML antes de gerar NF
+        // Gera NF com desconto via nota.fiscal.incluir.php
+        let nf: any;
         try {
           const discountPercent = await getMarketplaceDiscount('ML');
           if (discountPercent > 0) {
             await sleep(1100);
-            const alterResult = await alterOrderPrices(summary.id, detail, discountPercent);
-            if (alterResult.success) {
-              console.log(`[BOT-ML] Desconto ${discountPercent}% ML aplicado ao pedido ${detail.numero}`);
+            nf = await createAndEmitNFDiscounted(detail, discountPercent, 'Mercado Livre');
+            if (nf.success) {
+              console.log(`[BOT-ML] NF criada com desconto ${discountPercent}% ML via nota.fiscal.incluir`);
             } else {
-              console.warn(`[BOT-ML] Falha ao aplicar desconto ML: ${alterResult.error}`);
+              console.warn(`[BOT-ML] createAndEmitNFDiscounted falhou: ${nf.error} — tentando sem desconto`);
+              await sleep(1100);
+              nf = await generateNFFromOrder(summary.id, detail.numero);
             }
+          } else {
+            await sleep(1100);
+            nf = await generateNFFromOrder(summary.id, detail.numero);
           }
         } catch (e: any) {
-          console.warn(`[BOT-ML] Erro ao aplicar desconto ML: ${e.message} — gerando NF sem desconto`);
+          console.warn(`[BOT-ML] Erro desconto ML: ${e.message} — gerando NF sem desconto`);
+          await sleep(1100);
+          nf = await generateNFFromOrder(summary.id, detail.numero);
         }
 
-        await sleep(1100);
-        const nf = await generateNFFromOrder(summary.id, detail.numero);
         if (nf.success) {
           stats.altered++;
           stats.nfGenerated++;
@@ -907,31 +926,29 @@ export async function processSingleShopeeOrder(orderSn: string): Promise<SingleO
       result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF já vinculada (ID: ${nfId}) — detalhes indisponíveis` });
     }
   } else {
-    // Aplica desconto Shopee antes de gerar NF
-    console.log(`[SINGLE] Aplicando desconto Shopee no pedido ${orderSn}...`);
+    // Gera NF com desconto via nota.fiscal.incluir.php (preços reduzidos direto no payload)
+    console.log(`[SINGLE] Gerando NF com desconto Shopee para pedido ${orderSn}...`);
     let descontoAplicado = 0;
+
     try {
       const discountPercent = await getMarketplaceDiscount('Shopee');
+      let nf: any;
       if (discountPercent > 0) {
         await sleep(1100);
-        const alterResult = await alterOrderPrices(tinyOrder.id, detail, discountPercent);
-        if (alterResult.success) {
+        nf = await createAndEmitNFDiscounted(detail, discountPercent, 'Shopee');
+        if (nf.success) {
           descontoAplicado = discountPercent;
-          console.log(`[SINGLE] Desconto ${discountPercent}% Shopee aplicado ao pedido ${orderSn}`);
+          console.log(`[SINGLE] NF criada com desconto ${discountPercent}% Shopee via nota.fiscal.incluir`);
         } else {
-          console.warn(`[SINGLE] Falha ao aplicar desconto: ${alterResult.error}`);
+          console.warn(`[SINGLE] createAndEmitNFDiscounted falhou: ${nf.error} — tentando sem desconto`);
+          await sleep(1100);
+          nf = await generateNFFromOrder(tinyOrder.id, tinyOrder.numero);
         }
+      } else {
+        await sleep(1100);
+        nf = await generateNFFromOrder(tinyOrder.id, tinyOrder.numero);
       }
-    } catch (e: any) {
-      console.warn(`[SINGLE] Erro ao aplicar desconto Shopee: ${e.message} — gerando NF sem desconto`);
-    }
 
-    // Gera NF a partir do pedido (preserva selo ecommerce → Tiny auto-envia para Shopee)
-    console.log(`[SINGLE] Gerando NF do pedido ${orderSn} via gerar.nota.fiscal.pedido...`);
-    await sleep(1100);
-
-    try {
-      const nf = await generateNFFromOrder(tinyOrder.id, tinyOrder.numero);
       if (nf.success && nf.chaveAcesso) {
         nfId = nf.nfId;
         result.nf = {

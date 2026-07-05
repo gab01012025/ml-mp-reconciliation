@@ -2281,40 +2281,45 @@ const server = http.createServer(async (req, res) => {
 
       let descontoAplicado = 0;
       const discountDebug: string[] = [`canal=${detectedCanal || 'nenhum'}`, `itens=${detail.itens?.length || 0}`, `total=${detail.total_pedido}`];
+      let nf: any;
+
       if (detectedCanal) {
         try {
           const discountPercent = await tinyClient.getMarketplaceDiscount(detectedCanal);
           discountDebug.push(`desconto=${discountPercent}%`);
           if (discountPercent > 0) {
-            console.log(`[MANUAL] Aplicando desconto ${discountPercent}% (${detectedCanal}) ao pedido ${tinyOrderId}`);
+            // Usa nota.fiscal.incluir.php com preços reduzidos diretamente no payload
+            // (pedido.alterar.php não persiste o desconto de forma confiável)
+            console.log(`[MANUAL] Criando NF com desconto ${discountPercent}% (${detectedCanal}) via nota.fiscal.incluir`);
             await sleep(1200);
-            const alterResult = await tinyClient.alterOrderPrices(tinyOrderId, detail, discountPercent);
-            discountDebug.push(`alter=${alterResult.success ? 'OK' : 'FALHA: ' + (alterResult.error || '?')}`);
-            if (alterResult.success) {
+            const ecommerceName = detectedCanal === 'Shopee' ? 'Shopee' : 'Mercado Livre';
+            nf = await tinyClient.createAndEmitNFDiscounted(detail, discountPercent, ecommerceName);
+            if (nf.success) {
               descontoAplicado = discountPercent;
-              console.log(`[MANUAL] Desconto ${discountPercent}% aplicado com sucesso`);
-              // Re-fetch order para pegar preços atualizados
-              await sleep(1200);
-              detail = await tinyClient.getOrder(tinyOrderId);
-              discountDebug.push(`novoTotal=${detail.total_pedido}`);
+              discountDebug.push(`NF criada com desconto OK via incluir.php`);
             } else {
-              console.warn(`[MANUAL] Falha ao aplicar desconto: ${alterResult.error} — gerando NF sem desconto`);
+              discountDebug.push(`incluir falhou: ${nf.error || '?'} — tentando sem desconto`);
+              console.warn(`[MANUAL] createAndEmitNFDiscounted falhou: ${nf.error} — gerando NF sem desconto`);
+              await sleep(1200);
+              nf = await tinyClient.generateNFFromOrder(tinyOrderId, detail.numero);
             }
           } else {
             discountDebug.push('desconto=0, nada a fazer');
+            await sleep(1200);
+            nf = await tinyClient.generateNFFromOrder(tinyOrderId, detail.numero);
           }
         } catch (e: any) {
           discountDebug.push(`erro=${e.message}`);
-          console.warn(`[MANUAL] Erro ao aplicar desconto: ${e.message} — gerando NF sem desconto`);
+          console.warn(`[MANUAL] Erro ao criar NF com desconto: ${e.message} — gerando NF sem desconto`);
+          await sleep(1200);
+          nf = await tinyClient.generateNFFromOrder(tinyOrderId, detail.numero);
         }
       } else {
         discountDebug.push('sem marketplace detectado');
         console.log(`[MANUAL] Pedido ${tinyOrderId} sem marketplace detectado — gerando NF sem desconto`);
+        await sleep(1200);
+        nf = await tinyClient.generateNFFromOrder(tinyOrderId, detail.numero);
       }
-
-      // Gera NF a partir do pedido (preserva selo ecommerce → Tiny auto-envia)
-      await sleep(1200);
-      const nf = await tinyClient.generateNFFromOrder(tinyOrderId, detail.numero);
 
       if (nf.success) {
         // Adiciona ao histórico e CSV
@@ -2419,46 +2424,52 @@ const server = http.createServer(async (req, res) => {
                 continue;
               }
 
-              // Aplicar desconto — usa canal do frontend (baseado em regex do numero_ecommerce)
-              // pois isShopeeOrder() depende de campo ecommerce que a API Tiny nem sempre retorna
+              // Detectar canal do marketplace
               let detectedCanal: 'Shopee' | 'ML' | null = null;
               if (p.canal === 'Shopee') detectedCanal = 'Shopee';
               else if (p.canal === 'Mercado Livre') detectedCanal = 'ML';
-              // Fallback: tenta detectar pela API se canal não veio do frontend
               if (!detectedCanal) {
                 if (tinyClient.isShopeeOrder(detail)) detectedCanal = 'Shopee';
                 else if (tinyClient.isMercadoLivreOrder(detail)) detectedCanal = 'ML';
               }
 
+              // Gerar NF — usa nota.fiscal.incluir.php com desconto direto no payload
+              // (pedido.alterar.php + gerar.nota.fiscal.pedido.php não funciona com desconto)
               let descontoAplicado = 0;
+              let nf: any;
+
               if (detectedCanal) {
-                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Aplicando desconto ${detectedCanal}...` });
+                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Gerando NF com desconto ${detectedCanal}...` });
                 try {
                   const discountPercent = await tinyClient.getMarketplaceDiscount(detectedCanal);
                   console.log(`[BATCH] Pedido ${label}: canal=${detectedCanal}, desconto=${discountPercent}%`);
                   if (discountPercent > 0) {
                     await sleep(1200);
-                    const alterResult = await tinyClient.alterOrderPrices(p.id, detail, discountPercent);
-                    if (alterResult.success) {
+                    const ecommerceName = detectedCanal === 'Shopee' ? 'Shopee' : 'Mercado Livre';
+                    nf = await tinyClient.createAndEmitNFDiscounted(detail, discountPercent, ecommerceName);
+                    if (nf.success) {
                       descontoAplicado = discountPercent;
                       resumo.descontosAplicados++;
-                      console.log(`[BATCH] Pedido ${label}: desconto ${discountPercent}% aplicado OK`);
-                    } else {
-                      console.warn(`[BATCH] Pedido ${label}: alterOrderPrices FALHOU: ${alterResult.error}`);
-                      sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Desconto falhou: ${alterResult.error} — gerando NF sem desconto` });
+                      console.log(`[BATCH] Pedido ${label}: NF criada com desconto ${discountPercent}% via nota.fiscal.incluir`);
                     }
+                  } else {
+                    // Desconto = 0, gera normalmente
+                    await sleep(1200);
+                    nf = await tinyClient.generateNFFromOrder(p.id, detail.numero);
                   }
                 } catch (discErr: any) {
-                  console.warn(`[BATCH] Pedido ${label}: erro desconto: ${discErr.message}`);
+                  console.warn(`[BATCH] Pedido ${label}: erro ao criar NF com desconto: ${discErr.message}`);
                   sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Erro desconto: ${discErr.message} — gerando NF sem desconto` });
+                  await sleep(1200);
+                  nf = await tinyClient.generateNFFromOrder(p.id, detail.numero);
                 }
+              } else {
+                // Sem marketplace, gera NF normalmente
+                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Gerando NF...` });
+                await sleep(1200);
+                nf = await tinyClient.generateNFFromOrder(p.id, detail.numero);
               }
 
-              // Gerar NF
-              const canalDebug = detectedCanal ? `(${detectedCanal}, desc=${descontoAplicado}%)` : `(canal="${p.canal}", sem desconto)`;
-              sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Gerando NF... ${canalDebug}` });
-              await sleep(1200);
-              const nf = await tinyClient.generateNFFromOrder(p.id, detail.numero);
               if (nf.success) {
                 const descontoInfo = descontoAplicado > 0 ? ` (desconto ${descontoAplicado}% ${detectedCanal})` : '';
                 sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'ok', detail: `NF ${nf.numero || nf.nfId} gerada — R$ ${(nf.valorNota || 0).toFixed(2)}${descontoInfo}` });
