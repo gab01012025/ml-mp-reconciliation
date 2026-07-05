@@ -346,13 +346,49 @@ async function tryUpload(
   filename: string,
   label: string,
 ): Promise<ShopeeApiResponse> {
+  // Usa Blob em vez de File para melhor compatibilidade com Node.js fetch
   const formData = new _FormData();
   formData.append('order_sn', orderSn);
   formData.append('file_type', '1');
-  const file = new _File([xmlBuffer], filename, { type: mimeType });
-  formData.append('file', file);
+  const blob = new Blob([xmlBuffer], { type: mimeType });
+  formData.append('file', blob, filename);
 
   const res = await fetch(url, { method: 'POST', body: formData as any });
+  const rawText = await res.text();
+  console.log(`[SHOPEE] ${label} response (${res.status}): ${rawText.slice(0, 300)}`);
+  try {
+    return JSON.parse(rawText) as ShopeeApiResponse;
+  } catch {
+    return { error: 'parse_error', message: `Status ${res.status}: ${rawText.slice(0, 200)}` };
+  }
+}
+
+// === Helper: upload via multipart boundary manual (fallback robusto) ===
+async function tryUploadManual(
+  url: string,
+  orderSn: string,
+  xmlBuffer: Buffer,
+  label: string,
+): Promise<ShopeeApiResponse> {
+  const boundary = '----ShopeeUpload' + Date.now();
+  const parts: Buffer[] = [];
+
+  // order_sn field
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="order_sn"\r\n\r\n${orderSn}\r\n`));
+  // file_type field
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file_type"\r\n\r\n1\r\n`));
+  // file field
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${orderSn}.xml"\r\nContent-Type: application/xml\r\n\r\n`));
+  parts.push(xmlBuffer);
+  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+
+  const body = Buffer.concat(parts);
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+    body,
+  });
   const rawText = await res.text();
   console.log(`[SHOPEE] ${label} response (${res.status}): ${rawText.slice(0, 300)}`);
   try {
@@ -452,6 +488,15 @@ export async function uploadInvoiceDoc(
     return { success: true };
   }
   console.warn(`[SHOPEE] Upload application/xml falhou: ${result.error} — ${result.message || ''}`);
+
+  // Tentativa 4: multipart manual (boundary construído manualmente)
+  console.log(`[SHOPEE] Tentativa 4: upload manual multipart (${rawBuf.length} bytes)`);
+  result = await tryUploadManual(buildUrl(), orderSn, rawBuf, 'tentativa4');
+  if (!result.error) {
+    console.log(`[SHOPEE] NF enviada via upload manual multipart`);
+    return { success: true };
+  }
+  console.warn(`[SHOPEE] Upload manual falhou: ${result.error} — ${result.message || ''}`);
 
   return { success: false, error: `${result.error}: ${result.message || ''}` };
 }
