@@ -543,6 +543,7 @@ export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discount
     nota_fiscal: {
       tipo_nota: 'N',
       natureza_operacao: 'Venda de mercadorias',
+      id_pedido: order.id,
       numero_pedido_ecommerce: order.numero_ecommerce,
       frete_por_conta: 'R',
       cliente: {
