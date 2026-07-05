@@ -143,7 +143,7 @@ async function ensureValidToken(): Promise<string | null> {
 }
 
 // === API call helper ===
-async function shopeeApiCall(path: string, body: Record<string, any>): Promise<ShopeeApiResponse> {
+async function shopeeApiCall(path: string, body: Record<string, any>, retryOnAuthError = true): Promise<ShopeeApiResponse> {
   const accessToken = await ensureValidToken();
   if (!accessToken) {
     return { error: 'no_token', message: 'Token não disponível. Re-autorize a loja.' };
@@ -162,11 +162,25 @@ async function shopeeApiCall(path: string, body: Record<string, any>): Promise<S
       body: JSON.stringify(body),
     });
     const rawText = await res.text();
+    console.log(`[SHOPEE] ${path} HTTP ${res.status} — ${rawText.slice(0, 300)}`);
+    let parsed: ShopeeApiResponse;
     try {
-      return JSON.parse(rawText) as ShopeeApiResponse;
+      parsed = JSON.parse(rawText) as ShopeeApiResponse;
     } catch {
       return { error: 'parse_error', message: `Status ${res.status}: ${rawText.slice(0, 200)}` };
     }
+
+    // Retry on auth-like errors (interceptor, error_auth, invalid token)
+    const errStr = String(parsed.error || '').toLowerCase();
+    if (retryOnAuthError && (errStr === 'interceptor' || errStr.includes('auth') || errStr.includes('token') || res.status === 403)) {
+      console.warn(`[SHOPEE] Auth-like error "${parsed.error}" em ${path} — forçando refresh e retry...`);
+      const refreshed = await refreshAccessToken();
+      if (refreshed) {
+        return shopeeApiCall(path, body, false); // retry once
+      }
+    }
+
+    return parsed;
   } catch (err: any) {
     return { error: 'fetch_error', message: err.message || String(err) };
   }
@@ -433,11 +447,10 @@ export async function uploadInvoiceDoc(
   console.log(`[SHOPEE] NF-e dados: chave=${nfeData.chaveAcesso || 'N/A'} num=${nfeData.numero || 'N/A'} serie=${nfeData.serie || 'N/A'}`);
   console.log(`[SHOPEE] Enviando NF para pedido ${orderSn} (${xml.length} bytes XML) status=${invoiceCheck.orderStatus || 'N/A'}`);
 
-  // === Estratégia: add_invoice_data (JSON) primeiro, upload de arquivo como fallback ===
-  // O add_invoice_data é mais confiável pois envia apenas os dados estruturados da NF
-  // sem depender do upload de arquivo XML (que falha com "File error" frequentemente).
+  let lastError = '';
 
-  // Tentativa 1: add_invoice_data (dados estruturados via JSON — mais confiável)
+  // === Tentativa 1: add_invoice_data (dados estruturados via JSON) ===
+  // Envia só número, série e chave — sem upload de arquivo
   if (nfeData.chaveAcesso && nfeData.numero && nfeData.serie) {
     console.log(`[SHOPEE] Tentativa 1: add_invoice_data (JSON) — num=${nfeData.numero} serie=${nfeData.serie} chave=...${nfeData.chaveAcesso.slice(-8)}`);
     const jsonResult = await addInvoiceData(orderSn, nfeData.numero, nfeData.serie, nfeData.chaveAcesso);
@@ -445,19 +458,32 @@ export async function uploadInvoiceDoc(
       console.log(`[SHOPEE] NF registrada com sucesso via add_invoice_data (JSON)`);
       return { success: true };
     }
-    console.warn(`[SHOPEE] add_invoice_data falhou: ${jsonResult.error}`);
+    lastError = jsonResult.error || 'add_invoice_data falhou';
+    console.warn(`[SHOPEE] add_invoice_data falhou: ${lastError}`);
   } else {
     console.warn(`[SHOPEE] Dados NF incompletos no XML — chave=${!!nfeData.chaveAcesso} num=${!!nfeData.numero} serie=${!!nfeData.serie}`);
   }
 
-  // Tentativa 2+: upload de arquivo XML (fallback)
+  // === Tentativa 2: upload_invoice_doc via https module (multipart manual) ===
   const accessToken = await ensureValidToken();
   if (!accessToken) {
     return { success: false, error: 'no_token: Token não disponível. Re-autorize a loja.' };
   }
 
   const shopId = currentTokens?.shop_id || String(SHOP_ID);
+  const rawBuf = Buffer.from(xml, 'utf-8');
 
+  // Upload via https module nativo (mais confiável que fetch para multipart)
+  console.log(`[SHOPEE] Tentativa 2: upload_invoice_doc via https (${rawBuf.length} bytes)`);
+  const httpsResult = await uploadViaHttps(orderSn, rawBuf, accessToken, shopId);
+  if (httpsResult.success) {
+    console.log(`[SHOPEE] NF enviada via upload https nativo`);
+    return { success: true };
+  }
+  lastError = httpsResult.error || 'upload https falhou';
+  console.warn(`[SHOPEE] Upload https falhou: ${lastError}`);
+
+  // === Tentativa 3: upload_invoice_doc via fetch + FormData ===
   function buildUrl(): string {
     const ts = Math.floor(Date.now() / 1000);
     const path = '/api/v2/order/upload_invoice_doc';
@@ -465,40 +491,103 @@ export async function uploadInvoiceDoc(
     return `${BASE_URL}${path}?partner_id=${PARTNER_ID}&timestamp=${ts}&sign=${sign}&access_token=${accessToken}&shop_id=${shopId}`;
   }
 
-  // Tentativa 2: File + text/xml
-  const rawBuf = Buffer.from(xml, 'utf-8');
-  console.log(`[SHOPEE] Tentativa 2: upload_invoice_doc text/xml (${rawBuf.length} bytes)`);
-  let result = await tryUpload(buildUrl(), orderSn, rawBuf, 'text/xml', `${orderSn}.xml`, 'tentativa2');
+  console.log(`[SHOPEE] Tentativa 3: upload_invoice_doc fetch+FormData (${rawBuf.length} bytes)`);
+  let result = await tryUpload(buildUrl(), orderSn, rawBuf, 'text/xml', `${orderSn}.xml`, 'tentativa3');
   if (!result.error) {
-    console.log(`[SHOPEE] NF enviada via upload de arquivo (text/xml)`);
+    console.log(`[SHOPEE] NF enviada via fetch+FormData`);
     return { success: true };
   }
-  console.warn(`[SHOPEE] Upload text/xml falhou: ${result.error} — ${result.message || ''}`);
+  lastError = `${result.error}: ${result.message || ''}`;
+  console.warn(`[SHOPEE] Upload fetch+FormData falhou: ${lastError}`);
 
-  // Tentativa 3: File + application/xml com declaração
-  let xmlWithDecl = xml;
-  if (!xml.startsWith('<?xml')) {
-    xmlWithDecl = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml;
-  }
-  const declBuf = Buffer.from(xmlWithDecl, 'utf-8');
-  console.log(`[SHOPEE] Tentativa 3: upload_invoice_doc application/xml (${declBuf.length} bytes)`);
-  result = await tryUpload(buildUrl(), orderSn, declBuf, 'application/xml', `nfe_${orderSn}.xml`, 'tentativa3');
-  if (!result.error) {
-    console.log(`[SHOPEE] NF enviada via upload de arquivo (application/xml)`);
-    return { success: true };
-  }
-  console.warn(`[SHOPEE] Upload application/xml falhou: ${result.error} — ${result.message || ''}`);
-
-  // Tentativa 4: multipart manual (boundary construído manualmente)
+  // === Tentativa 4: multipart boundary manual ===
   console.log(`[SHOPEE] Tentativa 4: upload manual multipart (${rawBuf.length} bytes)`);
   result = await tryUploadManual(buildUrl(), orderSn, rawBuf, 'tentativa4');
   if (!result.error) {
-    console.log(`[SHOPEE] NF enviada via upload manual multipart`);
+    console.log(`[SHOPEE] NF enviada via multipart manual`);
     return { success: true };
   }
-  console.warn(`[SHOPEE] Upload manual falhou: ${result.error} — ${result.message || ''}`);
+  lastError = `${result.error}: ${result.message || ''}`;
+  console.warn(`[SHOPEE] Upload manual falhou: ${lastError}`);
 
-  return { success: false, error: `${result.error}: ${result.message || ''}` };
+  return { success: false, error: lastError };
+}
+
+// === Upload via Node.js https module (mais controle sobre multipart) ===
+async function uploadViaHttps(
+  orderSn: string,
+  xmlBuffer: Buffer,
+  accessToken: string,
+  shopId: string,
+): Promise<{ success: boolean; error?: string }> {
+  const https = await import('https');
+
+  const ts = Math.floor(Date.now() / 1000);
+  const apiPath = '/api/v2/order/upload_invoice_doc';
+  const sign = generateSign(apiPath, ts, accessToken, shopId);
+  const queryStr = `partner_id=${PARTNER_ID}&timestamp=${ts}&sign=${sign}&access_token=${accessToken}&shop_id=${shopId}`;
+
+  const boundary = `----NodeUpload${Date.now()}`;
+  const filename = `${orderSn}.xml`;
+
+  // Construir multipart body
+  const preamble = [
+    `--${boundary}`,
+    `Content-Disposition: form-data; name="order_sn"`,
+    ``,
+    orderSn,
+    `--${boundary}`,
+    `Content-Disposition: form-data; name="file"; filename="${filename}"`,
+    `Content-Type: text/xml`,
+    ``,
+    ``,
+  ].join('\r\n');
+
+  const epilogue = `\r\n--${boundary}--\r\n`;
+
+  const preambleBuf = Buffer.from(preamble, 'utf-8');
+  const epilogueBuf = Buffer.from(epilogue, 'utf-8');
+  const bodyBuf = Buffer.concat([preambleBuf, xmlBuffer, epilogueBuf]);
+
+  return new Promise((resolve) => {
+    const options = {
+      hostname: 'partner.shopeemobile.com',
+      port: 443,
+      path: `${apiPath}?${queryStr}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': bodyBuf.length,
+      },
+    };
+
+    const req = https.request(options, (res: any) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => {
+        const rawText = Buffer.concat(chunks).toString('utf-8');
+        console.log(`[SHOPEE] upload_invoice_doc (https) HTTP ${res.statusCode}: ${rawText.slice(0, 300)}`);
+        try {
+          const data = JSON.parse(rawText);
+          if (data.error) {
+            resolve({ success: false, error: `${data.error}: ${data.message || rawText.slice(0, 100)}` });
+          } else {
+            resolve({ success: true });
+          }
+        } catch {
+          resolve({ success: false, error: `HTTP ${res.statusCode}: ${rawText.slice(0, 200)}` });
+        }
+      });
+    });
+
+    req.on('error', (err: any) => {
+      console.error(`[SHOPEE] upload_invoice_doc (https) erro:`, err);
+      resolve({ success: false, error: `https_error: ${err.message}` });
+    });
+
+    req.write(bodyBuf);
+    req.end();
+  });
 }
 
 // === Fallback: Add Invoice Data via JSON endpoint ===
