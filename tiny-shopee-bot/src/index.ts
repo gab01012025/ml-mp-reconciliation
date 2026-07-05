@@ -2478,6 +2478,32 @@ const server = http.createServer(async (req, res) => {
                 (p as any)._nfNumero = nf.numero;
                 (p as any)._chaveAcesso = nf.chaveAcesso;
 
+                // Auto-envio para Shopee quando NF criada via nota.fiscal.incluir (sem vínculo automático)
+                if (descontoAplicado > 0 && detectedCanal === 'Shopee' && p.numero_ecommerce && nf.nfId) {
+                  sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'working', detail: 'Enviando NF para Shopee (auto)...' });
+                  try {
+                    await sleep(1500);
+                    const xml = await tinyClient.getNFXml(nf.nfId);
+                    if (xml) {
+                      const sendResult = await shopeeClient.uploadInvoiceDoc(p.numero_ecommerce, xml);
+                      if (sendResult.success) {
+                        sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'ok', detail: 'NF enviada para Shopee' });
+                        resumo.enviadas++;
+                        (p as any)._autoEnviada = true;
+                      } else {
+                        sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'erro', detail: `Envio Shopee: ${sendResult.error}` });
+                        resumo.envioErros++;
+                      }
+                    } else {
+                      sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'erro', detail: 'XML da NF não disponível ainda' });
+                      resumo.envioErros++;
+                    }
+                  } catch (envErr: any) {
+                    sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'erro', detail: `Envio: ${envErr.message}` });
+                    resumo.envioErros++;
+                  }
+                }
+
                 // Registra no histórico
                 const processedNF: ProcessedNF = {
                   numero: nf.numero || '', nfId: nf.nfId || '', chaveAcesso: nf.chaveAcesso || '',
@@ -2503,7 +2529,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         // ---- ENVIAR NF ----
-        if (doEnviar && p.canal === 'Shopee' && p.numero_ecommerce) {
+        if (doEnviar && p.canal === 'Shopee' && p.numero_ecommerce && !(p as any)._autoEnviada) {
           const nfId = (p as any)._nfId;
           const chaveAcesso = (p as any)._chaveAcesso;
           if (!nfId) {
