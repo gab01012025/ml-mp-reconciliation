@@ -574,12 +574,12 @@ export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discount
     },
   };
 
-  if (ecommerceName) {
-    nota.nota_fiscal.ecommerce = ecommerceName;
-  }
+  // NOTA: NÃO enviar campo "ecommerce" — a API do Tiny pode rejeitar.
+  // O Preview (que funciona) também não envia esse campo.
+  // O numero_pedido_ecommerce já faz o vínculo com o marketplace.
 
-  console.log(`[TINY] Criando NF com id_pedido=${order.id}, numero_pedido_ecommerce=${order.numero_ecommerce}${ecommerceName ? `, ecommerce=${ecommerceName}` : ''}`);
-  console.log(`[TINY] Payload nota.fiscal.incluir: ${order.itens.length} itens, fator=${factor}, cliente=${order.cliente.nome}`);
+  console.log(`[TINY] Criando NF via nota.fiscal.incluir: pedido=${order.id}, ecommerce_num=${order.numero_ecommerce}, ${order.itens.length} itens, fator=${factor}, cliente=${order.cliente.nome}`);
+  console.log(`[TINY] Payload JSON:`, JSON.stringify(nota, null, 2));
 
   const incluirResult = await tinyPost('nota.fiscal.incluir.php', { nota: JSON.stringify(nota) });
   const incluirRetorno = incluirResult.retorno;
