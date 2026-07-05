@@ -543,7 +543,6 @@ export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discount
     nota_fiscal: {
       tipo_nota: 'N',
       natureza_operacao: 'Venda de mercadorias',
-      id_pedido: order.id,
       numero_pedido_ecommerce: order.numero_ecommerce,
       frete_por_conta: 'R',
       cliente: {
@@ -579,18 +578,27 @@ export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discount
     nota.nota_fiscal.ecommerce = ecommerceName;
   }
 
-  console.log(`[TINY] Criando NF com numero_pedido_ecommerce=${order.numero_ecommerce}${ecommerceName ? `, ecommerce=${ecommerceName}` : ''}`);
+  console.log(`[TINY] Criando NF com id_pedido=${order.id}, numero_pedido_ecommerce=${order.numero_ecommerce}${ecommerceName ? `, ecommerce=${ecommerceName}` : ''}`);
+  console.log(`[TINY] Payload nota.fiscal.incluir: ${order.itens.length} itens, fator=${factor}, cliente=${order.cliente.nome}`);
 
   const incluirResult = await tinyPost('nota.fiscal.incluir.php', { nota: JSON.stringify(nota) });
   const incluirRetorno = incluirResult.retorno;
   const registro = incluirRetorno.registros?.registro;
   const reg = Array.isArray(registro) ? registro[0] : registro;
 
-  if (incluirRetorno.status !== 'OK' || reg?.status !== 'OK') {
+  if (incluirRetorno.status !== 'OK' || (reg && reg.status !== 'OK')) {
     const erros = reg?.erros || incluirRetorno.erros;
-    const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro desconhecido';
+    let errList: string;
+    if (Array.isArray(erros)) {
+      errList = erros.map((e: any) => e.erro || JSON.stringify(e)).join('; ');
+    } else if (erros?.erro) {
+      errList = erros.erro;
+    } else {
+      errList = `API status=${incluirRetorno.status}, reg.status=${reg?.status || 'N/A'}`;
+    }
     console.error(`[ERRO] Falha ao criar NF para pedido ${order.id}: ${errList}`);
-    return { success: false };
+    console.error(`[DEBUG] nota.fiscal.incluir response:`, JSON.stringify(incluirRetorno, null, 2));
+    return { success: false, error: errList };
   }
 
   const nfId = String(reg.id);
