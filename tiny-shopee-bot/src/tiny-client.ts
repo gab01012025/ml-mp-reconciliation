@@ -574,9 +574,28 @@ export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discount
     },
   };
 
-  // NOTA: NÃO enviar campo "ecommerce" — a API do Tiny pode rejeitar.
-  // O Preview (que funciona) também não envia esse campo.
-  // O numero_pedido_ecommerce já faz o vínculo com o marketplace.
+  // Tenta vincular NF ao pedido existente no Tiny
+  if (order.id) {
+    nota.nota_fiscal.id_pedido = order.id;
+  }
+
+  // Intermediador + ecommerce — necessário para NF-e de marketplace (tag infIntermed)
+  // e pode fazer o Tiny reconhecer como venda via marketplace (selo)
+  if (ecommerceName) {
+    nota.nota_fiscal.ecommerce = ecommerceName;
+    const marketplaceCnpjs: Record<string, string> = {
+      'shopee': '36666279000101',        // Shopee Brasil Internet LTDA
+      'mercado livre': '10573521000191',  // MercadoLivre.com Atividades de Internet LTDA
+    };
+    const cnpj = marketplaceCnpjs[ecommerceName.toLowerCase()];
+    if (cnpj) {
+      nota.nota_fiscal.intermediador = {
+        cnpj,
+        nome_usuario: order.numero_ecommerce,
+      };
+      console.log(`[TINY] Intermediador: ${ecommerceName} CNPJ=${cnpj} usuario=${order.numero_ecommerce}`);
+    }
+  }
 
   console.log(`[TINY] Criando NF via nota.fiscal.incluir: pedido=${order.id}, ecommerce_num=${order.numero_ecommerce}, ${order.itens.length} itens, fator=${factor}, cliente=${order.cliente.nome}`);
   console.log(`[TINY] Payload JSON:`, JSON.stringify(nota, null, 2));

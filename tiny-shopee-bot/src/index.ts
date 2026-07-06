@@ -231,14 +231,14 @@ const server = http.createServer(async (req, res) => {
   // Public: health
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v4.00', uptime: process.uptime() }));
+    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v4.04', uptime: process.uptime() }));
     return;
   }
 
   // Public: version check (for debugging deploys)
   if (url.pathname === '/version') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ version: 'v4.00', build: '2026-07-05T02:20Z', deployed: startTime.toISOString() }));
+    res.end(JSON.stringify({ version: 'v4.04', build: '2026-07-05T02:20Z', deployed: startTime.toISOString() }));
     return;
   }
 
@@ -2284,15 +2284,23 @@ const server = http.createServer(async (req, res) => {
       let nf: any;
 
       if (detectedCanal === 'Shopee') {
-        // Shopee: usa gerar.nota.fiscal.pedido — mantém selo + lista de preço do Tiny
-        discountDebug.push('Shopee: gerar.nota.fiscal.pedido (selo + lista de preço)');
-        console.log(`[MANUAL] Gerando NF via gerar.nota.fiscal.pedido para Shopee — pedido ${tinyOrderId}`);
-        await sleep(1200);
-        nf = await tinyClient.generateNFFromOrder(tinyOrderId, detail.numero);
-        if (nf.success) {
-          discountDebug.push(`NF criada com selo ecommerce — R$${(nf.valorNota || 0).toFixed(2)}`);
-        } else {
-          discountDebug.push(`gerar falhou: ${nf.error || '?'}`);
+        // Shopee: nota.fiscal.incluir com desconto + intermediador (CNPJ Shopee)
+        try {
+          const discountPercent = await tinyClient.getMarketplaceDiscount('Shopee');
+          discountDebug.push(`desconto=${discountPercent}%`);
+          discountDebug.push('Shopee: nota.fiscal.incluir + intermediador');
+          console.log(`[MANUAL] Criando NF Shopee com desconto ${discountPercent}% + intermediador — pedido ${tinyOrderId}`);
+          await sleep(1200);
+          nf = await tinyClient.createAndEmitNFDiscounted(detail, discountPercent, 'Shopee');
+          if (nf.success) {
+            descontoAplicado = discountPercent;
+            discountDebug.push(`NF criada com desconto + intermediador — R$${(nf.valorNota || 0).toFixed(2)}`);
+          } else {
+            discountDebug.push(`incluir falhou: ${nf.error || '?'}`);
+          }
+        } catch (e: any) {
+          discountDebug.push(`erro=${e.message}`);
+          nf = { success: false, error: e.message };
         }
       } else if (detectedCanal) {
         // ML e outros: usa nota.fiscal.incluir com desconto
@@ -2338,8 +2346,27 @@ const server = http.createServer(async (req, res) => {
         addToChecklist([processedNF], canal || detectedCanal || 'Manual');
         totalNFsEmitted++;
 
-        // Shopee: Tiny envia automaticamente (selo). ML: sem envio automático.
-        const nfSent = (detectedCanal === 'Shopee');
+        // Shopee: tenta enviar via API + verifica selo
+        let nfSent = false;
+        if (detectedCanal === 'Shopee' && nf.nfId && detail.numero_ecommerce) {
+          try {
+            await sleep(1200);
+            const xml = await tinyClient.getNFXml(nf.nfId);
+            if (xml) {
+              await sleep(1200);
+              const sendResult = await shopeeClient.uploadInvoiceDoc(detail.numero_ecommerce, xml);
+              nfSent = sendResult.success;
+              if (!nfSent) {
+                discountDebug.push(`upload Shopee falhou: ${sendResult.error}`);
+                console.warn(`[MANUAL] Upload Shopee falhou: ${sendResult.error} — verificar selo`);
+              } else {
+                discountDebug.push('NF enviada via Shopee API');
+              }
+            }
+          } catch (uploadErr: any) {
+            discountDebug.push(`upload erro: ${uploadErr.message}`);
+          }
+        }
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -2443,16 +2470,19 @@ const server = http.createServer(async (req, res) => {
               let nf: any;
 
               if (detectedCanal === 'Shopee') {
-                // Shopee: gerar.nota.fiscal.pedido — mantém selo + lista de preço automática
-                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Gerando NF Shopee (selo + lista de preço)...` });
+                // Shopee: nota.fiscal.incluir com desconto + intermediador (CNPJ Shopee)
+                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Gerando NF Shopee com desconto + intermediador...` });
                 try {
+                  const discountPercent = await tinyClient.getMarketplaceDiscount('Shopee');
+                  console.log(`[BATCH] Pedido ${label}: canal=Shopee, desconto=${discountPercent}%`);
                   await sleep(1200);
-                  nf = await tinyClient.generateNFFromOrder(p.id, detail.numero);
+                  nf = await tinyClient.createAndEmitNFDiscounted(detail, discountPercent, 'Shopee');
                   if (nf.success) {
-                    resumo.descontosAplicados++;
-                    console.log(`[BATCH] Pedido ${label}: NF gerada via gerar.nota.fiscal.pedido — R$${(nf.valorNota || 0).toFixed(2)}`);
+                    descontoAplicado = discountPercent;
+                    if (discountPercent > 0) resumo.descontosAplicados++;
+                    console.log(`[BATCH] Pedido ${label}: NF criada com desconto ${discountPercent}% + intermediador — R$${(nf.valorNota || 0).toFixed(2)}`);
                   } else {
-                    console.error(`[BATCH] Pedido ${label}: generateNFFromOrder falhou: ${nf.error}`);
+                    console.error(`[BATCH] Pedido ${label}: createAndEmitNFDiscounted falhou: ${nf.error}`);
                     sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'error', detail: `Falha: ${nf.error || '?'}` });
                   }
                 } catch (discErr: any) {
@@ -2496,11 +2526,25 @@ const server = http.createServer(async (req, res) => {
                 (p as any)._nfNumero = nf.numero;
                 (p as any)._chaveAcesso = nf.chaveAcesso;
 
-                // Shopee: Tiny envia automaticamente (selo). Não precisa de upload manual.
-                if (detectedCanal === 'Shopee') {
-                  sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'ok', detail: 'Tiny envia automaticamente (selo ecommerce)' });
-                  resumo.enviadas++;
-                  (p as any)._autoEnviada = true;
+                // Shopee: tenta enviar NF via Shopee API
+                if (detectedCanal === 'Shopee' && nf.nfId && detail.numero_ecommerce) {
+                  sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'working', detail: 'Enviando NF para Shopee...' });
+                  try {
+                    await sleep(1200);
+                    const xml = await tinyClient.getNFXml(nf.nfId);
+                    if (xml) {
+                      await sleep(1200);
+                      const sendResult = await shopeeClient.uploadInvoiceDoc(detail.numero_ecommerce, xml);
+                      if (sendResult.success) {
+                        sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'ok', detail: 'NF enviada via Shopee API' });
+                        resumo.enviadas++;
+                      } else {
+                        sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'error', detail: `Upload falhou: ${sendResult.error} — verificar selo` });
+                      }
+                    }
+                  } catch (uploadErr: any) {
+                    sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'enviar', status: 'error', detail: `Erro upload: ${uploadErr.message}` });
+                  }
                 }
 
                 // Registra no histórico
@@ -3058,7 +3102,7 @@ ${items.map(i => `<tr><td class="check"><input type="checkbox"></td><td style="f
     <button class="btn btn-green" id="btnProcessar" onclick="processarAuto()" style="min-width:180px;">Processar Pedido</button>
     <button class="btn btn-blue btn-sm" id="btnBuscar" onclick="buscar()" title="Buscar sem processar (modo manual)">Buscar</button>
   </div>
-  <p style="margin-top:8px;font-size:12px;color:#94a3b8;">Processar = busca no Tiny + gera NF (Tiny envia automaticamente para o marketplace)</p>
+  <p style="margin-top:8px;font-size:12px;color:#94a3b8;">Processar = busca no Tiny + gera NF com desconto + envia para o marketplace</p>
   <div id="msgBusca" class="msg" style="margin-top:12px;"></div>
 </div>
 
@@ -3143,7 +3187,7 @@ async function processarAuto() {
         var nfDetail = 'NF ' + nfLabel + (d2.jaExistia ? ' (já existia)' : ' gerada e emitida');
         if (d2.descontoAplicado > 0) nfDetail += ' (desconto ' + d2.descontoAplicado + '% ' + (d2.canal || '') + ')';
         d.steps.push({ step: 'Nota Fiscal (NF-e)', ok: true, detail: nfDetail });
-        d.steps.push({ step: 'Enviar NF ao Marketplace', ok: true, detail: 'Tiny envia automaticamente com selo ecommerce' });
+        d.steps.push({ step: 'Enviar NF ao Marketplace', ok: true, detail: 'NF enviada para Shopee via API' });
         if (d2.discountDebug) d.steps.push({ step: 'Debug Desconto', ok: d2.descontoAplicado > 0, detail: d2.discountDebug });
       } else if (d2.error && wasFound) {
         d.steps.push({ step: 'Nota Fiscal (NF-e)', ok: false, detail: d2.error });
@@ -3338,8 +3382,8 @@ function renderSteps(p) {
     steps[2].detail = 'Gere a NF primeiro (etapa 2)';
   } else {
     if (p.canal === 'Shopee') {
-      steps[2].detail = 'Tiny envia NF automaticamente para Shopee (selo ecommerce)';
-      steps[2].done = true;
+      steps[2].detail = 'NF com desconto + intermediador — envio via API Shopee';
+      steps[2].done = false;
     } else {
       steps[2].detail = 'Clique para enviar a NF para ' + p.canal;
       steps[2].done = false;
@@ -3426,7 +3470,7 @@ async function _gerarNFInternal() {
           pedidoAtual.nf = d2.nf;
           // Step 3: Shopee — Tiny envia automaticamente (selo)
           if (d2.nfSent) {
-            setStepDone('step3', 'Tiny envia automaticamente com selo ecommerce');
+            setStepDone('step3', 'NF enviada para Shopee via API');
           }
         } else {
           var errDetail = 'Falha ao gerar NF';
@@ -3452,7 +3496,7 @@ async function _gerarNFInternal() {
         pedidoAtual.temNF = true;
         pedidoAtual.nf = { nfId: d3.nfId, numero: d3.numero, chaveAcesso: d3.chaveAcesso, valorNota: d3.valorNota };
         if (d3.nfSent) {
-          setStepDone('step3', 'Tiny envia automaticamente com selo ecommerce');
+          setStepDone('step3', 'NF enviada para Shopee via API');
         }
       } else {
         setStepError('step2', d3.error || 'Erro ao gerar NF');
@@ -3473,9 +3517,9 @@ async function _gerarNFInternal() {
       setStepDone('step2', msg);
       pedidoAtual.temNF = true;
       pedidoAtual.nf = { nfId: d.nfId, numero: d.numero, chaveAcesso: d.chaveAcesso, situacao: d.situacao || 'Autorizada', valorNota: d.valorNota };
-      // NF criada — Shopee: Tiny envia automaticamente
+      // NF criada — Shopee: enviada via API
       if (d.nfSent) {
-        setStepDone('step3', 'Tiny envia automaticamente com selo ecommerce');
+        setStepDone('step3', 'NF enviada para Shopee via API');
       }
     } else {
       setStepError('step2', d.error || 'Erro ao gerar NF');
@@ -3693,7 +3737,7 @@ function getLoginHtml(error?: string): string {
       <div class="int-badge"><span class="dot"></span> Mercado Livre</div>
       <div class="int-badge"><span class="dot"></span> Tiny ERP</div>
     </div>
-    <div class="footer">SyncHub v4.00 — Integrador de Marketplaces e ERPs</div>
+    <div class="footer">SyncHub v4.04 — Integrador de Marketplaces e ERPs</div>
   </div>
   <script>
     if (localStorage.getItem('auth_token')) { window.location.href = '/'; }
@@ -3896,7 +3940,7 @@ function getDashboardHtml(): string {
       <div class="section-label">Sistema</div>
       <a href="#logs"><span class="icon">📄</span> Logs</a>
     </nav>
-    <div class="sidebar-footer">SyncHub v4.00<br>Integrador ERP/HUB</div>
+    <div class="sidebar-footer">SyncHub v4.04<br>Integrador ERP/HUB</div>
   </div>
 
   <!-- Main -->
@@ -4261,7 +4305,7 @@ function getDashboardHtml(): string {
 
           <hr style="border:none; border-top:1px solid #f0f0f0; margin: 16px 0;">
           <p style="font-size:13px; color:#888; margin-bottom:10px; font-weight:600;">Emitir NF Manual (por pedido)</p>
-          <p style="font-size:12px; color:#aaa; margin-bottom:10px;">Gera NF a partir do pedido (preserva selo ecommerce). Aceita ID Tiny ou nº ecommerce (Shopee/ML).</p>
+          <p style="font-size:12px; color:#aaa; margin-bottom:10px;">Gera NF com desconto + intermediador. Aceita ID Tiny ou nº ecommerce (Shopee/ML).</p>
           <div id="msgTestLP" class="msg msg-ok"></div>
           <div style="display:flex; gap:8px; align-items:end; flex-wrap:wrap;">
             <div class="form-sm">

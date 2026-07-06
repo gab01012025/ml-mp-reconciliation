@@ -207,16 +207,37 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
           continue;
         }
 
-        // Gera NF via gerar.nota.fiscal.pedido — mantém selo ecommerce + lista de preço configurada no Tiny
-        console.log(`[BOT] Gerando NF do pedido ${order.id} (${detail.numero}) via gerar.nota.fiscal.pedido — total: R$${detail.total_pedido}`);
+        // Gera NF via nota.fiscal.incluir com desconto + intermediador (Shopee CNPJ)
+        // O intermediador + ecommerce + id_pedido podem criar o selo para auto-envio
+        const discountPercent = await getMarketplaceDiscount('Shopee');
+        console.log(`[BOT] Gerando NF do pedido ${order.id} (${detail.numero}) via nota.fiscal.incluir — desconto ${discountPercent}% — total: R$${detail.total_pedido}`);
 
         await sleep(1100);
-        const nf = await generateNFFromOrder(order.id, detail.numero);
+        const nf = await createAndEmitNFDiscounted(detail, discountPercent, 'Shopee');
 
         if (nf.success) {
           stats.altered++;
           stats.nfGenerated++;
-          console.log(`[OK] NF ${nf.numero || nf.nfId} emitida para pedido ${detail.numero_ecommerce} — R$${(nf.valorNota || 0).toFixed(2)} — Tiny envia automaticamente (selo)`);
+          console.log(`[OK] NF ${nf.numero || nf.nfId} emitida para pedido ${detail.numero_ecommerce} — R$${(nf.valorNota || 0).toFixed(2)} (desconto ${discountPercent}%)`);
+
+          // Tenta enviar NF para Shopee via API (fallback se selo não funcionar)
+          if (nf.nfId && detail.numero_ecommerce) {
+            try {
+              await sleep(1200);
+              const xml = await getNFXml(nf.nfId);
+              if (xml) {
+                await sleep(1200);
+                const sendResult = await shopee.uploadInvoiceDoc(detail.numero_ecommerce, xml);
+                if (sendResult.success) {
+                  console.log(`[OK] NF enviada para Shopee via API — pedido ${detail.numero_ecommerce}`);
+                } else {
+                  console.warn(`[AVISO] Upload Shopee falhou: ${sendResult.error} — verificar se Tiny enviou via selo`);
+                }
+              }
+            } catch (uploadErr: any) {
+              console.warn(`[AVISO] Erro ao enviar NF para Shopee: ${uploadErr.message} — verificar se Tiny enviou via selo`);
+            }
+          }
 
           if (nf.chaveAcesso) {
             stats.nfs.push({
@@ -872,13 +893,13 @@ export async function processSingleShopeeOrder(orderSn: string): Promise<SingleO
       result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF já vinculada (ID: ${nfId}) — detalhes indisponíveis` });
     }
   } else {
-    // Gera NF via gerar.nota.fiscal.pedido — vincula ao pedido com selo ecommerce
-    // A lista de preço SHOPEE configurada no Tiny aplica o desconto automaticamente
-    console.log(`[SINGLE] Gerando NF via gerar.nota.fiscal.pedido para pedido ${orderSn} (Tiny ID: ${tinyOrder.id})...`);
+    // Gera NF via nota.fiscal.incluir com desconto + intermediador (Shopee CNPJ)
+    const discountPercent = await getMarketplaceDiscount('Shopee');
+    console.log(`[SINGLE] Gerando NF via nota.fiscal.incluir para pedido ${orderSn} (Tiny ID: ${tinyOrder.id}) — desconto ${discountPercent}%...`);
 
     try {
       await sleep(1100);
-      const nf = await generateNFFromOrder(tinyOrder.id, tinyOrder.numero);
+      const nf = await createAndEmitNFDiscounted(detail, discountPercent, 'Shopee');
 
       if (nf.success && nf.chaveAcesso) {
         nfId = nf.nfId;
@@ -888,8 +909,8 @@ export async function processSingleShopeeOrder(orderSn: string): Promise<SingleO
           chaveAcesso: nf.chaveAcesso || '',
           valorNota: nf.valorNota || 0,
         };
-        console.log(`[SINGLE] NF ${nf.numero} gerada — R$${(nf.valorNota || 0).toFixed(2)} — selo ecommerce mantido`);
-        result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF ${nf.numero} gerada e emitida — R$ ${(nf.valorNota || 0).toFixed(2)} — Chave: ...${nf.chaveAcesso.slice(-8)}` });
+        console.log(`[SINGLE] NF ${nf.numero} gerada — R$${(nf.valorNota || 0).toFixed(2)} (desconto ${discountPercent}%)`);
+        result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF ${nf.numero} gerada com desconto ${discountPercent}% — R$ ${(nf.valorNota || 0).toFixed(2)} — Chave: ...${nf.chaveAcesso.slice(-8)}` });
       } else {
         result.steps.push({ step: 'Nota Fiscal', ok: false, detail: nf.error || 'Falha ao gerar/emitir NF.' });
         return result;
@@ -901,10 +922,29 @@ export async function processSingleShopeeOrder(orderSn: string): Promise<SingleO
   }
 
   // --- Step 5: Envio NF para Shopee ---
-  // NF gerada via gerar.nota.fiscal.pedido mantém o selo ecommerce
-  // O Tiny envia automaticamente para a Shopee
-  result.steps.push({ step: 'Enviar NF para Shopee', ok: true, detail: 'Tiny envia automaticamente com selo ecommerce' });
-  result.nfSent = true;
+  // Tenta enviar via Shopee API + verifica se Tiny enviou via selo (intermediador)
+  let nfSentOk = false;
+  if (nfId) {
+    try {
+      await sleep(1200);
+      const xml = await getNFXml(nfId);
+      if (xml) {
+        await sleep(1200);
+        const sendResult = await shopee.uploadInvoiceDoc(orderSn, xml);
+        if (sendResult.success) {
+          nfSentOk = true;
+          result.steps.push({ step: 'Enviar NF para Shopee', ok: true, detail: 'NF enviada via Shopee API' });
+        } else {
+          result.steps.push({ step: 'Enviar NF para Shopee', ok: false, detail: `Upload Shopee falhou: ${sendResult.error} — verificar se Tiny enviou via selo` });
+        }
+      } else {
+        result.steps.push({ step: 'Enviar NF para Shopee', ok: false, detail: 'XML da NF não disponível para upload' });
+      }
+    } catch (uploadErr: any) {
+      result.steps.push({ step: 'Enviar NF para Shopee', ok: false, detail: `Erro: ${uploadErr.message}` });
+    }
+  }
+  result.nfSent = nfSentOk;
 
   result.success = result.steps.every(s => s.ok);
   console.log(`[SINGLE] ========== Resultado: ${result.success ? 'SUCESSO' : 'COM ERROS'} — ${result.steps.length} etapas ==========`);
