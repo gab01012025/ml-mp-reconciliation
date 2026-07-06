@@ -363,7 +363,7 @@ async function tryUpload(
   // Usa Blob em vez de File para melhor compatibilidade com Node.js fetch
   const formData = new _FormData();
   formData.append('order_sn', orderSn);
-  formData.append('file_type', 'XML');
+  formData.append('file_type', '1');
   const blob = new Blob([xmlBuffer], { type: mimeType });
   formData.append('file', blob, filename);
 
@@ -390,7 +390,7 @@ async function tryUploadManual(
   // order_sn field
   parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="order_sn"\r\n\r\n${orderSn}\r\n`));
   // file_type field
-  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file_type"\r\n\r\nXML\r\n`));
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file_type"\r\n\r\n1\r\n`));
   // file field
   parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${orderSn}.xml"\r\nContent-Type: application/xml\r\n\r\n`));
   parts.push(xmlBuffer);
@@ -446,6 +446,7 @@ export async function uploadInvoiceDoc(
   const nfeData = extractNFeData(xml);
   console.log(`[SHOPEE] NF-e dados: chave=${nfeData.chaveAcesso || 'N/A'} num=${nfeData.numero || 'N/A'} serie=${nfeData.serie || 'N/A'}`);
   console.log(`[SHOPEE] Enviando NF para pedido ${orderSn} (${xml.length} bytes XML) status=${invoiceCheck.orderStatus || 'N/A'}`);
+  console.log(`[SHOPEE] XML preview: ${xml.slice(0, 200)}...`);
 
   let lastError = '';
 
@@ -539,7 +540,7 @@ async function uploadViaHttps(
     `--${boundary}`,
     `Content-Disposition: form-data; name="file_type"`,
     ``,
-    `XML`,
+    `1`,
     `--${boundary}`,
     `Content-Disposition: form-data; name="file"; filename="${filename}"`,
     `Content-Type: application/xml`,
