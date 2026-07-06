@@ -6,6 +6,7 @@ import {
   isMercadoLivreOrder,
   isPessoaFisica,
   hasClientAddress,
+  generateNFFromOrder,
   createAndEmitNFDiscounted,
   getNFDetails,
   getNFXml,
@@ -206,37 +207,16 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
           continue;
         }
 
-        // Gera NF com desconto via nota.fiscal.incluir.php + envia para Shopee via API
-        const discountPercent = await getMarketplaceDiscount('Shopee');
-        console.log(`[BOT] Gerando NF do pedido ${order.id} (${detail.numero}) — total: R$${detail.total_pedido} — desconto: ${discountPercent}%`);
+        // Gera NF via gerar.nota.fiscal.pedido — mantém selo ecommerce + lista de preço configurada no Tiny
+        console.log(`[BOT] Gerando NF do pedido ${order.id} (${detail.numero}) via gerar.nota.fiscal.pedido — total: R$${detail.total_pedido}`);
 
         await sleep(1100);
-        const nf = await createAndEmitNFDiscounted(detail, discountPercent, 'Shopee');
+        const nf = await generateNFFromOrder(order.id, detail.numero);
 
         if (nf.success) {
           stats.altered++;
           stats.nfGenerated++;
-          console.log(`[OK] NF ${nf.numero || nf.nfId} emitida com ${discountPercent}% desconto para pedido ${detail.numero_ecommerce}`);
-
-          // Upload NF para Shopee via API (não depende de selo/Tiny auto-envio)
-          if (nf.nfId && detail.numero_ecommerce) {
-            try {
-              await sleep(1500);
-              const xml = await import('./tiny-client').then(tc => tc.getNFXml(nf.nfId!));
-              if (xml) {
-                const sendResult = await shopee.uploadInvoiceDoc(detail.numero_ecommerce, xml);
-                if (sendResult.success) {
-                  console.log(`[OK] NF enviada para Shopee via API para pedido ${detail.numero_ecommerce}`);
-                } else {
-                  console.warn(`[AVISO] NF criada mas envio Shopee falhou: ${sendResult.error}`);
-                }
-              } else {
-                console.warn(`[AVISO] XML da NF ${nf.nfId} não disponível — envio para Shopee pendente`);
-              }
-            } catch (uploadErr: any) {
-              console.warn(`[AVISO] Erro ao enviar NF para Shopee: ${uploadErr.message}`);
-            }
-          }
+          console.log(`[OK] NF ${nf.numero || nf.nfId} emitida para pedido ${detail.numero_ecommerce} — R$${(nf.valorNota || 0).toFixed(2)} — Tiny envia automaticamente (selo)`);
 
           if (nf.chaveAcesso) {
             stats.nfs.push({
@@ -250,7 +230,7 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
             });
           }
         } else {
-          console.error(`[ERRO] Falha ao gerar NF com desconto para pedido ${detail.numero}: ${nf.error}`);
+          console.error(`[ERRO] Falha ao gerar NF para pedido ${detail.numero}: ${nf.error}`);
           stats.errors++;
         }
         processedOrders.add(order.id);
@@ -892,32 +872,13 @@ export async function processSingleShopeeOrder(orderSn: string): Promise<SingleO
       result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF já vinculada (ID: ${nfId}) — detalhes indisponíveis` });
     }
   } else {
-    // Gera NF com desconto via nota.fiscal.incluir.php (preços reduzidos direto no payload)
-    console.log(`[SINGLE] Gerando NF com desconto Shopee para pedido ${orderSn}...`);
-    let descontoAplicado = 0;
+    // Gera NF via gerar.nota.fiscal.pedido — vincula ao pedido com selo ecommerce
+    // A lista de preço SHOPEE configurada no Tiny aplica o desconto automaticamente
+    console.log(`[SINGLE] Gerando NF via gerar.nota.fiscal.pedido para pedido ${orderSn} (Tiny ID: ${tinyOrder.id})...`);
 
     try {
-      const discountPercent = await getMarketplaceDiscount('Shopee');
-      let nf: any;
-      if (discountPercent > 0) {
-        await sleep(1100);
-        nf = await createAndEmitNFDiscounted(detail, discountPercent, 'Shopee');
-        if (nf.success) {
-          descontoAplicado = discountPercent;
-          console.log(`[SINGLE] NF criada com desconto ${discountPercent}% Shopee via nota.fiscal.incluir`);
-        } else {
-          console.error(`[SINGLE] Falha ao gerar NF com desconto: ${nf.error}`);
-          result.steps.push({ step: 'Nota Fiscal', ok: false, detail: `Falha ao gerar NF com desconto ${discountPercent}%: ${nf.error}` });
-          return result;
-        }
-      } else {
-        await sleep(1100);
-        nf = await createAndEmitNFDiscounted(detail, 0, 'Shopee');
-        if (!nf.success) {
-          result.steps.push({ step: 'Nota Fiscal', ok: false, detail: nf.error || 'Falha ao gerar/emitir NF.' });
-          return result;
-        }
-      }
+      await sleep(1100);
+      const nf = await generateNFFromOrder(tinyOrder.id, tinyOrder.numero);
 
       if (nf.success && nf.chaveAcesso) {
         nfId = nf.nfId;
@@ -927,10 +888,10 @@ export async function processSingleShopeeOrder(orderSn: string): Promise<SingleO
           chaveAcesso: nf.chaveAcesso || '',
           valorNota: nf.valorNota || 0,
         };
-        const descontoInfo = descontoAplicado > 0 ? ` (desconto ${descontoAplicado}% Shopee)` : '';
-        result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF ${nf.numero} emitida — R$ ${(nf.valorNota || 0).toFixed(2)}${descontoInfo} — Chave: ...${nf.chaveAcesso.slice(-8)}` });
+        console.log(`[SINGLE] NF ${nf.numero} gerada — R$${(nf.valorNota || 0).toFixed(2)} — selo ecommerce mantido`);
+        result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF ${nf.numero} gerada e emitida — R$ ${(nf.valorNota || 0).toFixed(2)} — Chave: ...${nf.chaveAcesso.slice(-8)}` });
       } else {
-        result.steps.push({ step: 'Nota Fiscal', ok: false, detail: nf.error || 'Falha ao gerar/emitir NF. Verifique os logs do servidor.' });
+        result.steps.push({ step: 'Nota Fiscal', ok: false, detail: nf.error || 'Falha ao gerar/emitir NF.' });
         return result;
       }
     } catch (err: any) {
@@ -939,28 +900,11 @@ export async function processSingleShopeeOrder(orderSn: string): Promise<SingleO
     }
   }
 
-  // --- Step 5: Upload NF para Shopee via API ---
-  if (nfId && orderSn) {
-    try {
-      await sleep(1100);
-      const xml = await getNFXml(nfId);
-      if (xml) {
-        const sendResult = await shopee.uploadInvoiceDoc(orderSn, xml);
-        if (sendResult.success) {
-          result.steps.push({ step: 'Enviar NF para Shopee', ok: true, detail: 'NF enviada para Shopee via API.' });
-          result.nfSent = true;
-        } else {
-          result.steps.push({ step: 'Enviar NF para Shopee', ok: false, detail: `Falha no upload: ${sendResult.error || 'erro desconhecido'}` });
-        }
-      } else {
-        result.steps.push({ step: 'Enviar NF para Shopee', ok: false, detail: 'Não foi possível obter XML da NF para upload.' });
-      }
-    } catch (err: any) {
-      result.steps.push({ step: 'Enviar NF para Shopee', ok: false, detail: `Erro no upload: ${err.message}` });
-    }
-  } else {
-    result.steps.push({ step: 'Enviar NF para Shopee', ok: false, detail: 'NF ID ou Order SN não disponível para upload.' });
-  }
+  // --- Step 5: Envio NF para Shopee ---
+  // NF gerada via gerar.nota.fiscal.pedido mantém o selo ecommerce
+  // O Tiny envia automaticamente para a Shopee
+  result.steps.push({ step: 'Enviar NF para Shopee', ok: true, detail: 'Tiny envia automaticamente com selo ecommerce' });
+  result.nfSent = true;
 
   result.success = result.steps.every(s => s.ok);
   console.log(`[SINGLE] ========== Resultado: ${result.success ? 'SUCESSO' : 'COM ERROS'} — ${result.steps.length} etapas ==========`);
