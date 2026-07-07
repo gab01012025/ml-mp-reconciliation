@@ -591,9 +591,9 @@ export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discount
     if (cnpj) {
       nota.nota_fiscal.intermediador = {
         cnpj,
-        nome_usuario: order.numero_ecommerce,
+        nome: ecommerceName,
       };
-      console.log(`[TINY] Intermediador: ${ecommerceName} CNPJ=${cnpj} usuario=${order.numero_ecommerce}`);
+      console.log(`[TINY] Intermediador: nome=${ecommerceName} CNPJ=${cnpj}`);
     }
   }
 
