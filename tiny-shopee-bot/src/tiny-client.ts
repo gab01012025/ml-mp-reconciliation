@@ -584,8 +584,8 @@ export async function createAndEmitNFDiscounted(order: TinyOrderDetail, discount
   if (ecommerceName) {
     nota.nota_fiscal.ecommerce = ecommerceName;
     const marketplaceCnpjs: Record<string, string> = {
-      'shopee': '36666279000101',        // Shopee Brasil Internet LTDA
-      'mercado livre': '10573521000191',  // MercadoLivre.com Atividades de Internet LTDA
+      'shopee': '36.666.279/0001-01',        // Shopee Brasil Internet LTDA
+      'mercado livre': '10.573.521/0001-91',  // MercadoLivre.com Atividades de Internet LTDA
     };
     const cnpj = marketplaceCnpjs[ecommerceName.toLowerCase()];
     if (cnpj) {
