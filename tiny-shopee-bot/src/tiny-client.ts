@@ -797,29 +797,35 @@ export async function alterOrderPrices(
 ): Promise<{ success: boolean; error?: string }> {
   const factor = (100 - discountPercent) / 100;
 
-  const pedido = {
+  const itensAlterados = order.itens.map(item => {
+    const vuOriginal = parseFloat(item.valor_unitario);
+    const vuReduzido = Math.max(0.01, +(vuOriginal * factor).toFixed(3));
+    return {
+      item: {
+        id_produto: item.id_produto,
+        descricao: item.descricao,
+        unidade: item.unidade,
+        quantidade: item.quantidade,
+        valor_unitario: vuReduzido.toFixed(3),
+      },
+    };
+  });
+
+  const dadosPedido = {
     pedido: {
-      itens: order.itens.map(item => {
-        const vuOriginal = parseFloat(item.valor_unitario);
-        const vuReduzido = Math.max(0.01, +(vuOriginal * factor).toFixed(3));
-        return {
-          item: {
-            id_produto: item.id_produto,
-            descricao: item.descricao,
-            unidade: item.unidade,
-            quantidade: item.quantidade,
-            valor_unitario: vuReduzido.toFixed(3),
-          },
-        };
-      }),
+      itens: itensAlterados,
     },
   };
 
+  console.log(`[TINY] alterOrderPrices: pedido ${orderId} — ${order.itens.length} itens, fator=${factor}`);
+  console.log(`[TINY] alterOrderPrices payload:`, JSON.stringify(dadosPedido).slice(0, 300));
   const data = await tinyPost('pedido.alterar.php', {
     id: orderId,
-    pedido: JSON.stringify(pedido),
+    dados_pedido: JSON.stringify(dadosPedido),
   });
   const retorno = data.retorno;
+
+  console.log(`[TINY] alterOrderPrices response:`, JSON.stringify(retorno).slice(0, 500));
 
   if (retorno.status !== 'OK') {
     const erros = retorno.erros;
