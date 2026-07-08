@@ -8,6 +8,7 @@ import {
   hasClientAddress,
   generateNFFromOrder,
   createAndEmitNFDiscounted,
+  alterOrderPrices,
   getNFDetails,
   getNFXml,
   hasMaskedClientData,
@@ -207,13 +208,21 @@ export async function processNewShopeeOrders(customDataInicial?: string, customD
           continue;
         }
 
-        // Gera NF via nota.fiscal.incluir com desconto + intermediador (Shopee CNPJ)
-        // O intermediador + ecommerce + id_pedido podem criar o selo para auto-envio
+        // Novo fluxo: altera preços do pedido + gera NF vinculada (mantém selo ecommerce)
         const discountPercent = await getMarketplaceDiscount('Shopee');
-        console.log(`[BOT] Gerando NF do pedido ${order.id} (${detail.numero}) via nota.fiscal.incluir — desconto ${discountPercent}% — total: R$${detail.total_pedido}`);
+        console.log(`[BOT] Pedido ${order.id} (${detail.numero}): alterando preços (desconto ${discountPercent}%) + gerar NF vinculada — total original: R$${detail.total_pedido}`);
 
         await sleep(1100);
-        const nf = await createAndEmitNFDiscounted(detail, discountPercent, 'Shopee');
+        const alterResult = await alterOrderPrices(order.id, detail, discountPercent);
+        if (!alterResult.success) {
+          console.error(`[ERRO] Falha ao alterar preços do pedido ${order.id}: ${alterResult.error}`);
+          stats.skippedNF++;
+          processedOrders.add(order.id);
+          continue;
+        }
+
+        await sleep(1200);
+        const nf = await generateNFFromOrder(order.id, detail.numero);
 
         if (nf.success) {
           stats.altered++;
@@ -369,11 +378,21 @@ export async function processMercadoLivreOrdersForDate(dataDia: string): Promise
           continue;
         }
 
+        // Novo fluxo: altera preços do pedido + gera NF vinculada (mantém selo ecommerce)
         const discountPercent = await getMarketplaceDiscount('ML');
-        console.log(`[BOT-ML] Gerando NF do pedido ML ${detail.numero_ecommerce} (Tiny ${detail.numero}) — total R$${detail.total_pedido} — desconto: ${discountPercent}%`);
+        console.log(`[BOT-ML] Pedido ML ${detail.numero_ecommerce} (Tiny ${detail.numero}): alterando preços (desconto ${discountPercent}%) + gerar NF vinculada — total original: R$${detail.total_pedido}`);
 
         await sleep(1100);
-        const nf = await createAndEmitNFDiscounted(detail, discountPercent, 'Mercado Livre');
+        const alterResult = await alterOrderPrices(order.id, detail, discountPercent);
+        if (!alterResult.success) {
+          console.error(`[ERRO] Falha ao alterar preços do pedido ML ${order.id}: ${alterResult.error}`);
+          stats.skippedNF++;
+          checkedMLOrders.add(order.id);
+          continue;
+        }
+
+        await sleep(1200);
+        const nf = await generateNFFromOrder(order.id, detail.numero);
 
         if (nf.success) {
           stats.altered++;
@@ -575,11 +594,21 @@ export async function processMercadoLivreByCollectionDate(dataColeta: string): P
           continue;
         }
 
+        // Novo fluxo: altera preços do pedido + gera NF vinculada (mantém selo ecommerce)
         const discountPercent = await getMarketplaceDiscount('ML');
-        console.log(`[BOT-ML] Gerando NF do pedido ML ${detail.numero_ecommerce} (Tiny ${detail.numero}) — total R$${detail.total_pedido} — desconto: ${discountPercent}%`);
+        console.log(`[BOT-ML] Pedido ML ${detail.numero_ecommerce} (Tiny ${detail.numero}): alterando preços (desconto ${discountPercent}%) + gerar NF vinculada — total original: R$${detail.total_pedido}`);
 
         await sleep(1100);
-        const nf = await createAndEmitNFDiscounted(detail, discountPercent, 'Mercado Livre');
+        const alterResult = await alterOrderPrices(summary.id, detail, discountPercent);
+        if (!alterResult.success) {
+          console.error(`[ERRO] Falha ao alterar preços do pedido ML ${summary.id}: ${alterResult.error}`);
+          stats.skippedNF++;
+          checkedMLOrders.add(summary.id);
+          continue;
+        }
+
+        await sleep(1200);
+        const nf = await generateNFFromOrder(summary.id, detail.numero);
 
         if (nf.success) {
           stats.altered++;
@@ -893,13 +922,20 @@ export async function processSingleShopeeOrder(orderSn: string): Promise<SingleO
       result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF já vinculada (ID: ${nfId}) — detalhes indisponíveis` });
     }
   } else {
-    // Gera NF via nota.fiscal.incluir com desconto + intermediador (Shopee CNPJ)
+    // Novo fluxo: altera preços do pedido + gera NF vinculada (mantém selo ecommerce)
     const discountPercent = await getMarketplaceDiscount('Shopee');
-    console.log(`[SINGLE] Gerando NF via nota.fiscal.incluir para pedido ${orderSn} (Tiny ID: ${tinyOrder.id}) — desconto ${discountPercent}%...`);
+    console.log(`[SINGLE] Alterando preços + gerando NF vinculada para pedido ${orderSn} (Tiny ID: ${tinyOrder.id}) — desconto ${discountPercent}%...`);
 
     try {
       await sleep(1100);
-      const nf = await createAndEmitNFDiscounted(detail, discountPercent, 'Shopee');
+      const alterResult = await alterOrderPrices(tinyOrder.id, detail, discountPercent);
+      if (!alterResult.success) {
+        result.steps.push({ step: 'Nota Fiscal', ok: false, detail: `Falha ao alterar preços: ${alterResult.error}` });
+        return result;
+      }
+
+      await sleep(1200);
+      const nf = await generateNFFromOrder(tinyOrder.id, detail.numero);
 
       if (nf.success && nf.chaveAcesso) {
         nfId = nf.nfId;
@@ -909,8 +945,8 @@ export async function processSingleShopeeOrder(orderSn: string): Promise<SingleO
           chaveAcesso: nf.chaveAcesso || '',
           valorNota: nf.valorNota || 0,
         };
-        console.log(`[SINGLE] NF ${nf.numero} gerada — R$${(nf.valorNota || 0).toFixed(2)} (desconto ${discountPercent}%)`);
-        result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF ${nf.numero} gerada com desconto ${discountPercent}% — R$ ${(nf.valorNota || 0).toFixed(2)} — Chave: ...${nf.chaveAcesso.slice(-8)}` });
+        console.log(`[SINGLE] NF ${nf.numero} gerada vinculada ao pedido — R$${(nf.valorNota || 0).toFixed(2)} (desconto ${discountPercent}%)`);
+        result.steps.push({ step: 'Nota Fiscal', ok: true, detail: `NF ${nf.numero} gerada com desconto ${discountPercent}% (selo) — R$ ${(nf.valorNota || 0).toFixed(2)} — Chave: ...${nf.chaveAcesso.slice(-8)}` });
       } else {
         result.steps.push({ step: 'Nota Fiscal', ok: false, detail: nf.error || 'Falha ao gerar/emitir NF.' });
         return result;

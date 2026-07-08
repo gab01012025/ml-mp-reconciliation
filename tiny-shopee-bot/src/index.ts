@@ -231,14 +231,14 @@ const server = http.createServer(async (req, res) => {
   // Public: health
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v4.04', uptime: process.uptime() }));
+    res.end(JSON.stringify({ status: 'ok', service: 'synchub-integration-platform', version: 'v4.05', uptime: process.uptime() }));
     return;
   }
 
   // Public: version check (for debugging deploys)
   if (url.pathname === '/version') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ version: 'v4.04', build: '2026-07-05T02:20Z', deployed: startTime.toISOString() }));
+    res.end(JSON.stringify({ version: 'v4.05', build: '2026-07-05T02:20Z', deployed: startTime.toISOString() }));
     return;
   }
 
@@ -2284,38 +2284,51 @@ const server = http.createServer(async (req, res) => {
       let nf: any;
 
       if (detectedCanal === 'Shopee') {
-        // Shopee: nota.fiscal.incluir com desconto + intermediador (CNPJ Shopee)
+        // Shopee: altera preços + gera NF vinculada ao pedido (mantém selo ecommerce)
         try {
           const discountPercent = await tinyClient.getMarketplaceDiscount('Shopee');
           discountDebug.push(`desconto=${discountPercent}%`);
-          discountDebug.push('Shopee: nota.fiscal.incluir + intermediador');
-          console.log(`[MANUAL] Criando NF Shopee com desconto ${discountPercent}% + intermediador — pedido ${tinyOrderId}`);
+          discountDebug.push('Shopee: alterOrderPrices + generateNFFromOrder (selo)');
+          console.log(`[MANUAL] Shopee: alterando preços (${discountPercent}%) + gerando NF vinculada — pedido ${tinyOrderId}`);
           await sleep(1200);
-          nf = await tinyClient.createAndEmitNFDiscounted(detail, discountPercent, 'Shopee');
-          if (nf.success) {
-            descontoAplicado = discountPercent;
-            discountDebug.push(`NF criada com desconto + intermediador — R$${(nf.valorNota || 0).toFixed(2)}`);
+          const alterResult = await tinyClient.alterOrderPrices(tinyOrderId, detail, discountPercent);
+          if (!alterResult.success) {
+            discountDebug.push(`alterOrderPrices falhou: ${alterResult.error || '?'}`);
+            nf = { success: false, error: `Falha ao alterar preços: ${alterResult.error}` };
           } else {
-            discountDebug.push(`incluir falhou: ${nf.error || '?'}`);
+            await sleep(1200);
+            nf = await tinyClient.generateNFFromOrder(tinyOrderId, detail.numero);
+            if (nf.success) {
+              descontoAplicado = discountPercent;
+              discountDebug.push(`NF gerada vinculada (selo) — R$${(nf.valorNota || 0).toFixed(2)}`);
+            } else {
+              discountDebug.push(`generateNFFromOrder falhou: ${nf.error || '?'}`);
+            }
           }
         } catch (e: any) {
           discountDebug.push(`erro=${e.message}`);
           nf = { success: false, error: e.message };
         }
       } else if (detectedCanal) {
-        // ML e outros: usa nota.fiscal.incluir com desconto
+        // ML e outros: altera preços + gera NF vinculada ao pedido (mantém selo ecommerce)
         try {
           const discountPercent = await tinyClient.getMarketplaceDiscount(detectedCanal);
           discountDebug.push(`desconto=${discountPercent}%`);
-          const ecommerceName = 'Mercado Livre';
-          console.log(`[MANUAL] Criando NF com desconto ${discountPercent}% (${detectedCanal}) via nota.fiscal.incluir`);
+          console.log(`[MANUAL] ${detectedCanal}: alterando preços (${discountPercent}%) + gerando NF vinculada — pedido ${tinyOrderId}`);
           await sleep(1200);
-          nf = await tinyClient.createAndEmitNFDiscounted(detail, discountPercent, ecommerceName);
-          if (nf.success) {
-            descontoAplicado = discountPercent;
-            discountDebug.push(`NF criada com desconto OK via incluir.php`);
+          const alterResult = await tinyClient.alterOrderPrices(tinyOrderId, detail, discountPercent);
+          if (!alterResult.success) {
+            discountDebug.push(`alterOrderPrices falhou: ${alterResult.error || '?'}`);
+            nf = { success: false, error: `Falha ao alterar preços: ${alterResult.error}` };
           } else {
-            discountDebug.push(`incluir falhou: ${nf.error || '?'}`);
+            await sleep(1200);
+            nf = await tinyClient.generateNFFromOrder(tinyOrderId, detail.numero);
+            if (nf.success) {
+              descontoAplicado = discountPercent;
+              discountDebug.push(`NF gerada vinculada (selo) — R$${(nf.valorNota || 0).toFixed(2)}`);
+            } else {
+              discountDebug.push(`generateNFFromOrder falhou: ${nf.error || '?'}`);
+            }
           }
         } catch (e: any) {
           discountDebug.push(`erro=${e.message}`);
@@ -2470,20 +2483,28 @@ const server = http.createServer(async (req, res) => {
               let nf: any;
 
               if (detectedCanal === 'Shopee') {
-                // Shopee: nota.fiscal.incluir com desconto + intermediador (CNPJ Shopee)
-                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Gerando NF Shopee com desconto + intermediador...` });
+                // Shopee: altera preços + gera NF vinculada (mantém selo ecommerce)
+                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Alterando preços + gerando NF vinculada (selo)...` });
                 try {
                   const discountPercent = await tinyClient.getMarketplaceDiscount('Shopee');
-                  console.log(`[BATCH] Pedido ${label}: canal=Shopee, desconto=${discountPercent}%`);
+                  console.log(`[BATCH] Pedido ${label}: canal=Shopee, desconto=${discountPercent}% — alterando preços + NF vinculada`);
                   await sleep(1200);
-                  nf = await tinyClient.createAndEmitNFDiscounted(detail, discountPercent, 'Shopee');
-                  if (nf.success) {
-                    descontoAplicado = discountPercent;
-                    if (discountPercent > 0) resumo.descontosAplicados++;
-                    console.log(`[BATCH] Pedido ${label}: NF criada com desconto ${discountPercent}% + intermediador — R$${(nf.valorNota || 0).toFixed(2)}`);
+                  const alterResult = await tinyClient.alterOrderPrices(p.id, detail, discountPercent);
+                  if (!alterResult.success) {
+                    console.error(`[BATCH] Pedido ${label}: alterOrderPrices falhou: ${alterResult.error}`);
+                    sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'error', detail: `Falha ao alterar preços: ${alterResult.error || '?'}` });
+                    nf = { success: false, error: alterResult.error };
                   } else {
-                    console.error(`[BATCH] Pedido ${label}: createAndEmitNFDiscounted falhou: ${nf.error}`);
-                    sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'error', detail: `Falha: ${nf.error || '?'}` });
+                    await sleep(1200);
+                    nf = await tinyClient.generateNFFromOrder(p.id, detail.numero);
+                    if (nf.success) {
+                      descontoAplicado = discountPercent;
+                      if (discountPercent > 0) resumo.descontosAplicados++;
+                      console.log(`[BATCH] Pedido ${label}: NF gerada vinculada (selo) — desconto ${discountPercent}% — R$${(nf.valorNota || 0).toFixed(2)}`);
+                    } else {
+                      console.error(`[BATCH] Pedido ${label}: generateNFFromOrder falhou: ${nf.error}`);
+                      sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'error', detail: `Falha: ${nf.error || '?'}` });
+                    }
                   }
                 } catch (discErr: any) {
                   console.error(`[BATCH] Pedido ${label}: erro: ${discErr.message}`);
@@ -2491,20 +2512,28 @@ const server = http.createServer(async (req, res) => {
                   nf = { success: false, error: discErr.message };
                 }
               } else if (detectedCanal) {
-                // ML e outros: nota.fiscal.incluir com desconto
-                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Gerando NF com desconto ${detectedCanal}...` });
+                // ML e outros: altera preços + gera NF vinculada (mantém selo ecommerce)
+                sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'working', detail: `Alterando preços + gerando NF vinculada (selo) ${detectedCanal}...` });
                 try {
                   const discountPercent = await tinyClient.getMarketplaceDiscount(detectedCanal);
-                  console.log(`[BATCH] Pedido ${label}: canal=${detectedCanal}, desconto=${discountPercent}%`);
+                  console.log(`[BATCH] Pedido ${label}: canal=${detectedCanal}, desconto=${discountPercent}% — alterando preços + NF vinculada`);
                   await sleep(1200);
-                  nf = await tinyClient.createAndEmitNFDiscounted(detail, discountPercent, 'Mercado Livre');
-                  if (nf.success) {
-                    descontoAplicado = discountPercent;
-                    if (discountPercent > 0) resumo.descontosAplicados++;
-                    console.log(`[BATCH] Pedido ${label}: NF criada com desconto ${discountPercent}% via nota.fiscal.incluir`);
+                  const alterResult = await tinyClient.alterOrderPrices(p.id, detail, discountPercent);
+                  if (!alterResult.success) {
+                    console.error(`[BATCH] Pedido ${label}: alterOrderPrices falhou: ${alterResult.error}`);
+                    sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'error', detail: `Falha ao alterar preços: ${alterResult.error || '?'}` });
+                    nf = { success: false, error: alterResult.error };
                   } else {
-                    console.error(`[BATCH] Pedido ${label}: falhou: ${nf.error}`);
-                    sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'error', detail: `Falha: ${nf.error || '?'}` });
+                    await sleep(1200);
+                    nf = await tinyClient.generateNFFromOrder(p.id, detail.numero);
+                    if (nf.success) {
+                      descontoAplicado = discountPercent;
+                      if (discountPercent > 0) resumo.descontosAplicados++;
+                      console.log(`[BATCH] Pedido ${label}: NF gerada vinculada (selo) — desconto ${discountPercent}% — R$${(nf.valorNota || 0).toFixed(2)}`);
+                    } else {
+                      console.error(`[BATCH] Pedido ${label}: generateNFFromOrder falhou: ${nf.error}`);
+                      sendSSE({ type: 'progress', current: i + 1, total: pedidos.length, pedido: label, step: 'nf', status: 'error', detail: `Falha: ${nf.error || '?'}` });
+                    }
                   }
                 } catch (discErr: any) {
                   console.error(`[BATCH] Pedido ${label}: erro: ${discErr.message}`);
@@ -3737,7 +3766,7 @@ function getLoginHtml(error?: string): string {
       <div class="int-badge"><span class="dot"></span> Mercado Livre</div>
       <div class="int-badge"><span class="dot"></span> Tiny ERP</div>
     </div>
-    <div class="footer">SyncHub v4.04 — Integrador de Marketplaces e ERPs</div>
+    <div class="footer">SyncHub v4.05 — Integrador de Marketplaces e ERPs</div>
   </div>
   <script>
     if (localStorage.getItem('auth_token')) { window.location.href = '/'; }
@@ -3940,7 +3969,7 @@ function getDashboardHtml(): string {
       <div class="section-label">Sistema</div>
       <a href="#logs"><span class="icon">📄</span> Logs</a>
     </nav>
-    <div class="sidebar-footer">SyncHub v4.04<br>Integrador ERP/HUB</div>
+    <div class="sidebar-footer">SyncHub v4.05<br>Integrador ERP/HUB</div>
   </div>
 
   <!-- Main -->
