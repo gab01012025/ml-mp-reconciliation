@@ -811,10 +811,9 @@ export async function alterOrderPrices(
     };
   });
 
+  // Tiny pedido.alterar.php espera dados_pedido flat (sem wrapper "pedido")
   const dadosPedido = {
-    pedido: {
-      itens: itensAlterados,
-    },
+    itens: itensAlterados,
   };
 
   console.log(`[TINY] alterOrderPrices: pedido ${orderId} — ${order.itens.length} itens, fator=${factor}`);
