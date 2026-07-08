@@ -816,26 +816,47 @@ export async function alterOrderPrices(
   const tinyUrl = config.tinyApiUrl;
   const tinyToken = config.tinyToken;
 
+  const itensJson = JSON.stringify(itensAlterados);
+
   // Tenta múltiplos formatos — a API pedido.alterar.php pode exigir formato específico
   const formats: Array<{ name: string; body: string }> = [
-    // Formato 1: dados_pedido RAW com wrapper pedido (sem URL-encode)
-    { name: 'dados_pedido+pedido RAW', body: `token=${tinyToken}&formato=json&id=${orderId}&dados_pedido={"pedido":{"itens":${JSON.stringify(itensAlterados)}}}` },
-    // Formato 2: dados_pedido RAW flat (sem wrapper, sem URL-encode)
-    { name: 'dados_pedido flat RAW', body: `token=${tinyToken}&formato=json&id=${orderId}&dados_pedido={"itens":${JSON.stringify(itensAlterados)}}` },
-    // Formato 3: pedido RAW (parâmetro "pedido" em vez de "dados_pedido")
-    { name: 'pedido RAW', body: `token=${tinyToken}&formato=json&id=${orderId}&pedido={"pedido":{"itens":${JSON.stringify(itensAlterados)}}}` },
-    // Formato 4: pedido flat RAW
-    { name: 'pedido flat RAW', body: `token=${tinyToken}&formato=json&id=${orderId}&pedido={"itens":${JSON.stringify(itensAlterados)}}` },
+    // Formato 1: dados_pedido URL-encoded, wrapper dados_pedido interno (docs pattern)
+    { name: 'dados_pedido ENCODED + wrapper dados_pedido', body: `token=${tinyToken}&formato=json&id=${orderId}&dados_pedido=${encodeURIComponent(JSON.stringify({ dados_pedido: { itens: itensAlterados } }))}` },
+    // Formato 2: dados_pedido URL-encoded, teste simples com obs (verifica se API funciona)
+    { name: 'dados_pedido ENCODED obs test', body: `token=${tinyToken}&formato=json&id=${orderId}&dados_pedido=${encodeURIComponent(JSON.stringify({ dados_pedido: { obs: 'teste api ' + Date.now() } }))}` },
+    // Formato 3: dados_pedido URL-encoded flat
+    { name: 'dados_pedido ENCODED flat', body: `token=${tinyToken}&formato=json&id=${orderId}&dados_pedido=${encodeURIComponent(JSON.stringify({ itens: itensAlterados }))}` },
+    // Formato 4: dados_pedido RAW com wrapper dados_pedido
+    { name: 'dados_pedido RAW + wrapper dados_pedido', body: `token=${tinyToken}&formato=json&id=${orderId}&dados_pedido={"dados_pedido":{"itens":${itensJson}}}` },
+    // Formato 5: dados_pedido RAW flat
+    { name: 'dados_pedido RAW flat', body: `token=${tinyToken}&formato=json&id=${orderId}&dados_pedido={"itens":${itensJson}}` },
+    // Formato 6: pedido RAW flat
+    { name: 'pedido RAW flat', body: `token=${tinyToken}&formato=json&id=${orderId}&pedido={"itens":${itensJson}}` },
+    // Formato 7: sem formato=json (talvez interfira)
+    { name: 'sem formato=json', body: `token=${tinyToken}&id=${orderId}&dados_pedido=${encodeURIComponent(JSON.stringify({ dados_pedido: { itens: itensAlterados } }))}` },
+    // Formato 8: JSON body (Content-Type application/json)
+    { name: 'JSON body', body: '__JSON__' },
   ];
 
   for (const fmt of formats) {
     console.log(`[TINY] alterOrderPrices tentando formato: ${fmt.name}`);
     try {
-      const resp = await fetch(`${tinyUrl}/pedido.alterar.php`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: fmt.body,
-      });
+      let resp: Response;
+      if (fmt.body === '__JSON__') {
+        // Formato JSON body
+        const jsonBody = JSON.stringify({ token: tinyToken, id: orderId, formato: 'json', dados_pedido: { itens: itensAlterados } });
+        resp = await fetch(`${tinyUrl}/pedido.alterar.php`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: jsonBody,
+        });
+      } else {
+        resp = await fetch(`${tinyUrl}/pedido.alterar.php`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: fmt.body,
+        });
+      }
       const text = await resp.text();
       const json = JSON.parse(text);
       const retorno = json.retorno;
