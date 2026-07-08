@@ -811,34 +811,61 @@ export async function alterOrderPrices(
     };
   });
 
-  // Tiny pedido.alterar.php espera dados_pedido flat (sem wrapper "pedido")
-  const dadosPedido = {
-    itens: itensAlterados,
-  };
-
   console.log(`[TINY] alterOrderPrices: pedido ${orderId} — ${order.itens.length} itens, fator=${factor}`);
-  console.log(`[TINY] alterOrderPrices payload:`, JSON.stringify(dadosPedido).slice(0, 300));
-  const data = await tinyPost('pedido.alterar.php', {
-    id: orderId,
-    dados_pedido: JSON.stringify(dadosPedido),
-  });
-  const retorno = data.retorno;
 
-  console.log(`[TINY] alterOrderPrices response:`, JSON.stringify(retorno).slice(0, 500));
+  const tinyUrl = config.tinyApiUrl;
+  const tinyToken = config.tinyToken;
 
-  if (retorno.status !== 'OK') {
-    const erros = retorno.erros;
-    const errList = Array.isArray(erros) ? erros.map((e: any) => e.erro).join('; ') : erros?.erro || 'Erro desconhecido';
-    console.error(`[ERRO] Falha ao alterar pedido ${orderId}: ${errList}`);
-    return { success: false, error: errList };
+  // Tenta múltiplos formatos — a API pedido.alterar.php pode exigir formato específico
+  const formats: Array<{ name: string; body: string }> = [
+    // Formato 1: dados_pedido RAW com wrapper pedido (sem URL-encode)
+    { name: 'dados_pedido+pedido RAW', body: `token=${tinyToken}&formato=json&id=${orderId}&dados_pedido={"pedido":{"itens":${JSON.stringify(itensAlterados)}}}` },
+    // Formato 2: dados_pedido RAW flat (sem wrapper, sem URL-encode)
+    { name: 'dados_pedido flat RAW', body: `token=${tinyToken}&formato=json&id=${orderId}&dados_pedido={"itens":${JSON.stringify(itensAlterados)}}` },
+    // Formato 3: pedido RAW (parâmetro "pedido" em vez de "dados_pedido")
+    { name: 'pedido RAW', body: `token=${tinyToken}&formato=json&id=${orderId}&pedido={"pedido":{"itens":${JSON.stringify(itensAlterados)}}}` },
+    // Formato 4: pedido flat RAW
+    { name: 'pedido flat RAW', body: `token=${tinyToken}&formato=json&id=${orderId}&pedido={"itens":${JSON.stringify(itensAlterados)}}` },
+  ];
+
+  for (const fmt of formats) {
+    console.log(`[TINY] alterOrderPrices tentando formato: ${fmt.name}`);
+    try {
+      const resp = await fetch(`${tinyUrl}/pedido.alterar.php`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: fmt.body,
+      });
+      const text = await resp.text();
+      const json = JSON.parse(text);
+      const retorno = json.retorno;
+
+      console.log(`[TINY] alterOrderPrices [${fmt.name}]: status=${retorno?.status} response=${JSON.stringify(retorno).slice(0, 300)}`);
+
+      if (retorno?.status === 'OK') {
+        const totalReduzido = order.itens.reduce(
+          (sum, i) => sum + parseFloat(i.valor_unitario) * parseFloat(i.quantidade) * factor,
+          0,
+        );
+        console.log(`[OK] Pedido ${orderId} alterado via formato "${fmt.name}": desconto ${discountPercent}% — novo total aprox R$${totalReduzido.toFixed(2)}`);
+        return { success: true };
+      }
+
+      // Se erro diferente de "dados não informados", loga e tenta próximo
+      const erros = retorno?.erros;
+      const errStr = Array.isArray(erros) ? erros.map((e: any) => `${e.erro} (campo:${e.campo || '?'})`).join('; ') : erros?.erro || 'Erro desconhecido';
+      console.warn(`[TINY] alterOrderPrices [${fmt.name}] falhou: ${errStr}`);
+    } catch (err: any) {
+      console.error(`[TINY] alterOrderPrices [${fmt.name}] exception: ${err.message}`);
+    }
+
+    // Espera entre tentativas para não sobrecarregar a API
+    await new Promise(r => setTimeout(r, 1500));
   }
 
-  const totalReduzido = order.itens.reduce(
-    (sum, i) => sum + parseFloat(i.valor_unitario) * parseFloat(i.quantidade) * factor,
-    0,
-  );
-  console.log(`[OK] Pedido ${orderId} alterado: desconto ${discountPercent}% aplicado — novo total aprox R$${totalReduzido.toFixed(2)}`);
-  return { success: true };
+  // Nenhum formato funcionou
+  console.error(`[ERRO] Falha ao alterar pedido ${orderId}: nenhum formato aceito pela API pedido.alterar.php`);
+  return { success: false, error: 'Nenhum formato aceito pela API pedido.alterar.php — verificar logs' };
 }
 
 /**
