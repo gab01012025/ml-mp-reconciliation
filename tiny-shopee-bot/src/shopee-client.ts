@@ -363,7 +363,7 @@ async function tryUpload(
   // Usa Blob em vez de File para melhor compatibilidade com Node.js fetch
   const formData = new _FormData();
   formData.append('order_sn', orderSn);
-  formData.append('file_type', '1');
+  formData.append('file_type', '4');  // 1=pdf 2=jpeg 3=png 4=xml
   const blob = new Blob([xmlBuffer], { type: mimeType });
   formData.append('file', blob, filename);
 
@@ -390,7 +390,7 @@ async function tryUploadManual(
   // order_sn field
   parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="order_sn"\r\n\r\n${orderSn}\r\n`));
   // file_type field
-  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file_type"\r\n\r\n1\r\n`));
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file_type"\r\n\r\n4\r\n`));
   // file field
   parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${orderSn}.xml"\r\nContent-Type: application/xml\r\n\r\n`));
   parts.push(xmlBuffer);
@@ -450,22 +450,10 @@ export async function uploadInvoiceDoc(
 
   let lastError = '';
 
-  // === Tentativa 1: add_invoice_data (dados estruturados via JSON) ===
-  // Envia só número, série e chave — sem upload de arquivo
-  if (nfeData.chaveAcesso && nfeData.numero && nfeData.serie) {
-    console.log(`[SHOPEE] Tentativa 1: add_invoice_data (JSON) — num=${nfeData.numero} serie=${nfeData.serie} chave=...${nfeData.chaveAcesso.slice(-8)}`);
-    const jsonResult = await addInvoiceData(orderSn, nfeData.numero, nfeData.serie, nfeData.chaveAcesso);
-    if (jsonResult.success) {
-      console.log(`[SHOPEE] NF registrada com sucesso via add_invoice_data (JSON)`);
-      return { success: true };
-    }
-    lastError = jsonResult.error || 'add_invoice_data falhou';
-    console.warn(`[SHOPEE] add_invoice_data falhou: ${lastError}`);
-  } else {
-    console.warn(`[SHOPEE] Dados NF incompletos no XML — chave=${!!nfeData.chaveAcesso} num=${!!nfeData.numero} serie=${!!nfeData.serie}`);
-  }
+  // add_invoice_data não disponível neste app — vai direto para upload_invoice_doc
+  // file_type=4 (XML) conforme docs Shopee: 1=pdf 2=jpeg 3=png 4=xml
 
-  // === Tentativa 2: upload_invoice_doc via https module (multipart manual) ===
+  // === Tentativa 1: upload_invoice_doc via https module (multipart manual) ===
   const accessToken = await ensureValidToken();
   if (!accessToken) {
     return { success: false, error: 'no_token: Token não disponível. Re-autorize a loja.' };
@@ -475,7 +463,7 @@ export async function uploadInvoiceDoc(
   const rawBuf = Buffer.from(xml, 'utf-8');
 
   // Upload via https module nativo (mais confiável que fetch para multipart)
-  console.log(`[SHOPEE] Tentativa 2: upload_invoice_doc via https (${rawBuf.length} bytes)`);
+  console.log(`[SHOPEE] Tentativa 1: upload_invoice_doc via https (${rawBuf.length} bytes)`);
   const httpsResult = await uploadViaHttps(orderSn, rawBuf, accessToken, shopId);
   if (httpsResult.success) {
     console.log(`[SHOPEE] NF enviada via upload https nativo`);
@@ -484,7 +472,7 @@ export async function uploadInvoiceDoc(
   lastError = httpsResult.error || 'upload https falhou';
   console.warn(`[SHOPEE] Upload https falhou: ${lastError}`);
 
-  // === Tentativa 3: upload_invoice_doc via fetch + FormData ===
+  // === Tentativa 2: upload_invoice_doc via fetch + FormData ===
   function buildUrl(): string {
     const ts = Math.floor(Date.now() / 1000);
     const path = '/api/v2/order/upload_invoice_doc';
@@ -492,8 +480,8 @@ export async function uploadInvoiceDoc(
     return `${BASE_URL}${path}?partner_id=${PARTNER_ID}&timestamp=${ts}&sign=${sign}&access_token=${accessToken}&shop_id=${shopId}`;
   }
 
-  console.log(`[SHOPEE] Tentativa 3: upload_invoice_doc fetch+FormData (${rawBuf.length} bytes)`);
-  let result = await tryUpload(buildUrl(), orderSn, rawBuf, 'application/xml', `${orderSn}.xml`, 'tentativa3');
+  console.log(`[SHOPEE] Tentativa 2: upload_invoice_doc fetch+FormData (${rawBuf.length} bytes)`);
+  let result = await tryUpload(buildUrl(), orderSn, rawBuf, 'application/xml', `${orderSn}.xml`, 'tentativa2');
   if (!result.error) {
     console.log(`[SHOPEE] NF enviada via fetch+FormData`);
     return { success: true };
@@ -501,9 +489,9 @@ export async function uploadInvoiceDoc(
   lastError = `${result.error}: ${result.message || ''}`;
   console.warn(`[SHOPEE] Upload fetch+FormData falhou: ${lastError}`);
 
-  // === Tentativa 4: multipart boundary manual ===
-  console.log(`[SHOPEE] Tentativa 4: upload manual multipart (${rawBuf.length} bytes)`);
-  result = await tryUploadManual(buildUrl(), orderSn, rawBuf, 'tentativa4');
+  // === Tentativa 3: multipart boundary manual ===
+  console.log(`[SHOPEE] Tentativa 3: upload manual multipart (${rawBuf.length} bytes)`);
+  result = await tryUploadManual(buildUrl(), orderSn, rawBuf, 'tentativa3');
   if (!result.error) {
     console.log(`[SHOPEE] NF enviada via multipart manual`);
     return { success: true };
@@ -540,7 +528,7 @@ async function uploadViaHttps(
     `--${boundary}`,
     `Content-Disposition: form-data; name="file_type"`,
     ``,
-    `1`,
+    `4`,
     `--${boundary}`,
     `Content-Disposition: form-data; name="file"; filename="${filename}"`,
     `Content-Type: application/xml`,
